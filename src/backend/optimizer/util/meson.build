@@ -14,6 +14,7 @@ backend_sources += files(
   'relnode.c',
   'restrictinfo.c',
   'robust.c',
+  'robustprofile.c',
   'robustvec.c',
   'tlist.c',
   'var.c',

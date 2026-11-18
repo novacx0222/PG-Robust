@@ -100,7 +100,7 @@ def main():
 
     # G4
     common.start(a.install)
-    out, err = common.psql('CREATE EXTENSION IF NOT EXISTS test_robust;\n'
+    out, err = common.psql('DROP EXTENSION IF EXISTS test_robust; CREATE EXTENSION test_robust;\n'
                            'SET client_min_messages = log;\nSELECT test_robust_dump();',
                            a.install, on_error_stop=False)
     ev = parse(err.splitlines()).get('test', [])

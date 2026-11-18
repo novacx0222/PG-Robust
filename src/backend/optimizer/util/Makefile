@@ -26,6 +26,7 @@ OBJS = \
 	relnode.o \
 	restrictinfo.o \
 	robust.o \
+	robustprofile.o \
 	robustvec.o \
 	tlist.o \
 	var.o

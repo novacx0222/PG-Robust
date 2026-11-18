@@ -77,10 +77,12 @@ extern void robust_dump_str(RobustDump *d, const char *key, const char *val);
 extern void robust_dump_int(RobustDump *d, const char *key, int64 val);
 extern void robust_dump_double(RobustDump *d, const char *key, double val);
 extern void robust_dump_bool(RobustDump *d, const char *key, bool val);
+extern void robust_dump_raw(RobustDump *d, const char *key, const char *json);
 extern void robust_dump_vec(RobustDump *d, const char *key, const RobustVec *v);
 extern void robust_dump_relids(RobustDump *d, const char *key,
 							   PlannerInfo *root, Relids relids);
 extern void robust_dump_end(RobustDump *d);
+extern void robust_json_number(StringInfo buf, double val);
 
 extern void robust_dump_query(void);
 

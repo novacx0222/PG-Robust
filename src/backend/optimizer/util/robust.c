@@ -62,8 +62,8 @@ dump_key(RobustDump *d, const char *key)
 	appendStringInfoChar(&d->buf, ':');
 }
 
-static void
-dump_number(StringInfo buf, double val)
+void
+robust_json_number(StringInfo buf, double val)
 {
 	if (isnan(val))
 		appendStringInfoString(buf, "\"nan\"");
@@ -102,7 +102,15 @@ void
 robust_dump_double(RobustDump *d, const char *key, double val)
 {
 	dump_key(d, key);
-	dump_number(&d->buf, val);
+	robust_json_number(&d->buf, val);
+}
+
+/* A value that is already JSON text (an array or object) */
+void
+robust_dump_raw(RobustDump *d, const char *key, const char *json)
+{
+	dump_key(d, key);
+	appendStringInfoString(&d->buf, json);
 }
 
 void
@@ -126,7 +134,7 @@ robust_dump_vec(RobustDump *d, const char *key, const RobustVec *v)
 	{
 		if (i > 0)
 			appendStringInfoChar(&d->buf, ',');
-		dump_number(&d->buf, v->v[i]);
+		robust_json_number(&d->buf, v->v[i]);
 	}
 	appendStringInfoChar(&d->buf, ']');
 }
