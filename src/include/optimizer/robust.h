@@ -81,6 +81,9 @@ extern void robust_dump_raw(RobustDump *d, const char *key, const char *json);
 extern void robust_dump_vec(RobustDump *d, const char *key, const RobustVec *v);
 extern void robust_dump_relids(RobustDump *d, const char *key,
 							   PlannerInfo *root, Relids relids);
+extern Index robust_instance_relid(PlannerInfo *root, Index relid);
+extern char *robust_rel_name(PlannerInfo *root, Index relid);
+extern char *robust_relids_name(PlannerInfo *root, Relids relids);
 extern void robust_dump_end(RobustDump *d);
 extern void robust_json_number(StringInfo buf, double val);
 

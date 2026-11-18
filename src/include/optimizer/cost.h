@@ -188,6 +188,10 @@ extern void set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel);
 extern double get_parameterized_baserel_size(PlannerInfo *root,
 											 RelOptInfo *rel,
 											 List *param_clauses);
+extern double get_parameterized_baserel_size_sel(PlannerInfo *root,
+												 RelOptInfo *rel,
+												 List *param_clauses,
+												 Selectivity *sel);
 extern double get_parameterized_joinrel_size(PlannerInfo *root,
 											 RelOptInfo *rel,
 											 Path *outer_path,

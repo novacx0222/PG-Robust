@@ -42,6 +42,8 @@
 #include "optimizer/plancat.h"
 #include "optimizer/planner.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/robust.h"
+#include "optimizer/robustrows.h"
 #include "optimizer/tlist.h"
 #include "parser/parse_clause.h"
 #include "parser/parsetree.h"
@@ -1209,6 +1211,10 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 		 */
 		rel->tuples = parent_rows;
 
+		/* RobDP: the row count in each error scenario */
+		if (enable_rows_dist)
+			robust_set_appendrel_rows(root, rel);
+
 		/*
 		 * Note that we leave rel->pages as zero; this is important to avoid
 		 * double-counting the appendrel tree in total_table_pages.
@@ -2146,6 +2152,7 @@ set_dummy_rel_pathlist(RelOptInfo *rel)
 {
 	/* Set dummy size estimates --- we leave attr_widths[] as zeroes */
 	rel->rows = 0;
+	rel->robust_rows = NULL;
 	rel->reltarget->width = 0;
 
 	/* Discard any pre-existing paths; no further need for them */

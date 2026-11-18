@@ -1038,6 +1038,14 @@ typedef struct RelOptInfo
 	List	  **partexprs pg_node_attr(read_write_ignore);
 	/* Nullable partition key expressions */
 	List	  **nullable_partexprs pg_node_attr(read_write_ignore);
+
+	/*
+	 * RobDP (optimizer/robustrows.h): the row count in each error scenario,
+	 * NULL when it is "rows" in every scenario, and the querylets with a
+	 * profile it depends on directly (a List of RobustQuerylet).
+	 */
+	struct RobustVec *robust_rows pg_node_attr(read_write_ignore);
+	List	   *robust_querylets pg_node_attr(read_write_ignore);
 } RelOptInfo;
 
 /*
@@ -1558,6 +1566,10 @@ typedef struct ParamPathInfo
 	Cardinality ppi_rows;		/* estimated number of result tuples */
 	List	   *ppi_clauses;	/* join clauses available from outer rels */
 	Bitmapset  *ppi_serials;	/* set of rinfo_serial for enforced quals */
+	/* RobDP: ppi_rows per error scenario (NULL if constant), and the
+	 * querylets (RobustQuerylet) it depends on; see optimizer/robustrows.h */
+	struct RobustVec *ppi_robust_rows pg_node_attr(read_write_ignore);
+	List	   *ppi_robust_querylets pg_node_attr(read_write_ignore);
 } ParamPathInfo;
 
 
