@@ -1,0 +1,4 @@
+__pycache__/
+# run outputs; only the stock baseline is kept as the reference for gates
+results/*.json
+!results/stock_v2rel.json

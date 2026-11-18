@@ -1,0 +1,1 @@
+SELECT count(*) FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.fk = t1.id AND t2.b < 500)

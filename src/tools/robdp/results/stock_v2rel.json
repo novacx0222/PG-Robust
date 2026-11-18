@@ -1,0 +1,2698 @@
+{
+ "install": "v2-release",
+ "settings": [],
+ "queries": {
+  "q01_scan_filter": {
+   "sql": "SELECT * FROM t1 WHERE a < 10",
+   "messages": [],
+   "plan": {
+    "Node Type": "Bitmap Heap Scan",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Relation Name": "t1",
+    "Alias": "t1",
+    "Startup Cost": 23.79,
+    "Total Cost": 176.79,
+    "Plan Rows": 2000,
+    "Plan Width": 20,
+    "Recheck Cond": "(a < 10)",
+    "Plans": [
+     {
+      "Node Type": "Bitmap Index Scan",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Index Name": "t1_a_idx",
+      "Startup Cost": 0.0,
+      "Total Cost": 23.29,
+      "Plan Rows": 2000,
+      "Plan Width": 0,
+      "Index Cond": "(a < 10)"
+     }
+    ]
+   },
+   "planning_ms": 0.005
+  },
+  "q02_index_point": {
+   "sql": "SELECT * FROM t3 WHERE fk = 42",
+   "messages": [],
+   "plan": {
+    "Node Type": "Index Scan",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Scan Direction": "Forward",
+    "Index Name": "t3_fk_idx",
+    "Relation Name": "t3",
+    "Alias": "t3",
+    "Startup Cost": 0.29,
+    "Total Cost": 8.31,
+    "Plan Rows": 1,
+    "Plan Width": 20,
+    "Index Cond": "(fk = 42)"
+   },
+   "planning_ms": 0.005
+  },
+  "q03_chain2": {
+   "sql": "SELECT * FROM t1, t2 WHERE t1.fk = t2.id AND t1.a < 10",
+   "messages": [],
+   "plan": {
+    "Node Type": "Hash Join",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Join Type": "Inner",
+    "Startup Cost": 201.79,
+    "Total Cost": 1026.79,
+    "Plan Rows": 2000,
+    "Plan Width": 40,
+    "Inner Unique": false,
+    "Hash Cond": "(t2.id = t1.fk)",
+    "Plans": [
+     {
+      "Node Type": "Seq Scan",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Relation Name": "t2",
+      "Alias": "t2",
+      "Startup Cost": 0.0,
+      "Total Cost": 655.0,
+      "Plan Rows": 40000,
+      "Plan Width": 20
+     },
+     {
+      "Node Type": "Hash",
+      "Parent Relationship": "Inner",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Startup Cost": 176.79,
+      "Total Cost": 176.79,
+      "Plan Rows": 2000,
+      "Plan Width": 20,
+      "Plans": [
+       {
+        "Node Type": "Bitmap Heap Scan",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Relation Name": "t1",
+        "Alias": "t1",
+        "Startup Cost": 23.79,
+        "Total Cost": 176.79,
+        "Plan Rows": 2000,
+        "Plan Width": 20,
+        "Recheck Cond": "(a < 10)",
+        "Plans": [
+         {
+          "Node Type": "Bitmap Index Scan",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Index Name": "t1_a_idx",
+          "Startup Cost": 0.0,
+          "Total Cost": 23.29,
+          "Plan Rows": 2000,
+          "Plan Width": 0,
+          "Index Cond": "(a < 10)"
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.03
+  },
+  "q04_chain3": {
+   "sql": "SELECT * FROM t1, t2, t3 WHERE t1.fk = t2.id AND t2.fk = t3.id AND t1.a < 10 AND t3.b = 5",
+   "messages": [],
+   "plan": {
+    "Node Type": "Nested Loop",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Join Type": "Inner",
+    "Startup Cost": 0.58,
+    "Total Cost": 1573.49,
+    "Plan Rows": 2,
+    "Plan Width": 60,
+    "Inner Unique": false,
+    "Plans": [
+     {
+      "Node Type": "Nested Loop",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Inner",
+      "Startup Cost": 0.29,
+      "Total Cost": 1560.05,
+      "Plan Rows": 40,
+      "Plan Width": 40,
+      "Inner Unique": false,
+      "Plans": [
+       {
+        "Node Type": "Seq Scan",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Relation Name": "t3",
+        "Alias": "t3",
+        "Startup Cost": 0.0,
+        "Total Cost": 1133.0,
+        "Plan Rows": 60,
+        "Plan Width": 20,
+        "Filter": "(b = 5)"
+       },
+       {
+        "Node Type": "Index Scan",
+        "Parent Relationship": "Inner",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Scan Direction": "Forward",
+        "Index Name": "t2_fk_idx",
+        "Relation Name": "t2",
+        "Alias": "t2",
+        "Startup Cost": 0.29,
+        "Total Cost": 7.11,
+        "Plan Rows": 1,
+        "Plan Width": 20,
+        "Index Cond": "(fk = t3.id)"
+       }
+      ]
+     },
+     {
+      "Node Type": "Index Scan",
+      "Parent Relationship": "Inner",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Scan Direction": "Forward",
+      "Index Name": "t1_fk_idx",
+      "Relation Name": "t1",
+      "Alias": "t1",
+      "Startup Cost": 0.29,
+      "Total Cost": 0.33,
+      "Plan Rows": 1,
+      "Plan Width": 20,
+      "Index Cond": "(fk = t2.id)",
+      "Filter": "(a < 10)"
+     }
+    ]
+   },
+   "planning_ms": 0.06
+  },
+  "q05_chain4": {
+   "sql": "SELECT * FROM t1, t2, t3, t4 WHERE t1.fk = t2.id AND t2.fk = t3.id AND t3.fk = t4.id AND t1.a < 10 AND t3.b = 5",
+   "messages": [],
+   "plan": {
+    "Node Type": "Nested Loop",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Join Type": "Inner",
+    "Startup Cost": 0.87,
+    "Total Cost": 1588.78,
+    "Plan Rows": 2,
+    "Plan Width": 80,
+    "Inner Unique": true,
+    "Plans": [
+     {
+      "Node Type": "Nested Loop",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Inner",
+      "Startup Cost": 0.58,
+      "Total Cost": 1573.49,
+      "Plan Rows": 2,
+      "Plan Width": 60,
+      "Inner Unique": false,
+      "Plans": [
+       {
+        "Node Type": "Nested Loop",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Join Type": "Inner",
+        "Startup Cost": 0.29,
+        "Total Cost": 1560.05,
+        "Plan Rows": 40,
+        "Plan Width": 40,
+        "Inner Unique": false,
+        "Plans": [
+         {
+          "Node Type": "Seq Scan",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Relation Name": "t3",
+          "Alias": "t3",
+          "Startup Cost": 0.0,
+          "Total Cost": 1133.0,
+          "Plan Rows": 60,
+          "Plan Width": 20,
+          "Filter": "(b = 5)"
+         },
+         {
+          "Node Type": "Index Scan",
+          "Parent Relationship": "Inner",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Scan Direction": "Forward",
+          "Index Name": "t2_fk_idx",
+          "Relation Name": "t2",
+          "Alias": "t2",
+          "Startup Cost": 0.29,
+          "Total Cost": 7.11,
+          "Plan Rows": 1,
+          "Plan Width": 20,
+          "Index Cond": "(fk = t3.id)"
+         }
+        ]
+       },
+       {
+        "Node Type": "Index Scan",
+        "Parent Relationship": "Inner",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Scan Direction": "Forward",
+        "Index Name": "t1_fk_idx",
+        "Relation Name": "t1",
+        "Alias": "t1",
+        "Startup Cost": 0.29,
+        "Total Cost": 0.33,
+        "Plan Rows": 1,
+        "Plan Width": 20,
+        "Index Cond": "(fk = t2.id)",
+        "Filter": "(a < 10)"
+       }
+      ]
+     },
+     {
+      "Node Type": "Index Scan",
+      "Parent Relationship": "Inner",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Scan Direction": "Forward",
+      "Index Name": "t4_pkey",
+      "Relation Name": "t4",
+      "Alias": "t4",
+      "Startup Cost": 0.29,
+      "Total Cost": 7.64,
+      "Plan Rows": 1,
+      "Plan Width": 20,
+      "Index Cond": "(id = t3.fk)"
+     }
+    ]
+   },
+   "planning_ms": 0.105
+  },
+  "q06_chain6": {
+   "sql": "SELECT count(*) FROM t1, t2, t3, t4, t5, t6 WHERE t1.fk = t2.id AND t2.fk = t3.id AND t3.fk = t4.id AND t4.fk = t5.id AND t5.fk = t6.id AND t1.a < 10 AND t3.b = 5",
+   "messages": [],
+   "plan": {
+    "Node Type": "Aggregate",
+    "Strategy": "Plain",
+    "Partial Mode": "Simple",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Startup Cost": 1590.14,
+    "Total Cost": 1590.15,
+    "Plan Rows": 1,
+    "Plan Width": 8,
+    "Plans": [
+     {
+      "Node Type": "Nested Loop",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Inner",
+      "Startup Cost": 1.45,
+      "Total Cost": 1590.13,
+      "Plan Rows": 2,
+      "Plan Width": 0,
+      "Inner Unique": true,
+      "Plans": [
+       {
+        "Node Type": "Nested Loop",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Join Type": "Inner",
+        "Startup Cost": 1.16,
+        "Total Cost": 1589.49,
+        "Plan Rows": 2,
+        "Plan Width": 4,
+        "Inner Unique": true,
+        "Plans": [
+         {
+          "Node Type": "Nested Loop",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Join Type": "Inner",
+          "Startup Cost": 0.87,
+          "Total Cost": 1588.78,
+          "Plan Rows": 2,
+          "Plan Width": 4,
+          "Inner Unique": true,
+          "Plans": [
+           {
+            "Node Type": "Nested Loop",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Join Type": "Inner",
+            "Startup Cost": 0.58,
+            "Total Cost": 1573.49,
+            "Plan Rows": 2,
+            "Plan Width": 4,
+            "Inner Unique": false,
+            "Plans": [
+             {
+              "Node Type": "Nested Loop",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Join Type": "Inner",
+              "Startup Cost": 0.29,
+              "Total Cost": 1560.05,
+              "Plan Rows": 40,
+              "Plan Width": 8,
+              "Inner Unique": false,
+              "Plans": [
+               {
+                "Node Type": "Seq Scan",
+                "Parent Relationship": "Outer",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "t3",
+                "Alias": "t3",
+                "Startup Cost": 0.0,
+                "Total Cost": 1133.0,
+                "Plan Rows": 60,
+                "Plan Width": 8,
+                "Filter": "(b = 5)"
+               },
+               {
+                "Node Type": "Index Scan",
+                "Parent Relationship": "Inner",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Scan Direction": "Forward",
+                "Index Name": "t2_fk_idx",
+                "Relation Name": "t2",
+                "Alias": "t2",
+                "Startup Cost": 0.29,
+                "Total Cost": 7.11,
+                "Plan Rows": 1,
+                "Plan Width": 8,
+                "Index Cond": "(fk = t3.id)"
+               }
+              ]
+             },
+             {
+              "Node Type": "Index Scan",
+              "Parent Relationship": "Inner",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Scan Direction": "Forward",
+              "Index Name": "t1_fk_idx",
+              "Relation Name": "t1",
+              "Alias": "t1",
+              "Startup Cost": 0.29,
+              "Total Cost": 0.33,
+              "Plan Rows": 1,
+              "Plan Width": 4,
+              "Index Cond": "(fk = t2.id)",
+              "Filter": "(a < 10)"
+             }
+            ]
+           },
+           {
+            "Node Type": "Index Scan",
+            "Parent Relationship": "Inner",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Scan Direction": "Forward",
+            "Index Name": "t4_pkey",
+            "Relation Name": "t4",
+            "Alias": "t4",
+            "Startup Cost": 0.29,
+            "Total Cost": 7.64,
+            "Plan Rows": 1,
+            "Plan Width": 8,
+            "Index Cond": "(id = t3.fk)"
+           }
+          ]
+         },
+         {
+          "Node Type": "Index Scan",
+          "Parent Relationship": "Inner",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Scan Direction": "Forward",
+          "Index Name": "t5_pkey",
+          "Relation Name": "t5",
+          "Alias": "t5",
+          "Startup Cost": 0.29,
+          "Total Cost": 0.36,
+          "Plan Rows": 1,
+          "Plan Width": 8,
+          "Index Cond": "(id = t4.fk)"
+         }
+        ]
+       },
+       {
+        "Node Type": "Index Only Scan",
+        "Parent Relationship": "Inner",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Scan Direction": "Forward",
+        "Index Name": "t6_pkey",
+        "Relation Name": "t6",
+        "Alias": "t6",
+        "Startup Cost": 0.29,
+        "Total Cost": 0.32,
+        "Plan Rows": 1,
+        "Plan Width": 4,
+        "Index Cond": "(id = t5.fk)"
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.168
+  },
+  "q07_chain8": {
+   "sql": "SELECT count(*) FROM t1, t2, t3, t4, t5, t6, t7, t8 WHERE t1.fk = t2.id AND t2.fk = t3.id AND t3.fk = t4.id AND t4.fk = t5.id AND t5.fk = t6.id AND t6.fk = t7.id AND t7.fk = t8.id AND t1.a < 10 AND t3.b = 5",
+   "messages": [],
+   "plan": {
+    "Node Type": "Aggregate",
+    "Strategy": "Plain",
+    "Partial Mode": "Simple",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Startup Cost": 1591.81,
+    "Total Cost": 1591.82,
+    "Plan Rows": 1,
+    "Plan Width": 8,
+    "Plans": [
+     {
+      "Node Type": "Nested Loop",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Inner",
+      "Startup Cost": 2.17,
+      "Total Cost": 1591.81,
+      "Plan Rows": 2,
+      "Plan Width": 0,
+      "Inner Unique": true,
+      "Plans": [
+       {
+        "Node Type": "Nested Loop",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Join Type": "Inner",
+        "Startup Cost": 1.75,
+        "Total Cost": 1590.91,
+        "Plan Rows": 2,
+        "Plan Width": 4,
+        "Inner Unique": true,
+        "Plans": [
+         {
+          "Node Type": "Nested Loop",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Join Type": "Inner",
+          "Startup Cost": 1.45,
+          "Total Cost": 1590.2,
+          "Plan Rows": 2,
+          "Plan Width": 4,
+          "Inner Unique": true,
+          "Plans": [
+           {
+            "Node Type": "Nested Loop",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Join Type": "Inner",
+            "Startup Cost": 1.16,
+            "Total Cost": 1589.49,
+            "Plan Rows": 2,
+            "Plan Width": 4,
+            "Inner Unique": true,
+            "Plans": [
+             {
+              "Node Type": "Nested Loop",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Join Type": "Inner",
+              "Startup Cost": 0.87,
+              "Total Cost": 1588.78,
+              "Plan Rows": 2,
+              "Plan Width": 4,
+              "Inner Unique": true,
+              "Plans": [
+               {
+                "Node Type": "Nested Loop",
+                "Parent Relationship": "Outer",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Join Type": "Inner",
+                "Startup Cost": 0.58,
+                "Total Cost": 1573.49,
+                "Plan Rows": 2,
+                "Plan Width": 4,
+                "Inner Unique": false,
+                "Plans": [
+                 {
+                  "Node Type": "Nested Loop",
+                  "Parent Relationship": "Outer",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Join Type": "Inner",
+                  "Startup Cost": 0.29,
+                  "Total Cost": 1560.05,
+                  "Plan Rows": 40,
+                  "Plan Width": 8,
+                  "Inner Unique": false,
+                  "Plans": [
+                   {
+                    "Node Type": "Seq Scan",
+                    "Parent Relationship": "Outer",
+                    "Parallel Aware": false,
+                    "Async Capable": false,
+                    "Relation Name": "t3",
+                    "Alias": "t3",
+                    "Startup Cost": 0.0,
+                    "Total Cost": 1133.0,
+                    "Plan Rows": 60,
+                    "Plan Width": 8,
+                    "Filter": "(b = 5)"
+                   },
+                   {
+                    "Node Type": "Index Scan",
+                    "Parent Relationship": "Inner",
+                    "Parallel Aware": false,
+                    "Async Capable": false,
+                    "Scan Direction": "Forward",
+                    "Index Name": "t2_fk_idx",
+                    "Relation Name": "t2",
+                    "Alias": "t2",
+                    "Startup Cost": 0.29,
+                    "Total Cost": 7.11,
+                    "Plan Rows": 1,
+                    "Plan Width": 8,
+                    "Index Cond": "(fk = t3.id)"
+                   }
+                  ]
+                 },
+                 {
+                  "Node Type": "Index Scan",
+                  "Parent Relationship": "Inner",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Scan Direction": "Forward",
+                  "Index Name": "t1_fk_idx",
+                  "Relation Name": "t1",
+                  "Alias": "t1",
+                  "Startup Cost": 0.29,
+                  "Total Cost": 0.33,
+                  "Plan Rows": 1,
+                  "Plan Width": 4,
+                  "Index Cond": "(fk = t2.id)",
+                  "Filter": "(a < 10)"
+                 }
+                ]
+               },
+               {
+                "Node Type": "Index Scan",
+                "Parent Relationship": "Inner",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Scan Direction": "Forward",
+                "Index Name": "t4_pkey",
+                "Relation Name": "t4",
+                "Alias": "t4",
+                "Startup Cost": 0.29,
+                "Total Cost": 7.64,
+                "Plan Rows": 1,
+                "Plan Width": 8,
+                "Index Cond": "(id = t3.fk)"
+               }
+              ]
+             },
+             {
+              "Node Type": "Index Scan",
+              "Parent Relationship": "Inner",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Scan Direction": "Forward",
+              "Index Name": "t5_pkey",
+              "Relation Name": "t5",
+              "Alias": "t5",
+              "Startup Cost": 0.29,
+              "Total Cost": 0.36,
+              "Plan Rows": 1,
+              "Plan Width": 8,
+              "Index Cond": "(id = t4.fk)"
+             }
+            ]
+           },
+           {
+            "Node Type": "Index Scan",
+            "Parent Relationship": "Inner",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Scan Direction": "Forward",
+            "Index Name": "t6_pkey",
+            "Relation Name": "t6",
+            "Alias": "t6",
+            "Startup Cost": 0.29,
+            "Total Cost": 0.35,
+            "Plan Rows": 1,
+            "Plan Width": 8,
+            "Index Cond": "(id = t5.fk)"
+           }
+          ]
+         },
+         {
+          "Node Type": "Index Scan",
+          "Parent Relationship": "Inner",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Scan Direction": "Forward",
+          "Index Name": "t7_pkey",
+          "Relation Name": "t7",
+          "Alias": "t7",
+          "Startup Cost": 0.29,
+          "Total Cost": 0.36,
+          "Plan Rows": 1,
+          "Plan Width": 8,
+          "Index Cond": "(id = t6.fk)"
+         }
+        ]
+       },
+       {
+        "Node Type": "Index Only Scan",
+        "Parent Relationship": "Inner",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Scan Direction": "Forward",
+        "Index Name": "t8_pkey",
+        "Relation Name": "t8",
+        "Alias": "t8",
+        "Startup Cost": 0.42,
+        "Total Cost": 0.45,
+        "Plan Rows": 1,
+        "Plan Width": 4,
+        "Index Cond": "(id = t7.fk)"
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.289
+  },
+  "q10_clique4": {
+   "sql": "SELECT count(*) FROM t1, t2, t3, t4 WHERE t1.a = t2.a AND t2.a = t3.a AND t3.a = t4.a AND t1.b < 3",
+   "messages": [],
+   "plan": {
+    "Node Type": "Aggregate",
+    "Strategy": "Plain",
+    "Partial Mode": "Simple",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Startup Cost": 158836380.57,
+    "Total Cost": 158836380.58,
+    "Plan Rows": 1,
+    "Plan Width": 8,
+    "Plans": [
+     {
+      "Node Type": "Hash Join",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Inner",
+      "Startup Cost": 1155.89,
+      "Total Cost": 130036381.3,
+      "Plan Rows": 11519999709,
+      "Plan Width": 0,
+      "Inner Unique": false,
+      "Hash Cond": "(t1.a = t2.a)",
+      "Plans": [
+       {
+        "Node Type": "Nested Loop",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Join Type": "Inner",
+        "Startup Cost": 0.89,
+        "Total Cost": 363233.71,
+        "Plan Rows": 28799999,
+        "Plan Width": 12,
+        "Inner Unique": false,
+        "Plans": [
+         {
+          "Node Type": "Nested Loop",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Join Type": "Inner",
+          "Startup Cost": 0.59,
+          "Total Cost": 1993.35,
+          "Plan Rows": 36000,
+          "Plan Width": 8,
+          "Inner Unique": false,
+          "Plans": [
+           {
+            "Node Type": "Index Scan",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Scan Direction": "Forward",
+            "Index Name": "t1_a_idx",
+            "Relation Name": "t1",
+            "Alias": "t1",
+            "Startup Cost": 0.29,
+            "Total Cost": 938.21,
+            "Plan Rows": 60,
+            "Plan Width": 4,
+            "Filter": "(b < 3)"
+           },
+           {
+            "Node Type": "Memoize",
+            "Parent Relationship": "Inner",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 0.3,
+            "Total Cost": 13.4,
+            "Plan Rows": 600,
+            "Plan Width": 4,
+            "Cache Key": "t1.a",
+            "Cache Mode": "logical",
+            "Plans": [
+             {
+              "Node Type": "Index Only Scan",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Scan Direction": "Forward",
+              "Index Name": "t3_a_idx",
+              "Relation Name": "t3",
+              "Alias": "t3",
+              "Startup Cost": 0.29,
+              "Total Cost": 13.39,
+              "Plan Rows": 600,
+              "Plan Width": 4,
+              "Index Cond": "(a = t1.a)"
+             }
+            ]
+           }
+          ]
+         },
+         {
+          "Node Type": "Memoize",
+          "Parent Relationship": "Inner",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 0.3,
+          "Total Cost": 17.24,
+          "Plan Rows": 800,
+          "Plan Width": 4,
+          "Cache Key": "t1.a",
+          "Cache Mode": "logical",
+          "Plans": [
+           {
+            "Node Type": "Index Only Scan",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Scan Direction": "Forward",
+            "Index Name": "t4_a_idx",
+            "Relation Name": "t4",
+            "Alias": "t4",
+            "Startup Cost": 0.29,
+            "Total Cost": 17.23,
+            "Plan Rows": 800,
+            "Plan Width": 4,
+            "Index Cond": "(a = t1.a)"
+           }
+          ]
+         }
+        ]
+       },
+       {
+        "Node Type": "Hash",
+        "Parent Relationship": "Inner",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 655.0,
+        "Total Cost": 655.0,
+        "Plan Rows": 40000,
+        "Plan Width": 4,
+        "Plans": [
+         {
+          "Node Type": "Seq Scan",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Relation Name": "t2",
+          "Alias": "t2",
+          "Startup Cost": 0.0,
+          "Total Cost": 655.0,
+          "Plan Rows": 40000,
+          "Plan Width": 4
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.113
+  },
+  "q11_clique6": {
+   "sql": "SELECT count(*) FROM t1, t2, t3, t4, t5, t6 WHERE t1.a = t2.a AND t2.a = t3.a AND t3.a = t4.a AND t4.a = t5.a AND t5.a = t6.a AND t1.b < 3",
+   "messages": [],
+   "plan": {
+    "Node Type": "Aggregate",
+    "Strategy": "Plain",
+    "Partial Mode": "Simple",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Startup Cost": 190599101321914.16,
+    "Total Cost": 190599101321914.16,
+    "Plan Rows": 1,
+    "Plan Width": 8,
+    "Plans": [
+     {
+      "Node Type": "Hash Join",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Inner",
+      "Startup Cost": 1156.5,
+      "Total Cost": 156039103941033.16,
+      "Plan Rows": 13823998952352404,
+      "Plan Width": 0,
+      "Inner Unique": false,
+      "Hash Cond": "(t1.a = t2.a)",
+      "Plans": [
+       {
+        "Node Type": "Nested Loop",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Join Type": "Inner",
+        "Startup Cost": 1.49,
+        "Total Cost": 432720699446.14,
+        "Plan Rows": 34559997053341,
+        "Plan Width": 20,
+        "Inner Unique": false,
+        "Plans": [
+         {
+          "Node Type": "Nested Loop",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Join Type": "Inner",
+          "Startup Cost": 1.19,
+          "Total Cost": 360724178.22,
+          "Plan Rows": 28799998272,
+          "Plan Width": 16,
+          "Inner Unique": false,
+          "Plans": [
+           {
+            "Node Type": "Nested Loop",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Join Type": "Inner",
+            "Startup Cost": 0.89,
+            "Total Cost": 363233.71,
+            "Plan Rows": 28799999,
+            "Plan Width": 12,
+            "Inner Unique": false,
+            "Plans": [
+             {
+              "Node Type": "Nested Loop",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Join Type": "Inner",
+              "Startup Cost": 0.59,
+              "Total Cost": 1993.35,
+              "Plan Rows": 36000,
+              "Plan Width": 8,
+              "Inner Unique": false,
+              "Plans": [
+               {
+                "Node Type": "Index Scan",
+                "Parent Relationship": "Outer",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Scan Direction": "Forward",
+                "Index Name": "t1_a_idx",
+                "Relation Name": "t1",
+                "Alias": "t1",
+                "Startup Cost": 0.29,
+                "Total Cost": 938.21,
+                "Plan Rows": 60,
+                "Plan Width": 4,
+                "Filter": "(b < 3)"
+               },
+               {
+                "Node Type": "Memoize",
+                "Parent Relationship": "Inner",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Startup Cost": 0.3,
+                "Total Cost": 13.4,
+                "Plan Rows": 600,
+                "Plan Width": 4,
+                "Cache Key": "t1.a",
+                "Cache Mode": "logical",
+                "Plans": [
+                 {
+                  "Node Type": "Index Only Scan",
+                  "Parent Relationship": "Outer",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Scan Direction": "Forward",
+                  "Index Name": "t3_a_idx",
+                  "Relation Name": "t3",
+                  "Alias": "t3",
+                  "Startup Cost": 0.29,
+                  "Total Cost": 13.39,
+                  "Plan Rows": 600,
+                  "Plan Width": 4,
+                  "Index Cond": "(a = t1.a)"
+                 }
+                ]
+               }
+              ]
+             },
+             {
+              "Node Type": "Memoize",
+              "Parent Relationship": "Inner",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Startup Cost": 0.3,
+              "Total Cost": 17.24,
+              "Plan Rows": 800,
+              "Plan Width": 4,
+              "Cache Key": "t1.a",
+              "Cache Mode": "logical",
+              "Plans": [
+               {
+                "Node Type": "Index Only Scan",
+                "Parent Relationship": "Outer",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Scan Direction": "Forward",
+                "Index Name": "t4_a_idx",
+                "Relation Name": "t4",
+                "Alias": "t4",
+                "Startup Cost": 0.29,
+                "Total Cost": 17.23,
+                "Plan Rows": 800,
+                "Plan Width": 4,
+                "Index Cond": "(a = t1.a)"
+               }
+              ]
+             }
+            ]
+           },
+           {
+            "Node Type": "Memoize",
+            "Parent Relationship": "Inner",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 0.3,
+            "Total Cost": 20.87,
+            "Plan Rows": 1000,
+            "Plan Width": 4,
+            "Cache Key": "t1.a",
+            "Cache Mode": "logical",
+            "Plans": [
+             {
+              "Node Type": "Index Only Scan",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Scan Direction": "Forward",
+              "Index Name": "t5_a_idx",
+              "Relation Name": "t5",
+              "Alias": "t5",
+              "Startup Cost": 0.29,
+              "Total Cost": 20.86,
+              "Plan Rows": 1000,
+              "Plan Width": 4,
+              "Index Cond": "(a = t1.a)"
+             }
+            ]
+           }
+          ]
+         },
+         {
+          "Node Type": "Memoize",
+          "Parent Relationship": "Inner",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 0.3,
+          "Total Cost": 26.37,
+          "Plan Rows": 1200,
+          "Plan Width": 4,
+          "Cache Key": "t1.a",
+          "Cache Mode": "logical",
+          "Plans": [
+           {
+            "Node Type": "Index Only Scan",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Scan Direction": "Forward",
+            "Index Name": "t6_a_idx",
+            "Relation Name": "t6",
+            "Alias": "t6",
+            "Startup Cost": 0.29,
+            "Total Cost": 26.36,
+            "Plan Rows": 1200,
+            "Plan Width": 4,
+            "Index Cond": "(a = t1.a)"
+           }
+          ]
+         }
+        ]
+       },
+       {
+        "Node Type": "Hash",
+        "Parent Relationship": "Inner",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 655.0,
+        "Total Cost": 655.0,
+        "Plan Rows": 40000,
+        "Plan Width": 4,
+        "Plans": [
+         {
+          "Node Type": "Seq Scan",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Relation Name": "t2",
+          "Alias": "t2",
+          "Startup Cost": 0.0,
+          "Total Cost": 655.0,
+          "Plan Rows": 40000,
+          "Plan Width": 4
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.656
+  },
+  "q12_clique8": {
+   "sql": "SELECT count(*) FROM t1, t2, t3, t4, t5, t6, t7, t8 WHERE t1.a = t2.a AND t2.a = t3.a AND t3.a = t4.a AND t4.a = t5.a AND t5.a = t6.a AND t6.a = t7.a AND t7.a = t8.a AND t1.b < 3",
+   "messages": [],
+   "plan": {
+    "Node Type": "Aggregate",
+    "Strategy": "Plain",
+    "Partial Mode": "Simple",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Startup Cost": 4.269415614274409e+20,
+    "Total Cost": 4.269415614274409e+20,
+    "Plan Rows": 1,
+    "Plan Width": 8,
+    "Plans": [
+     {
+      "Node Type": "Hash Join",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Inner",
+      "Startup Cost": 1157.11,
+      "Total Cost": 3.4952717120557154e+20,
+      "Plan Rows": 30965756088747737219072,
+      "Plan Width": 0,
+      "Inner Unique": false,
+      "Hash Cond": "(t1.a = t2.a)",
+      "Plans": [
+       {
+        "Node Type": "Nested Loop",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Join Type": "Inner",
+        "Startup Cost": 2.1,
+        "Total Cost": 9.688903576501512e+17,
+        "Plan Rows": 77414389488179740672,
+        "Plan Width": 28,
+        "Inner Unique": false,
+        "Plans": [
+         {
+          "Node Type": "Nested Loop",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Join Type": "Inner",
+          "Startup Cost": 1.8,
+          "Total Cost": 605664669097468.9,
+          "Plan Rows": 48383994652394856,
+          "Plan Width": 24,
+          "Inner Unique": false,
+          "Plans": [
+           {
+            "Node Type": "Nested Loop",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Join Type": "Inner",
+            "Startup Cost": 1.49,
+            "Total Cost": 432720699446.14,
+            "Plan Rows": 34559997053341,
+            "Plan Width": 20,
+            "Inner Unique": false,
+            "Plans": [
+             {
+              "Node Type": "Nested Loop",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Join Type": "Inner",
+              "Startup Cost": 1.19,
+              "Total Cost": 360724178.22,
+              "Plan Rows": 28799998272,
+              "Plan Width": 16,
+              "Inner Unique": false,
+              "Plans": [
+               {
+                "Node Type": "Nested Loop",
+                "Parent Relationship": "Outer",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Join Type": "Inner",
+                "Startup Cost": 0.89,
+                "Total Cost": 363233.71,
+                "Plan Rows": 28799999,
+                "Plan Width": 12,
+                "Inner Unique": false,
+                "Plans": [
+                 {
+                  "Node Type": "Nested Loop",
+                  "Parent Relationship": "Outer",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Join Type": "Inner",
+                  "Startup Cost": 0.59,
+                  "Total Cost": 1993.35,
+                  "Plan Rows": 36000,
+                  "Plan Width": 8,
+                  "Inner Unique": false,
+                  "Plans": [
+                   {
+                    "Node Type": "Index Scan",
+                    "Parent Relationship": "Outer",
+                    "Parallel Aware": false,
+                    "Async Capable": false,
+                    "Scan Direction": "Forward",
+                    "Index Name": "t1_a_idx",
+                    "Relation Name": "t1",
+                    "Alias": "t1",
+                    "Startup Cost": 0.29,
+                    "Total Cost": 938.21,
+                    "Plan Rows": 60,
+                    "Plan Width": 4,
+                    "Filter": "(b < 3)"
+                   },
+                   {
+                    "Node Type": "Memoize",
+                    "Parent Relationship": "Inner",
+                    "Parallel Aware": false,
+                    "Async Capable": false,
+                    "Startup Cost": 0.3,
+                    "Total Cost": 13.4,
+                    "Plan Rows": 600,
+                    "Plan Width": 4,
+                    "Cache Key": "t1.a",
+                    "Cache Mode": "logical",
+                    "Plans": [
+                     {
+                      "Node Type": "Index Only Scan",
+                      "Parent Relationship": "Outer",
+                      "Parallel Aware": false,
+                      "Async Capable": false,
+                      "Scan Direction": "Forward",
+                      "Index Name": "t3_a_idx",
+                      "Relation Name": "t3",
+                      "Alias": "t3",
+                      "Startup Cost": 0.29,
+                      "Total Cost": 13.39,
+                      "Plan Rows": 600,
+                      "Plan Width": 4,
+                      "Index Cond": "(a = t1.a)"
+                     }
+                    ]
+                   }
+                  ]
+                 },
+                 {
+                  "Node Type": "Memoize",
+                  "Parent Relationship": "Inner",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Startup Cost": 0.3,
+                  "Total Cost": 17.24,
+                  "Plan Rows": 800,
+                  "Plan Width": 4,
+                  "Cache Key": "t1.a",
+                  "Cache Mode": "logical",
+                  "Plans": [
+                   {
+                    "Node Type": "Index Only Scan",
+                    "Parent Relationship": "Outer",
+                    "Parallel Aware": false,
+                    "Async Capable": false,
+                    "Scan Direction": "Forward",
+                    "Index Name": "t4_a_idx",
+                    "Relation Name": "t4",
+                    "Alias": "t4",
+                    "Startup Cost": 0.29,
+                    "Total Cost": 17.23,
+                    "Plan Rows": 800,
+                    "Plan Width": 4,
+                    "Index Cond": "(a = t1.a)"
+                   }
+                  ]
+                 }
+                ]
+               },
+               {
+                "Node Type": "Memoize",
+                "Parent Relationship": "Inner",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Startup Cost": 0.3,
+                "Total Cost": 20.87,
+                "Plan Rows": 1000,
+                "Plan Width": 4,
+                "Cache Key": "t1.a",
+                "Cache Mode": "logical",
+                "Plans": [
+                 {
+                  "Node Type": "Index Only Scan",
+                  "Parent Relationship": "Outer",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Scan Direction": "Forward",
+                  "Index Name": "t5_a_idx",
+                  "Relation Name": "t5",
+                  "Alias": "t5",
+                  "Startup Cost": 0.29,
+                  "Total Cost": 20.86,
+                  "Plan Rows": 1000,
+                  "Plan Width": 4,
+                  "Index Cond": "(a = t1.a)"
+                 }
+                ]
+               }
+              ]
+             },
+             {
+              "Node Type": "Memoize",
+              "Parent Relationship": "Inner",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Startup Cost": 0.3,
+              "Total Cost": 26.37,
+              "Plan Rows": 1200,
+              "Plan Width": 4,
+              "Cache Key": "t1.a",
+              "Cache Mode": "logical",
+              "Plans": [
+               {
+                "Node Type": "Index Only Scan",
+                "Parent Relationship": "Outer",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Scan Direction": "Forward",
+                "Index Name": "t6_a_idx",
+                "Relation Name": "t6",
+                "Alias": "t6",
+                "Startup Cost": 0.29,
+                "Total Cost": 26.36,
+                "Plan Rows": 1200,
+                "Plan Width": 4,
+                "Index Cond": "(a = t1.a)"
+               }
+              ]
+             }
+            ]
+           },
+           {
+            "Node Type": "Memoize",
+            "Parent Relationship": "Inner",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 0.3,
+            "Total Cost": 30.27,
+            "Plan Rows": 1400,
+            "Plan Width": 4,
+            "Cache Key": "t1.a",
+            "Cache Mode": "logical",
+            "Plans": [
+             {
+              "Node Type": "Index Only Scan",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Scan Direction": "Forward",
+              "Index Name": "t7_a_idx",
+              "Relation Name": "t7",
+              "Alias": "t7",
+              "Startup Cost": 0.29,
+              "Total Cost": 30.26,
+              "Plan Rows": 1400,
+              "Plan Width": 4,
+              "Index Cond": "(a = t1.a)"
+             }
+            ]
+           }
+          ]
+         },
+         {
+          "Node Type": "Memoize",
+          "Parent Relationship": "Inner",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 0.3,
+          "Total Cost": 34.04,
+          "Plan Rows": 1600,
+          "Plan Width": 4,
+          "Cache Key": "t1.a",
+          "Cache Mode": "logical",
+          "Plans": [
+           {
+            "Node Type": "Index Only Scan",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Scan Direction": "Forward",
+            "Index Name": "t8_a_idx",
+            "Relation Name": "t8",
+            "Alias": "t8",
+            "Startup Cost": 0.29,
+            "Total Cost": 34.03,
+            "Plan Rows": 1600,
+            "Plan Width": 4,
+            "Index Cond": "(a = t1.a)"
+           }
+          ]
+         }
+        ]
+       },
+       {
+        "Node Type": "Hash",
+        "Parent Relationship": "Inner",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 655.0,
+        "Total Cost": 655.0,
+        "Plan Rows": 40000,
+        "Plan Width": 4,
+        "Plans": [
+         {
+          "Node Type": "Seq Scan",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Relation Name": "t2",
+          "Alias": "t2",
+          "Startup Cost": 0.0,
+          "Total Cost": 655.0,
+          "Plan Rows": 40000,
+          "Plan Width": 4
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 5.083
+  },
+  "q20_star": {
+   "sql": "SELECT count(*) FROM t1, t2, t3, t4, t5 WHERE t2.fk = t1.id AND t3.fk = t1.id AND t4.fk = t1.id AND t5.fk = t1.id AND t1.b < 50 AND t2.a = 1",
+   "messages": [],
+   "plan": {
+    "Node Type": "Aggregate",
+    "Strategy": "Plain",
+    "Partial Mode": "Simple",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Startup Cost": 681.78,
+    "Total Cost": 681.79,
+    "Plan Rows": 1,
+    "Plan Width": 8,
+    "Plans": [
+     {
+      "Node Type": "Nested Loop",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Inner",
+      "Startup Cost": 284.21,
+      "Total Cost": 681.75,
+      "Plan Rows": 10,
+      "Plan Width": 0,
+      "Inner Unique": false,
+      "Join Filter": "(t2.fk = t4.fk)",
+      "Plans": [
+       {
+        "Node Type": "Nested Loop",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Join Type": "Inner",
+        "Startup Cost": 283.92,
+        "Total Cost": 678.44,
+        "Plan Rows": 10,
+        "Plan Width": 16,
+        "Inner Unique": false,
+        "Join Filter": "(t2.fk = t5.fk)",
+        "Plans": [
+         {
+          "Node Type": "Nested Loop",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Join Type": "Inner",
+          "Startup Cost": 283.63,
+          "Total Cost": 675.03,
+          "Plan Rows": 10,
+          "Plan Width": 12,
+          "Inner Unique": false,
+          "Join Filter": "(t2.fk = t3.fk)",
+          "Plans": [
+           {
+            "Node Type": "Hash Join",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Join Type": "Inner",
+            "Startup Cost": 283.34,
+            "Total Cost": 665.19,
+            "Plan Rows": 10,
+            "Plan Width": 8,
+            "Inner Unique": false,
+            "Hash Cond": "(t1.id = t2.fk)",
+            "Plans": [
+             {
+              "Node Type": "Seq Scan",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Relation Name": "t1",
+              "Alias": "t1",
+              "Startup Cost": 0.0,
+              "Total Cost": 378.0,
+              "Plan Rows": 1000,
+              "Plan Width": 4,
+              "Filter": "(b < 50)"
+             },
+             {
+              "Node Type": "Hash",
+              "Parent Relationship": "Inner",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Startup Cost": 278.34,
+              "Total Cost": 278.34,
+              "Plan Rows": 400,
+              "Plan Width": 4,
+              "Plans": [
+               {
+                "Node Type": "Bitmap Heap Scan",
+                "Parent Relationship": "Outer",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "t2",
+                "Alias": "t2",
+                "Startup Cost": 7.39,
+                "Total Cost": 278.34,
+                "Plan Rows": 400,
+                "Plan Width": 4,
+                "Recheck Cond": "(a = 1)",
+                "Plans": [
+                 {
+                  "Node Type": "Bitmap Index Scan",
+                  "Parent Relationship": "Outer",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Index Name": "t2_a_idx",
+                  "Startup Cost": 0.0,
+                  "Total Cost": 7.29,
+                  "Plan Rows": 400,
+                  "Plan Width": 0,
+                  "Index Cond": "(a = 1)"
+                 }
+                ]
+               }
+              ]
+             }
+            ]
+           },
+           {
+            "Node Type": "Index Only Scan",
+            "Parent Relationship": "Inner",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Scan Direction": "Forward",
+            "Index Name": "t3_fk_idx",
+            "Relation Name": "t3",
+            "Alias": "t3",
+            "Startup Cost": 0.29,
+            "Total Cost": 0.97,
+            "Plan Rows": 1,
+            "Plan Width": 4,
+            "Index Cond": "(fk = t1.id)"
+           }
+          ]
+         },
+         {
+          "Node Type": "Index Only Scan",
+          "Parent Relationship": "Inner",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Scan Direction": "Forward",
+          "Index Name": "t5_fk_idx",
+          "Relation Name": "t5",
+          "Alias": "t5",
+          "Startup Cost": 0.29,
+          "Total Cost": 0.33,
+          "Plan Rows": 1,
+          "Plan Width": 4,
+          "Index Cond": "(fk = t3.fk)"
+         }
+        ]
+       },
+       {
+        "Node Type": "Index Only Scan",
+        "Parent Relationship": "Inner",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Scan Direction": "Forward",
+        "Index Name": "t4_fk_idx",
+        "Relation Name": "t4",
+        "Alias": "t4",
+        "Startup Cost": 0.29,
+        "Total Cost": 0.32,
+        "Plan Rows": 1,
+        "Plan Width": 4,
+        "Index Cond": "(fk = t5.fk)"
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.324
+  },
+  "q30_semi": {
+   "sql": "SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.fk = t1.id AND t2.b < 5)",
+   "messages": [],
+   "plan": {
+    "Node Type": "Hash Join",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Join Type": "Semi",
+    "Startup Cost": 757.5,
+    "Total Cost": 1139.11,
+    "Plan Rows": 100,
+    "Plan Width": 20,
+    "Inner Unique": false,
+    "Hash Cond": "(t1.id = t2.fk)",
+    "Plans": [
+     {
+      "Node Type": "Seq Scan",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Relation Name": "t1",
+      "Alias": "t1",
+      "Startup Cost": 0.0,
+      "Total Cost": 328.0,
+      "Plan Rows": 20000,
+      "Plan Width": 20
+     },
+     {
+      "Node Type": "Hash",
+      "Parent Relationship": "Inner",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Startup Cost": 755.0,
+      "Total Cost": 755.0,
+      "Plan Rows": 200,
+      "Plan Width": 4,
+      "Plans": [
+       {
+        "Node Type": "Seq Scan",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Relation Name": "t2",
+        "Alias": "t2",
+        "Startup Cost": 0.0,
+        "Total Cost": 755.0,
+        "Plan Rows": 200,
+        "Plan Width": 4,
+        "Filter": "(b < 5)"
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.04
+  },
+  "q31_anti": {
+   "sql": "SELECT count(*) FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.fk = t1.id AND t2.b < 500)",
+   "messages": [],
+   "plan": {
+    "Node Type": "Aggregate",
+    "Strategy": "Plain",
+    "Partial Mode": "Simple",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Startup Cost": 1443.06,
+    "Total Cost": 1443.07,
+    "Plan Rows": 1,
+    "Plan Width": 8,
+    "Plans": [
+     {
+      "Node Type": "Merge Join",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Anti",
+      "Startup Cost": 0.58,
+      "Total Cost": 1418.06,
+      "Plan Rows": 10000,
+      "Plan Width": 0,
+      "Inner Unique": false,
+      "Merge Cond": "(t1.id = t2.fk)",
+      "Plans": [
+       {
+        "Node Type": "Index Only Scan",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Scan Direction": "Forward",
+        "Index Name": "t1_pkey",
+        "Relation Name": "t1",
+        "Alias": "t1",
+        "Startup Cost": 0.29,
+        "Total Cost": 528.29,
+        "Plan Rows": 20000,
+        "Plan Width": 4
+       },
+       {
+        "Node Type": "Index Scan",
+        "Parent Relationship": "Inner",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Scan Direction": "Forward",
+        "Index Name": "t2_fk_idx",
+        "Relation Name": "t2",
+        "Alias": "t2",
+        "Startup Cost": 0.29,
+        "Total Cost": 2168.29,
+        "Plan Rows": 20000,
+        "Plan Width": 4,
+        "Filter": "(b < 500)"
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.03
+  },
+  "q32_left": {
+   "sql": "SELECT * FROM t1 LEFT JOIN t2 ON t2.fk = t1.id WHERE t1.a < 5",
+   "messages": [],
+   "plan": {
+    "Node Type": "Hash Join",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Join Type": "Right",
+    "Startup Cost": 165.04,
+    "Total Cost": 925.05,
+    "Plan Rows": 1000,
+    "Plan Width": 40,
+    "Inner Unique": true,
+    "Hash Cond": "(t2.fk = t1.id)",
+    "Plans": [
+     {
+      "Node Type": "Seq Scan",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Relation Name": "t2",
+      "Alias": "t2",
+      "Startup Cost": 0.0,
+      "Total Cost": 655.0,
+      "Plan Rows": 40000,
+      "Plan Width": 20
+     },
+     {
+      "Node Type": "Hash",
+      "Parent Relationship": "Inner",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Startup Cost": 152.54,
+      "Total Cost": 152.54,
+      "Plan Rows": 1000,
+      "Plan Width": 20,
+      "Plans": [
+       {
+        "Node Type": "Bitmap Heap Scan",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Relation Name": "t1",
+        "Alias": "t1",
+        "Startup Cost": 12.04,
+        "Total Cost": 152.54,
+        "Plan Rows": 1000,
+        "Plan Width": 20,
+        "Recheck Cond": "(a < 5)",
+        "Plans": [
+         {
+          "Node Type": "Bitmap Index Scan",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Index Name": "t1_a_idx",
+          "Startup Cost": 0.0,
+          "Total Cost": 11.79,
+          "Plan Rows": 1000,
+          "Plan Width": 0,
+          "Index Cond": "(a < 5)"
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.035
+  },
+  "q33_full": {
+   "sql": "SELECT count(*) FROM t1 FULL JOIN t2 ON t2.fk = t1.id",
+   "messages": [],
+   "plan": {
+    "Node Type": "Aggregate",
+    "Strategy": "Plain",
+    "Partial Mode": "Simple",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Startup Cost": 1438.01,
+    "Total Cost": 1438.02,
+    "Plan Rows": 1,
+    "Plan Width": 8,
+    "Plans": [
+     {
+      "Node Type": "Hash Join",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Full",
+      "Startup Cost": 578.0,
+      "Total Cost": 1338.01,
+      "Plan Rows": 40000,
+      "Plan Width": 0,
+      "Inner Unique": true,
+      "Hash Cond": "(t2.fk = t1.id)",
+      "Plans": [
+       {
+        "Node Type": "Seq Scan",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Relation Name": "t2",
+        "Alias": "t2",
+        "Startup Cost": 0.0,
+        "Total Cost": 655.0,
+        "Plan Rows": 40000,
+        "Plan Width": 4
+       },
+       {
+        "Node Type": "Hash",
+        "Parent Relationship": "Inner",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 328.0,
+        "Total Cost": 328.0,
+        "Plan Rows": 20000,
+        "Plan Width": 4,
+        "Plans": [
+         {
+          "Node Type": "Seq Scan",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Relation Name": "t1",
+          "Alias": "t1",
+          "Startup Cost": 0.0,
+          "Total Cost": 328.0,
+          "Plan Rows": 20000,
+          "Plan Width": 4
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.011
+  },
+  "q34_in_subquery": {
+   "sql": "SELECT * FROM t1 WHERE t1.id IN (SELECT fk FROM t3 WHERE b = 7)",
+   "messages": [],
+   "plan": {
+    "Node Type": "Merge Join",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Join Type": "Semi",
+    "Startup Cost": 0.61,
+    "Total Cost": 1521.31,
+    "Plan Rows": 20,
+    "Plan Width": 20,
+    "Inner Unique": false,
+    "Merge Cond": "(t1.id = t3.fk)",
+    "Plans": [
+     {
+      "Node Type": "Index Scan",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Scan Direction": "Forward",
+      "Index Name": "t1_pkey",
+      "Relation Name": "t1",
+      "Alias": "t1",
+      "Startup Cost": 0.29,
+      "Total Cost": 659.29,
+      "Plan Rows": 20000,
+      "Plan Width": 20
+     },
+     {
+      "Node Type": "Index Scan",
+      "Parent Relationship": "Inner",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Scan Direction": "Forward",
+      "Index Name": "t3_fk_idx",
+      "Relation Name": "t3",
+      "Alias": "t3",
+      "Startup Cost": 0.29,
+      "Total Cost": 3246.29,
+      "Plan Rows": 60,
+      "Plan Width": 4,
+      "Filter": "(b = 7)"
+     }
+    ]
+   },
+   "planning_ms": 0.038
+  },
+  "q40_groupby": {
+   "sql": "SELECT t2.a, count(*) FROM t1 JOIN t2 ON t1.fk = t2.id WHERE t1.b < 100 GROUP BY t2.a",
+   "messages": [],
+   "plan": {
+    "Node Type": "Aggregate",
+    "Strategy": "Hashed",
+    "Partial Mode": "Simple",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Startup Cost": 1238.0,
+    "Total Cost": 1239.0,
+    "Plan Rows": 100,
+    "Plan Width": 12,
+    "Group Key": [
+     "t2.a"
+    ],
+    "Planned Partitions": 0,
+    "Plans": [
+     {
+      "Node Type": "Hash Join",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Inner",
+      "Startup Cost": 403.0,
+      "Total Cost": 1228.0,
+      "Plan Rows": 2000,
+      "Plan Width": 4,
+      "Inner Unique": false,
+      "Hash Cond": "(t2.id = t1.fk)",
+      "Plans": [
+       {
+        "Node Type": "Seq Scan",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Relation Name": "t2",
+        "Alias": "t2",
+        "Startup Cost": 0.0,
+        "Total Cost": 655.0,
+        "Plan Rows": 40000,
+        "Plan Width": 8
+       },
+       {
+        "Node Type": "Hash",
+        "Parent Relationship": "Inner",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 378.0,
+        "Total Cost": 378.0,
+        "Plan Rows": 2000,
+        "Plan Width": 4,
+        "Plans": [
+         {
+          "Node Type": "Seq Scan",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Relation Name": "t1",
+          "Alias": "t1",
+          "Startup Cost": 0.0,
+          "Total Cost": 378.0,
+          "Plan Rows": 2000,
+          "Plan Width": 4,
+          "Filter": "(b < 100)"
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.038
+  },
+  "q41_order_limit": {
+   "sql": "SELECT * FROM t1 JOIN t2 ON t1.fk = t2.id ORDER BY t1.id LIMIT 10",
+   "messages": [],
+   "plan": {
+    "Node Type": "Limit",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Startup Cost": 0.58,
+    "Total Cost": 4.72,
+    "Plan Rows": 10,
+    "Plan Width": 40,
+    "Plans": [
+     {
+      "Node Type": "Nested Loop",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Inner",
+      "Startup Cost": 0.58,
+      "Total Cost": 8277.29,
+      "Plan Rows": 20000,
+      "Plan Width": 40,
+      "Inner Unique": true,
+      "Plans": [
+       {
+        "Node Type": "Index Scan",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Scan Direction": "Forward",
+        "Index Name": "t1_pkey",
+        "Relation Name": "t1",
+        "Alias": "t1",
+        "Startup Cost": 0.29,
+        "Total Cost": 659.29,
+        "Plan Rows": 20000,
+        "Plan Width": 20
+       },
+       {
+        "Node Type": "Index Scan",
+        "Parent Relationship": "Inner",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Scan Direction": "Forward",
+        "Index Name": "t2_pkey",
+        "Relation Name": "t2",
+        "Alias": "t2",
+        "Startup Cost": 0.29,
+        "Total Cost": 0.38,
+        "Plan Rows": 1,
+        "Plan Width": 20,
+        "Index Cond": "(id = t1.fk)"
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.037
+  },
+  "q42_distinct": {
+   "sql": "SELECT DISTINCT t2.b FROM t1 JOIN t2 ON t1.fk = t2.id WHERE t1.a = 3",
+   "messages": [],
+   "plan": {
+    "Node Type": "Unique",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Startup Cost": 958.96,
+    "Total Cost": 959.96,
+    "Plan Rows": 200,
+    "Plan Width": 4,
+    "Plans": [
+     {
+      "Node Type": "Sort",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Startup Cost": 958.96,
+      "Total Cost": 959.46,
+      "Plan Rows": 200,
+      "Plan Width": 4,
+      "Sort Key": [
+       "t2.b"
+      ],
+      "Plans": [
+       {
+        "Node Type": "Hash Join",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Join Type": "Inner",
+        "Startup Cost": 144.32,
+        "Total Cost": 951.32,
+        "Plan Rows": 200,
+        "Plan Width": 4,
+        "Inner Unique": false,
+        "Hash Cond": "(t2.id = t1.fk)",
+        "Plans": [
+         {
+          "Node Type": "Seq Scan",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Relation Name": "t2",
+          "Alias": "t2",
+          "Startup Cost": 0.0,
+          "Total Cost": 655.0,
+          "Plan Rows": 40000,
+          "Plan Width": 8
+         },
+         {
+          "Node Type": "Hash",
+          "Parent Relationship": "Inner",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 141.82,
+          "Total Cost": 141.82,
+          "Plan Rows": 200,
+          "Plan Width": 4,
+          "Plans": [
+           {
+            "Node Type": "Bitmap Heap Scan",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Relation Name": "t1",
+            "Alias": "t1",
+            "Startup Cost": 5.84,
+            "Total Cost": 141.82,
+            "Plan Rows": 200,
+            "Plan Width": 4,
+            "Recheck Cond": "(a = 3)",
+            "Plans": [
+             {
+              "Node Type": "Bitmap Index Scan",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Index Name": "t1_a_idx",
+              "Startup Cost": 0.0,
+              "Total Cost": 5.79,
+              "Plan Rows": 200,
+              "Plan Width": 0,
+              "Index Cond": "(a = 3)"
+             }
+            ]
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.03
+  },
+  "q50_selfjoin": {
+   "sql": "SELECT count(*) FROM t1 x JOIN t1 y ON x.fk = y.id WHERE x.a = 3",
+   "messages": [],
+   "plan": {
+    "Node Type": "Aggregate",
+    "Strategy": "Plain",
+    "Partial Mode": "Simple",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Startup Cost": 431.32,
+    "Total Cost": 431.33,
+    "Plan Rows": 1,
+    "Plan Width": 8,
+    "Plans": [
+     {
+      "Node Type": "Nested Loop",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Inner",
+      "Startup Cost": 6.12,
+      "Total Cost": 430.82,
+      "Plan Rows": 200,
+      "Plan Width": 0,
+      "Inner Unique": true,
+      "Plans": [
+       {
+        "Node Type": "Bitmap Heap Scan",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Relation Name": "t1",
+        "Alias": "x",
+        "Startup Cost": 5.84,
+        "Total Cost": 141.82,
+        "Plan Rows": 200,
+        "Plan Width": 4,
+        "Recheck Cond": "(a = 3)",
+        "Plans": [
+         {
+          "Node Type": "Bitmap Index Scan",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Index Name": "t1_a_idx",
+          "Startup Cost": 0.0,
+          "Total Cost": 5.79,
+          "Plan Rows": 200,
+          "Plan Width": 0,
+          "Index Cond": "(a = 3)"
+         }
+        ]
+       },
+       {
+        "Node Type": "Index Only Scan",
+        "Parent Relationship": "Inner",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Scan Direction": "Forward",
+        "Index Name": "t1_pkey",
+        "Relation Name": "t1",
+        "Alias": "y",
+        "Startup Cost": 0.29,
+        "Total Cost": 1.44,
+        "Plan Rows": 1,
+        "Plan Width": 4,
+        "Index Cond": "(id = x.fk)"
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.035
+  },
+  "q51_expr_join": {
+   "sql": "SELECT count(*) FROM t1, t2 WHERE t1.fk + 0 = t2.id AND t1.a < 10",
+   "messages": [],
+   "plan": {
+    "Node Type": "Aggregate",
+    "Strategy": "Plain",
+    "Partial Mode": "Simple",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Startup Cost": 1249.79,
+    "Total Cost": 1249.8,
+    "Plan Rows": 1,
+    "Plan Width": 8,
+    "Plans": [
+     {
+      "Node Type": "Nested Loop",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Inner",
+      "Startup Cost": 24.08,
+      "Total Cost": 1244.79,
+      "Plan Rows": 2000,
+      "Plan Width": 0,
+      "Inner Unique": true,
+      "Plans": [
+       {
+        "Node Type": "Bitmap Heap Scan",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Relation Name": "t1",
+        "Alias": "t1",
+        "Startup Cost": 23.79,
+        "Total Cost": 176.79,
+        "Plan Rows": 2000,
+        "Plan Width": 4,
+        "Recheck Cond": "(a < 10)",
+        "Plans": [
+         {
+          "Node Type": "Bitmap Index Scan",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Index Name": "t1_a_idx",
+          "Startup Cost": 0.0,
+          "Total Cost": 23.29,
+          "Plan Rows": 2000,
+          "Plan Width": 0,
+          "Index Cond": "(a < 10)"
+         }
+        ]
+       },
+       {
+        "Node Type": "Index Only Scan",
+        "Parent Relationship": "Inner",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Scan Direction": "Forward",
+        "Index Name": "t2_pkey",
+        "Relation Name": "t2",
+        "Alias": "t2",
+        "Startup Cost": 0.29,
+        "Total Cost": 0.53,
+        "Plan Rows": 1,
+        "Plan Width": 4,
+        "Index Cond": "(id = (t1.fk + 0))"
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.017
+  },
+  "q52_skew": {
+   "sql": "SELECT count(*) FROM t1, t2 WHERE t1.c = t2.c AND t1.c > 900",
+   "messages": [],
+   "plan": {
+    "Node Type": "Aggregate",
+    "Strategy": "Plain",
+    "Partial Mode": "Simple",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Startup Cost": 15210.02,
+    "Total Cost": 15210.03,
+    "Plan Rows": 1,
+    "Plan Width": 8,
+    "Plans": [
+     {
+      "Node Type": "Hash Join",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Inner",
+      "Startup Cost": 1155.0,
+      "Total Cost": 13389.02,
+      "Plan Rows": 728399,
+      "Plan Width": 0,
+      "Inner Unique": false,
+      "Hash Cond": "(t1.c = t2.c)",
+      "Plans": [
+       {
+        "Node Type": "Seq Scan",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Relation Name": "t1",
+        "Alias": "t1",
+        "Startup Cost": 0.0,
+        "Total Cost": 378.0,
+        "Plan Rows": 514,
+        "Plan Width": 4,
+        "Filter": "(c > 900)"
+       },
+       {
+        "Node Type": "Hash",
+        "Parent Relationship": "Inner",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 655.0,
+        "Total Cost": 655.0,
+        "Plan Rows": 40000,
+        "Plan Width": 4,
+        "Plans": [
+         {
+          "Node Type": "Seq Scan",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Relation Name": "t2",
+          "Alias": "t2",
+          "Startup Cost": 0.0,
+          "Total Cost": 655.0,
+          "Plan Rows": 40000,
+          "Plan Width": 4
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.174
+  },
+  "q60_param_nl": {
+   "sql": "SELECT * FROM t1 JOIN t8 ON t8.fk = t1.id WHERE t1.a = 3 AND t1.b = 3",
+   "messages": [],
+   "plan": {
+    "Node Type": "Nested Loop",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Join Type": "Inner",
+    "Startup Cost": 6.21,
+    "Total Cost": 150.72,
+    "Plan Rows": 1,
+    "Plan Width": 40,
+    "Inner Unique": false,
+    "Plans": [
+     {
+      "Node Type": "Bitmap Heap Scan",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Relation Name": "t1",
+      "Alias": "t1",
+      "Startup Cost": 5.79,
+      "Total Cost": 142.27,
+      "Plan Rows": 1,
+      "Plan Width": 20,
+      "Recheck Cond": "(a = 3)",
+      "Filter": "(b = 3)",
+      "Plans": [
+       {
+        "Node Type": "Bitmap Index Scan",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Index Name": "t1_a_idx",
+        "Startup Cost": 0.0,
+        "Total Cost": 5.79,
+        "Plan Rows": 200,
+        "Plan Width": 0,
+        "Index Cond": "(a = 3)"
+       }
+      ]
+     },
+     {
+      "Node Type": "Index Scan",
+      "Parent Relationship": "Inner",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Scan Direction": "Forward",
+      "Index Name": "t8_fk_idx",
+      "Relation Name": "t8",
+      "Alias": "t8",
+      "Startup Cost": 0.42,
+      "Total Cost": 8.44,
+      "Plan Rows": 1,
+      "Plan Width": 20,
+      "Index Cond": "(fk = t1.id)"
+     }
+    ]
+   },
+   "planning_ms": 0.039
+  },
+  "q61_partitioned": {
+   "sql": "SELECT count(*) FROM p JOIN t2 ON p.id = t2.id WHERE t2.a < 20",
+   "messages": [],
+   "plan": {
+    "Node Type": "Aggregate",
+    "Strategy": "Plain",
+    "Partial Mode": "Simple",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Startup Cost": 2463.47,
+    "Total Cost": 2463.48,
+    "Plan Rows": 1,
+    "Plan Width": 8,
+    "Plans": [
+     {
+      "Node Type": "Merge Join",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Inner",
+      "Startup Cost": 969.11,
+      "Total Cost": 2443.47,
+      "Plan Rows": 8000,
+      "Plan Width": 0,
+      "Inner Unique": true,
+      "Merge Cond": "(p.id = t2.id)",
+      "Plans": [
+       {
+        "Node Type": "Append",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 1.15,
+        "Total Cost": 3137.15,
+        "Plan Rows": 100000,
+        "Plan Width": 4,
+        "Subplans Removed": 0,
+        "Plans": [
+         {
+          "Node Type": "Index Only Scan",
+          "Parent Relationship": "Member",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Scan Direction": "Forward",
+          "Index Name": "p1_id_idx",
+          "Relation Name": "p1",
+          "Alias": "p_1",
+          "Startup Cost": 0.29,
+          "Total Cost": 659.29,
+          "Plan Rows": 25000,
+          "Plan Width": 4
+         },
+         {
+          "Node Type": "Index Only Scan",
+          "Parent Relationship": "Member",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Scan Direction": "Forward",
+          "Index Name": "p2_id_idx",
+          "Relation Name": "p2",
+          "Alias": "p_2",
+          "Startup Cost": 0.29,
+          "Total Cost": 659.29,
+          "Plan Rows": 25000,
+          "Plan Width": 4
+         },
+         {
+          "Node Type": "Index Only Scan",
+          "Parent Relationship": "Member",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Scan Direction": "Forward",
+          "Index Name": "p3_id_idx",
+          "Relation Name": "p3",
+          "Alias": "p_3",
+          "Startup Cost": 0.29,
+          "Total Cost": 659.29,
+          "Plan Rows": 25000,
+          "Plan Width": 4
+         },
+         {
+          "Node Type": "Index Only Scan",
+          "Parent Relationship": "Member",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Scan Direction": "Forward",
+          "Index Name": "p4_id_idx",
+          "Relation Name": "p4",
+          "Alias": "p_4",
+          "Startup Cost": 0.29,
+          "Total Cost": 659.29,
+          "Plan Rows": 25000,
+          "Plan Width": 4
+         }
+        ]
+       },
+       {
+        "Node Type": "Sort",
+        "Parent Relationship": "Inner",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 967.92,
+        "Total Cost": 987.92,
+        "Plan Rows": 8000,
+        "Plan Width": 4,
+        "Sort Key": [
+         "t2.id"
+        ],
+        "Plans": [
+         {
+          "Node Type": "Bitmap Heap Scan",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Relation Name": "t2",
+          "Alias": "t2",
+          "Startup Cost": 94.29,
+          "Total Cost": 449.29,
+          "Plan Rows": 8000,
+          "Plan Width": 4,
+          "Recheck Cond": "(a < 20)",
+          "Plans": [
+           {
+            "Node Type": "Bitmap Index Scan",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Index Name": "t2_a_idx",
+            "Startup Cost": 0.0,
+            "Total Cost": 92.29,
+            "Plan Rows": 8000,
+            "Plan Width": 0,
+            "Index Cond": "(a < 20)"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.043
+  },
+  "q62_union_all": {
+   "sql": "SELECT count(*) FROM (SELECT id FROM t1 WHERE a < 5 UNION ALL SELECT id FROM t2 WHERE a < 5) u JOIN t3 ON t3.id = u.id",
+   "messages": [],
+   "plan": {
+    "Node Type": "Aggregate",
+    "Strategy": "Plain",
+    "Partial Mode": "Simple",
+    "Parallel Aware": false,
+    "Async Capable": false,
+    "Startup Cost": 2065.33,
+    "Total Cost": 2065.34,
+    "Plan Rows": 1,
+    "Plan Width": 8,
+    "Plans": [
+     {
+      "Node Type": "Nested Loop",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Join Type": "Inner",
+      "Startup Cost": 12.33,
+      "Total Cost": 2057.83,
+      "Plan Rows": 3000,
+      "Plan Width": 0,
+      "Inner Unique": true,
+      "Plans": [
+       {
+        "Node Type": "Append",
+        "Parent Relationship": "Outer",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 12.04,
+        "Total Cost": 471.33,
+        "Plan Rows": 3000,
+        "Plan Width": 4,
+        "Subplans Removed": 0,
+        "Plans": [
+         {
+          "Node Type": "Bitmap Heap Scan",
+          "Parent Relationship": "Member",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Relation Name": "t1",
+          "Alias": "t1",
+          "Startup Cost": 12.04,
+          "Total Cost": 152.54,
+          "Plan Rows": 1000,
+          "Plan Width": 4,
+          "Recheck Cond": "(a < 5)",
+          "Plans": [
+           {
+            "Node Type": "Bitmap Index Scan",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Index Name": "t1_a_idx",
+            "Startup Cost": 0.0,
+            "Total Cost": 11.79,
+            "Plan Rows": 1000,
+            "Plan Width": 0,
+            "Index Cond": "(a < 5)"
+           }
+          ]
+         },
+         {
+          "Node Type": "Bitmap Heap Scan",
+          "Parent Relationship": "Member",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Relation Name": "t2",
+          "Alias": "t2",
+          "Startup Cost": 23.79,
+          "Total Cost": 303.79,
+          "Plan Rows": 2000,
+          "Plan Width": 4,
+          "Recheck Cond": "(a < 5)",
+          "Plans": [
+           {
+            "Node Type": "Bitmap Index Scan",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Index Name": "t2_a_idx",
+            "Startup Cost": 0.0,
+            "Total Cost": 23.29,
+            "Plan Rows": 2000,
+            "Plan Width": 0,
+            "Index Cond": "(a < 5)"
+           }
+          ]
+         }
+        ]
+       },
+       {
+        "Node Type": "Index Only Scan",
+        "Parent Relationship": "Inner",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Scan Direction": "Forward",
+        "Index Name": "t3_pkey",
+        "Relation Name": "t3",
+        "Alias": "t3",
+        "Startup Cost": 0.29,
+        "Total Cost": 0.53,
+        "Plan Rows": 1,
+        "Plan Width": 4,
+        "Index Cond": "(id = t1.id)"
+       }
+      ]
+     }
+    ]
+   },
+   "planning_ms": 0.024
+  }
+ }
+}

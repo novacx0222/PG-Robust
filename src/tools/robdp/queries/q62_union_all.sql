@@ -1,0 +1,1 @@
+SELECT count(*) FROM (SELECT id FROM t1 WHERE a < 5 UNION ALL SELECT id FROM t2 WHERE a < 5) u JOIN t3 ON t3.id = u.id

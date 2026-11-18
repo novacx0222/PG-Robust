@@ -1,0 +1,1 @@
+SELECT * FROM t1 WHERE t1.id IN (SELECT fk FROM t3 WHERE b = 7)
