@@ -675,6 +675,14 @@ build_join_rel(PlannerInfo *root,
 														   outer_rel,
 														   inner_rel,
 														   sjinfo);
+
+		/*
+		 * RobDP: with the debug dump on, report the row vector this pair
+		 * would give, to check that it does not depend on the pair much.
+		 */
+		if (enable_rows_dist && robust_debug_dump && restrictlist_ptr)
+			robust_set_joinrel_rows(root, joinrel, outer_rel, inner_rel,
+									sjinfo, *restrictlist_ptr, NULL, false);
 		return joinrel;
 	}
 
@@ -1653,6 +1661,7 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 	List	   *eclauses;
 	List	   *dropped_ecs;
 	double		rows;
+	RobustJoinSel jsel;
 	ListCell   *lc;
 
 	/* If rel has LATERAL refs, every path for it should account for them */
@@ -1801,11 +1810,12 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 		return ppi;
 
 	/* Estimate the number of rows returned by the parameterized join */
-	rows = get_parameterized_joinrel_size(root, joinrel,
-										  outer_path,
-										  inner_path,
-										  sjinfo,
-										  *restrict_clauses);
+	rows = get_parameterized_joinrel_size_sel(root, joinrel,
+											  outer_path,
+											  inner_path,
+											  sjinfo,
+											  *restrict_clauses,
+											  &jsel);
 
 	/*
 	 * And now we can build the ParamPathInfo.  No point in saving the
@@ -1820,6 +1830,11 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 	ppi->ppi_clauses = NIL;
 	ppi->ppi_serials = NULL;
 	joinrel->ppilist = lappend(joinrel->ppilist, ppi);
+
+	/* RobDP: the row count in each error scenario */
+	if (enable_rows_dist)
+		robust_set_joinrel_ppi_rows(root, joinrel, ppi, outer_path, inner_path,
+									sjinfo, *restrict_clauses, &jsel);
 
 	return ppi;
 }

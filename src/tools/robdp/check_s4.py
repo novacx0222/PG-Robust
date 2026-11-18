@@ -144,7 +144,10 @@ class Reference:
 
 
 def vec(v, n):
-    return v if isinstance(v, list) and len(v) == n else [v[0] if isinstance(v, list) else v] * n
+    """a dumped vector (or scalar) as n floats; JSON integers load as Python ints,
+    whose exact arithmetic would differ from C's doubles"""
+    v = v if isinstance(v, list) and len(v) == n else [v[0] if isinstance(v, list) else v] * n
+    return [float(x) for x in v]
 
 
 def check_events(events, ref):
@@ -174,6 +177,10 @@ def check_events(events, ref):
                         want.append(clamp_row_est(e['tuples'] * p))
                 if len(qs) > 1:
                     problems.append('rel %s: %d querylets' % (e['rels'], len(qs)))
+            elif e['kind'] == 'join':
+                if e['first']:
+                    rows_of[e['rels']] = got
+                continue
             elif e['kind'] == 'append':
                 want = [0.0] * N
                 for c in e['children']:
@@ -185,7 +192,7 @@ def check_events(events, ref):
             if got != want:
                 problems.append('rel %s (%s): C %s..., Python %s...' % (e['rels'], e['kind'], got[:3], want[:3]))
             rows_of[e['rels']] = got
-        elif e['ev'] == 'ppi':
+        elif e['ev'] == 'ppi' and e.get('kind', 'base') == 'base':
             n += 1
             got = vec(e['rows'], N)
             relrows = rows_of[e['rels']]
@@ -257,7 +264,8 @@ def main():
                     if e['ev'] in ('rel', 'ppi'):
                         n_ev += 1
                         n_q += len(e['querylets'])
-                        if any(v != e['rows_point'] for v in vec(e['rows'], 20)):
+                        point = e['rows_point'] if e.get('first', True) else e['pair_point']
+                        if any(v != point for v in vec(e['rows'], 20)):
                             problems.append('%s %s %s %s' % (d, name, e['ev'], e['rels']))
     allok &= report('R2', not problems and n_q > 0,
                     '%d rel/ppi events (%d querylets with a profile): rows[s] == rows_point' % (n_ev, n_q)
