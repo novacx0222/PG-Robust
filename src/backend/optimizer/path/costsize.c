@@ -182,7 +182,8 @@ static double calc_joinrel_size_estimate(PlannerInfo *root,
 										 double outer_rows,
 										 double inner_rows,
 										 SpecialJoinInfo *sjinfo,
-										 List *restrictlist);
+										 List *restrictlist,
+										 RobustJoinSel *sel);
 static Selectivity get_foreign_key_join_selectivity(PlannerInfo *root,
 													Relids outer_relids,
 													Relids inner_relids,
@@ -5103,6 +5104,8 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 						   SpecialJoinInfo *sjinfo,
 						   List *restrictlist)
 {
+	RobustJoinSel sel;
+
 	rel->rows = calc_joinrel_size_estimate(root,
 										   rel,
 										   outer_rel,
@@ -5110,7 +5113,13 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 										   outer_rel->rows,
 										   inner_rel->rows,
 										   sjinfo,
-										   restrictlist);
+										   restrictlist,
+										   &sel);
+
+	/* RobDP: the row count in each error scenario */
+	if (enable_rows_dist)
+		robust_set_joinrel_rows(root, rel, outer_rel, inner_rel, sjinfo,
+								restrictlist, &sel, true);
 }
 
 /*
@@ -5135,6 +5144,26 @@ get_parameterized_joinrel_size(PlannerInfo *root, RelOptInfo *rel,
 							   SpecialJoinInfo *sjinfo,
 							   List *restrict_clauses)
 {
+	RobustJoinSel sel;
+
+	return get_parameterized_joinrel_size_sel(root, rel, outer_path,
+											  inner_path, sjinfo,
+											  restrict_clauses, &sel);
+}
+
+/*
+ * get_parameterized_joinrel_size_sel
+ *		get_parameterized_joinrel_size(), also returning the selectivities
+ *		it estimated (for RobDP, see robust_set_joinrel_ppi_rows).
+ */
+double
+get_parameterized_joinrel_size_sel(PlannerInfo *root, RelOptInfo *rel,
+								   Path *outer_path,
+								   Path *inner_path,
+								   SpecialJoinInfo *sjinfo,
+								   List *restrict_clauses,
+								   RobustJoinSel *sel)
+{
 	double		nrows;
 
 	/*
@@ -5153,7 +5182,8 @@ get_parameterized_joinrel_size(PlannerInfo *root, RelOptInfo *rel,
 									   outer_path->rows,
 									   inner_path->rows,
 									   sjinfo,
-									   restrict_clauses);
+									   restrict_clauses,
+									   sel);
 	/* For safety, make sure result is not more than the base estimate */
 	if (nrows > rel->rows)
 		nrows = rel->rows;
@@ -5168,7 +5198,27 @@ get_parameterized_joinrel_size(PlannerInfo *root, RelOptInfo *rel,
  * outer_rel/inner_rel are the relations being joined, but they should be
  * assumed to have sizes outer_rows/inner_rows; those numbers might be less
  * than what rel->rows says, when we are considering parameterized paths.
+ *
+ * RobDP: if sel is not NULL, the three selectivities estimated are stored
+ * in it, so that robustrows.c can apply the same formula per error
+ * scenario.
  */
+double
+robust_calc_joinrel_size(PlannerInfo *root,
+						 RelOptInfo *joinrel,
+						 RelOptInfo *outer_rel,
+						 RelOptInfo *inner_rel,
+						 double outer_rows,
+						 double inner_rows,
+						 SpecialJoinInfo *sjinfo,
+						 List *restrictlist,
+						 RobustJoinSel *sel)
+{
+	return calc_joinrel_size_estimate(root, joinrel, outer_rel, inner_rel,
+									  outer_rows, inner_rows, sjinfo,
+									  restrictlist, sel);
+}
+
 static double
 calc_joinrel_size_estimate(PlannerInfo *root,
 						   RelOptInfo *joinrel,
@@ -5177,7 +5227,8 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 						   double outer_rows,
 						   double inner_rows,
 						   SpecialJoinInfo *sjinfo,
-						   List *restrictlist)
+						   List *restrictlist,
+						   RobustJoinSel *sel)
 {
 	JoinType	jointype = sjinfo->jointype;
 	Selectivity fkselec;
@@ -5252,6 +5303,13 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 										jointype,
 										sjinfo);
 		pselec = 0.0;			/* not used, keep compiler quiet */
+	}
+
+	if (sel != NULL)
+	{
+		sel->fkselec = fkselec;
+		sel->jselec = jselec;
+		sel->pselec = pselec;
 	}
 
 	/*

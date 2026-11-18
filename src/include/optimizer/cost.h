@@ -198,6 +198,31 @@ extern double get_parameterized_joinrel_size(PlannerInfo *root,
 											 Path *inner_path,
 											 SpecialJoinInfo *sjinfo,
 											 List *restrict_clauses);
+
+/* RobDP: the selectivities calc_joinrel_size_estimate() estimated */
+typedef struct RobustJoinSel
+{
+	Selectivity fkselec;		/* of FK-matched clauses */
+	Selectivity jselec;			/* of the other join clauses */
+	Selectivity pselec;			/* of pushed-down clauses (outer joins) */
+} RobustJoinSel;
+
+extern double get_parameterized_joinrel_size_sel(PlannerInfo *root,
+												 RelOptInfo *rel,
+												 Path *outer_path,
+												 Path *inner_path,
+												 SpecialJoinInfo *sjinfo,
+												 List *restrict_clauses,
+												 RobustJoinSel *sel);
+extern double robust_calc_joinrel_size(PlannerInfo *root,
+									   RelOptInfo *joinrel,
+									   RelOptInfo *outer_rel,
+									   RelOptInfo *inner_rel,
+									   double outer_rows,
+									   double inner_rows,
+									   SpecialJoinInfo *sjinfo,
+									   List *restrictlist,
+									   RobustJoinSel *sel);
 extern void set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 									   RelOptInfo *outer_rel,
 									   RelOptInfo *inner_rel,

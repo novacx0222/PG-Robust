@@ -33,6 +33,7 @@
 #define ROBUSTROWS_H
 
 #include "nodes/pathnodes.h"
+#include "optimizer/cost.h"
 #include "optimizer/robustvec.h"
 
 /*
@@ -47,15 +48,21 @@ typedef struct RobustQuerylet
 	int			bin;			/* the profile bin of sel_est */
 	RobustVec  *x;				/* the draws, length N */
 	RobustVec  *mult;			/* m_q, length N */
+	bool		pushed;			/* at an outer join: all its clauses are
+								 * pushed down (it scales pselec, not jselec) */
 } RobustQuerylet;
 
 /* The row-count vector of a relation: rel->robust_rows, or rel->rows */
 extern RobustVec *robust_rel_rows(const RelOptInfo *rel);
+extern RobustVec *robust_path_rows(const Path *path, const char **source,
+								   bool *varies);
 
 /* Querylets */
 extern RobustQuerylet *robust_base_querylet(PlannerInfo *root,
 											RelOptInfo *rel, double sel_est);
 extern List *robust_join_querylets(PlannerInfo *root, List *clauses);
+extern List *robust_join_querylets_at(PlannerInfo *root, List *clauses,
+									  Relids joinrelids);
 
 /* Row counts */
 extern void robust_set_baserel_rows(PlannerInfo *root, RelOptInfo *rel,
@@ -63,5 +70,18 @@ extern void robust_set_baserel_rows(PlannerInfo *root, RelOptInfo *rel,
 extern void robust_set_appendrel_rows(PlannerInfo *root, RelOptInfo *rel);
 extern void robust_set_baserel_ppi_rows(PlannerInfo *root, RelOptInfo *rel,
 										ParamPathInfo *ppi, Selectivity sel);
+extern void robust_set_joinrel_rows(PlannerInfo *root, RelOptInfo *joinrel,
+									RelOptInfo *outer_rel,
+									RelOptInfo *inner_rel,
+									SpecialJoinInfo *sjinfo,
+									List *restrictlist,
+									const RobustJoinSel *sel, bool store);
+extern void robust_set_joinrel_ppi_rows(PlannerInfo *root,
+										RelOptInfo *joinrel,
+										ParamPathInfo *ppi,
+										Path *outer_path, Path *inner_path,
+										SpecialJoinInfo *sjinfo,
+										List *restrict_clauses,
+										const RobustJoinSel *sel);
 
 #endif							/* ROBUSTROWS_H */

@@ -1392,6 +1392,7 @@ mark_dummy_rel(RelOptInfo *rel)
 
 	/* Set dummy size estimate */
 	rel->rows = 0;
+	rel->robust_rows = NULL;
 
 	/* Evict any previously chosen paths */
 	rel->pathlist = NIL;
