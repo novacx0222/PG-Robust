@@ -127,8 +127,26 @@ class Reference:
             self.cache[key] = (pts, make_bins(pts, self.nbins))
         return self.cache[key]
 
+    def set_ec(self, e):
+        """the pair querylets of an ecgraph event; a query level's event comes
+        before its first use and after its subqueries are planned"""
+        self.ec = {p['inst']: p for p in e['pairs'] if p['key'] is not None}
+
     def querylet(self, q):
-        """(x, mult) of a dumped querylet {key, inst, sel_est, bin}"""
+        """(x, mult) of a dumped querylet {key, inst, sel_est, bin}, or of an
+        "ec" factor {num, den}: product of num's multipliers, then divided by den's"""
+        if q['key'] == 'ec':
+            ms = [self.querylet(self.ec[i])[1] for i in q['num']]
+            ds = [self.querylet(self.ec[i])[1] for i in q['den']]
+            mult = []
+            for s in range(self.N):
+                f = 1.0
+                for m in ms:
+                    f = f * m[s]
+                for m in ds:
+                    f = f / m[s]
+                mult.append(f)
+            return None, mult
         pts, bins = self.profile(q['key'])
         _, b, _, xs, _ = draw(pts, bins, q['key'], q['inst'], q['sel_est'], self.N, self.seed, self.bw)
         assert b == q['bin'], (q, b)
@@ -155,8 +173,11 @@ def check_events(events, ref):
     N = ref.N
     rows_of = {}           # rels -> latest rel rows vector
     problems, n = [], 0
+    ref.ec = {}
     for e in events:
-        if e['ev'] == 'draw':
+        if e['ev'] == 'ecgraph':
+            ref.set_ec(e)
+        elif e['ev'] == 'draw':
             pts, bins = ref.profile(e['key'])
             seed, b, h, xs, _ = draw(pts, bins, e['key'], e['inst'], e['sel_est'], N, ref.seed, ref.bw)
             n += 1

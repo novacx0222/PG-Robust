@@ -39,10 +39,15 @@
 /*
  * A querylet whose errors are drawn from a profile.  Querylets without a
  * profile are not represented (their multiplier is 1).
+ *
+ * The factor of the multi-member equivalence classes at a join is also
+ * carried as a RobustQuerylet, with key "ec", no draws of its own (x NULL)
+ * and mult = the product of the pair querylets in ec_num divided by those
+ * in ec_den (see "Equivalence classes" below).
  */
 typedef struct RobustQuerylet
 {
-	char	   *key;			/* the profile used */
+	char	   *key;			/* the profile used, or "ec" */
 	char	   *inst;			/* instance name, seeds the draws */
 	double		sel_est;		/* PostgreSQL's estimate of the querylet */
 	int			bin;			/* the profile bin of sel_est */
@@ -50,7 +55,32 @@ typedef struct RobustQuerylet
 	RobustVec  *mult;			/* m_q, length N */
 	bool		pushed;			/* at an outer join: all its clauses are
 								 * pushed down (it scales pselec, not jselec) */
+	List	   *ec_num;			/* "ec": pair querylets multiplied, */
+	List	   *ec_den;			/* and divided, in this order */
 } RobustQuerylet;
+
+/*
+ * Equivalence classes.  For an equivalence class with k >= 3 member
+ * relations, the clause PostgreSQL generates between two sides depends on
+ * the pair of sides (t1.a = t3.a or t2.a = t3.a), so querylets taken from
+ * the generated clauses would make a join relation's vector depend on the
+ * pair that built it.  Instead, every relation set X gets the edges of a
+ * spanning forest of the class's members in X, chosen from the member pairs
+ * that have a profile:
+ *
+ *	- members are ranked by the number of profiled pairs they are in
+ *	  (more first), then by instance name;
+ *	- profiled pairs are taken in the order (better-ranked endpoint, other
+ *	  endpoint) and kept if they join two components (Kruskal).
+ *
+ * When some member has a profiled pair with every other member, this is
+ * the star around the best-covered member.  M(X) is the product of the
+ * multipliers of the edges in X's forests (a pair shared by two classes
+ * counts once), and a relation of sets X built from inputs Y, Z gets the
+ * factor M(X) / (M(Y) M(Z)), which depends on X, Y and Z only.  Member pairs
+ * without a profile have multiplier 1.
+ */
+typedef struct RobustECGraph RobustECGraph;
 
 /* The row-count vector of a relation: rel->robust_rows, or rel->rows */
 extern RobustVec *robust_rel_rows(const RelOptInfo *rel);
@@ -63,6 +93,9 @@ extern RobustQuerylet *robust_base_querylet(PlannerInfo *root,
 extern List *robust_join_querylets(PlannerInfo *root, List *clauses);
 extern List *robust_join_querylets_at(PlannerInfo *root, List *clauses,
 									  Relids joinrelids);
+extern RobustQuerylet *robust_ec_factor(PlannerInfo *root,
+										Relids *num, int nnum,
+										Relids *den, int nden, bool pushed);
 
 /* Row counts */
 extern void robust_set_baserel_rows(PlannerInfo *root, RelOptInfo *rel,

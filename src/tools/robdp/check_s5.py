@@ -12,15 +12,21 @@ robustrows.c exactly, and agree with PostgreSQL itself.
   J3  shift / two-point / lognormal profiles: every join rel (all pairs)
       and join ppi vector bit-identical to a Python recomputation; the
       input vectors equal the vectors of the input rels / ppis
-  J4  inner-join queries: the vector of a join rel built from another pair
-      differs from the first pair's by rounding only (reported against
-      PostgreSQL's own pair dependence)
+  J4  inner-join queries, equivalence-class cliques and stars included: the
+      vector of a join rel built from another pair differs from the first
+      pair's by rounding only (samples where a node is clamped to 1 or at the
+      inner-join cap rows <= outer * inner are skipped)
   J5  bounds per join type (left >= outer, full >= max, semi/anti <= outer,
       inner <= outer * inner) on every event
   J6  replay against PostgreSQL: a profile that scales one filter's
       selectivity by K gives, for inner, left, full, semi and anti joins,
       exactly the rows stock PostgreSQL estimates for the query whose
       filter really selects K times as much
+  J9  equivalence classes with 3+ members, on one-point profiles: the C and
+      Python spanning forests agree (a path a=b, b=c, a=d, c=e; a hub that is
+      not the smallest name; two classes sharing a pair, counted once; an
+      extra clause on an edge pair drawing as "a=b+"), and every join event of
+      every pair equals pair_point x M(J)
   J7  S4 gates (and through them S3, S2, S1) still pass
   J8  planning time, robust on vs off (informational)
 """
@@ -86,8 +92,11 @@ def join_rows_at(jt, o, i, sel, qms, s):
 def check_joins(events, ref, N):
     rows_of, ppi_of = {}, {}
     problems, n = [], 0
+    ref.ec = {}
     for e in events:
-        if e['ev'] == 'rel':
+        if e['ev'] == 'ecgraph':
+            ref.set_ec(e)
+        elif e['ev'] == 'rel':
             if e['kind'] != 'join':
                 rows_of[e['rels']] = vec(e['rows'], N)
                 continue
@@ -176,9 +185,13 @@ def pair_dependence(events, N):
     first = {}
     for e in joins:
         r = vec(e['rows'], N)
+        ov, iv = vec(e['outer_rows'], N), vec(e['inner_rows'], N)
         o, i = e['pair']
         er = [err[o][s] + err[i][s] + 0.5 / r[s] for s in range(N)]
-        cl = [clamped[o][s] or clamped[i][s] or r[s] <= 1.0 for s in range(N)]
+        # clamped to 1, or at the inner-join cap rows <= outer * inner (an
+        # equivalence-class factor can push the selectivity above 1)
+        cl = [clamped[o][s] or clamped[i][s] or r[s] <= 1.0 or r[s] >= ov[s] * iv[s] - 0.5
+              for s in range(N)]
         if e['first']:
             first[e['rels']] = r
             err[e['rels']], clamped[e['rels']] = er, cl
@@ -280,6 +293,121 @@ def j6(install):
     return checked, problems, lines
 
 
+J9_CASES = [
+    # (name, query, equivalence classes, profiled pairs with their multiplier,
+    #  pairs with extra non-class clauses, expected forest order per class, M of all relations)
+    ('path', 'SELECT count(*) FROM t1, t2, t3, t4, t5 WHERE t1.a = t2.a AND t2.a = t3.a AND t1.a = t4.a '
+     'AND t3.a = t5.a',
+     [['t1', 't2', 't3', 't4', 't5']], {'t1=t2': 2, 't2=t3': 0.5, 't1=t4': 4, 't3=t5': 3}, {},
+     [['t1=t2', 't1=t4', 't2=t3', 't3=t5']], 12),
+    ('hub', 'SELECT count(*) FROM t1, t2, t3, t4 WHERE t1.a = t2.a AND t2.a = t3.a AND t3.a = t4.a',
+     [['t1', 't2', 't3', 't4']], {'t1=t3': 2, 't2=t3': 0.5, 't3=t4': 4}, {},
+     [['t1=t3', 't2=t3', 't3=t4']], 4),
+    ('shared', 'SELECT count(*) FROM t1, t2, t3, t4 WHERE t1.a = t2.a AND t2.a = t3.a AND t1.b = t2.b '
+     'AND t2.b = t4.b',
+     [['t1', 't2', 't3'], ['t1', 't2', 't4']], {'t1=t2': 2, 't1=t3': 3, 't2=t4': 5}, {},
+     [['t1=t2', 't1=t3'], ['t1=t2', 't2=t4']], 30),
+    ('extra', 'SELECT count(*) FROM t1, t2, t3 WHERE t1.a = t2.a AND t2.a = t3.a AND t1.b < t2.b',
+     [['t1', 't2', 't3']], {'t1=t2': 2, 't2=t3': 3}, {'t1=t2': 2},
+     [['t1=t2', 't2=t3']], 12),
+]
+
+
+def py_order(members, profiled):
+    """rank members by profiled pairs (more first) then name; profiled pairs in
+    (better endpoint, other endpoint) order"""
+    pair = lambda a, b: '%s=%s' % tuple(sorted((a, b)))
+    cover = {m: sum(1 for o in members if o != m and pair(m, o) in profiled) for m in members}
+    ranked = sorted(members, key=lambda m: (-cover[m], m))
+    order = []
+    for u in range(len(ranked)):
+        for v in range(u + 1, len(ranked)):
+            if pair(ranked[u], ranked[v]) in profiled:
+                order.append((u, v, pair(ranked[u], ranked[v])))
+    return ranked, order
+
+
+def py_forest(members, profiled, x):
+    ranked, order = py_order(members, profiled)
+    parent = list(range(len(ranked)))
+
+    def root(i):
+        while parent[i] != i:
+            i = parent[i]
+        return i
+    edges = []
+    for u, v, p in order:
+        if ranked[u] in x and ranked[v] in x and root(u) != root(v):
+            parent[root(u)] = root(v)
+            edges.append(p)
+    return edges
+
+
+def j9(install):
+    """equivalence-class spanning forests on one-point profiles: (checked events, problems, lines)"""
+    lines, problems, checked = [], [], 0
+    for name, sql, ecs, mult, extra, want_order, want_full in J9_CASES:
+        pdir = os.path.join(PROFILES, 's5_ec_' + name)
+        if os.path.isdir(pdir):
+            for f in os.listdir(pdir):
+                os.remove(os.path.join(pdir, f))
+        os.makedirs(pdir, exist_ok=True)
+        for key, m in mult.items():
+            with open(os.path.join(pdir, key + '.txt'), 'w') as f:
+                f.write('%r 0.01\n' % (0.01 * m))
+        out, err = common.psql("SET enable_rows_dist=on; SET error_profile_path='%s'; SET error_sample_count=1;"
+                               "SET error_sample_kde_bandwidth=0; SET robust_debug_dump=on;"
+                               "SET client_min_messages=log;\nEXPLAIN %s;\n" % (pdir, sql),
+                               install, on_error_stop=False)
+        ev = parse(err.splitlines())
+        graphs = ev.get('ecgraph', [])
+        if len(graphs) != 1:
+            problems.append('%s: %d ecgraph events' % (name, len(graphs)))
+            continue
+        g = graphs[0]
+        orders = [st['order'] for st in g['ecs']]
+        for ec_members, wo in zip(ecs, want_order):
+            ranked, order = py_order(ec_members, mult)
+            if [p for _, _, p in order] != wo:
+                problems.append('%s: Python order %s, expected %s' % (name, order, wo))
+        if sorted(map(tuple, orders)) != sorted(map(tuple, want_order)):
+            problems.append('%s: C order %s, expected %s' % (name, orders, want_order))
+        npairs = {p['inst']: p['nclauses'] for p in g['pairs']}
+        full = None
+        for e in ev.get('rel', []):
+            if e['kind'] != 'join':
+                continue
+            x = set(e['rels'].split())
+            edges = set()
+            for ec_members in ecs:
+                edges |= set(py_forest(ec_members, mult, x))
+            m = 1.0
+            for p in sorted(edges):
+                m *= mult[p]
+            for p, em in extra.items():
+                if set(p.split('=')) <= x:
+                    m *= em
+            got = vec(e['rows'], 1)[0]
+            want = e['pair_point'] * m
+            checked += 1
+            if abs(got - want) > 1e-6 * want + 0.5:
+                problems.append('%s %s from %s: rows %s, expected %s (M %g)' % (name, e['rels'], e['pair'],
+                                                                               got, want, m))
+            if len(x) == len(set().union(*map(set, ecs))) and e['first']:
+                full = got / e['pair_point']
+        if name == 'shared' and npairs.get('t1=t2') != 2:
+            problems.append('shared: pair t1=t2 has %s clauses' % npairs.get('t1=t2'))
+        if extra:
+            insts = {q['inst'] for e in ev.get('rel', []) if e['kind'] == 'join' for q in e['querylets']}
+            if not any(i.endswith('+') for i in insts):
+                problems.append('%s: no "+" instance among %s' % (name, sorted(insts)))
+        lines.append('%s: forests %s; all relations M = %s (expected %g)'
+                     % (name, orders, '%.6g' % full if full else None, want_full))
+        if full is None or abs(full - want_full) > 1e-6 * want_full:
+            problems.append('%s: full M %s, expected %g' % (name, full, want_full))
+    return checked, problems, lines
+
+
 def main():
     global FUSED_ANTI
     ap = argparse.ArgumentParser()
@@ -352,20 +480,17 @@ def main():
                     '%d join rel/ppi events bit-identical over %d configurations (%d vectors vary; anti '
                     'join formula %s)' % (counts, len(configs), varying, 'fused as in stock' if FUSED_ANTI
                                           else 'unfused') if not problems else '; '.join(problems[:4]))
-    n_pairs = sum(p[0] for p in pair_stats)
-    n_viol = sum(p[1] for p in pair_stats)
-    n_skip = sum(p[2] for p in pair_stats)
-    worst = max((p[3] for p in pair_stats), default=0)
-    ec_n = sum(p[0] for p in ec_pairs)
-    ec_viol = sum(p[1] for p in ec_pairs)
-    ec_med = sorted(x for p in ec_pairs for x in p[4])
-    allok &= report('J4', n_pairs > 0 and n_viol == 0,
-                    '%d (pair, s) of later pairs in queries without multi-member equivalence classes: '
-                    '%d outside the rounding bound (%d skipped: clamped to 1); worst |diff| / bound %.2f.  '
-                    'Informational, equivalence-class queries %s: %d of %d outside the bound, median '
-                    'relative difference %.2f'
-                    % (n_pairs, n_viol, n_skip, worst, '/'.join(sorted(EC_QUERIES)), ec_viol, ec_n,
-                       ec_med[len(ec_med) // 2] if ec_med else 0))
+    def agg(stats):
+        return (sum(p[0] for p in stats), sum(p[1] for p in stats), sum(p[2] for p in stats),
+                max((p[3] for p in stats), default=0))
+    n_pairs, n_viol, n_skip, worst = agg(pair_stats)
+    ec_n, ec_viol, ec_skip, ec_worst = agg(ec_pairs)
+    allok &= report('J4', n_pairs > 0 and ec_n > 0 and n_viol == 0 and ec_viol == 0,
+                    'later pairs vs the first pair, against the rounding bound: other queries %d (pair, s), '
+                    '%d outside (%d skipped), worst |diff| / bound %.3f; equivalence-class queries %s %d, '
+                    '%d outside (%d skipped: clamped to 1 or at the inner-join cap), worst %.3f'
+                    % (n_pairs, n_viol, n_skip, worst, '/'.join(sorted(EC_QUERIES)), ec_n, ec_viol, ec_skip,
+                       ec_worst))
     allok &= report('J5', not bnd, 'join-type bounds hold on every event' if not bnd else '; '.join(bnd[:3]))
 
     # J6
@@ -373,6 +498,14 @@ def main():
     checked, probs, lines = j6(a.install)
     allok &= report('J6', not probs, '%d replay cases equal to PostgreSQL' % checked if not probs
                     else '; '.join(probs[:3]))
+    for l in lines:
+        print('       ' + l)
+
+    # J9
+    checked, probs, lines = j9(a.install)
+    allok &= report('J9', not probs and checked > 0,
+                    '%d join events (all pairs) of 4 equivalence-class cases equal pair_point x M(J) of the '
+                    'Python forests' % checked if not probs else '; '.join(probs[:4]))
     for l in lines:
         print('       ' + l)
 
