@@ -544,6 +544,16 @@ struct PlannerInfo
 
 	/* Does this query modify any partition key columns? */
 	bool		partColsUpdated;
+
+	/*
+	 * RobDP robust planning (optimizer/robust.h): the phase this query level
+	 * is in (a RobustPass, ROBUST_PASS_NONE when robust planning is not
+	 * running), and the sample the envelope pass is optimizing for
+	 * (meaningful only in ROBUST_PASS_ENVELOPE).  makeNode() zeroes both,
+	 * which is the "not running" state.
+	 */
+	int			robust_pass;
+	int			robust_round;
 };
 
 

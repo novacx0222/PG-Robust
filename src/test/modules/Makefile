@@ -29,6 +29,7 @@ SUBDIRS = \
 		  test_predtest \
 		  test_rbtree \
 		  test_regex \
+		  test_robust \
 		  test_rls_hooks \
 		  test_shm_mq \
 		  test_slru \

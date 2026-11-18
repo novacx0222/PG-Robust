@@ -52,6 +52,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
+#include "optimizer/robust.h"
 #include "parser/parse_expr.h"
 #include "parser/parser.h"
 #include "pgstat.h"
@@ -1005,6 +1006,27 @@ struct config_bool ConfigureNamesBool[] =
 		},
 		&enable_presorted_aggregate,
 		true,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"enable_rows_dist", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Enables RobDP robust planning over sampled selectivity errors."),
+			gettext_noop("When off, the planner behaves exactly like PostgreSQL."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&enable_rows_dist,
+		false,
+		NULL, NULL, NULL
+	},
+	{
+		{"robust_debug_dump", PGC_SUSET, DEVELOPER_OPTIONS,
+			gettext_noop("Logs RobDP planner internals as \"ROBDP\" JSON lines."),
+			gettext_noop("For the RobDP test harness; see src/tools/robdp/ROBDP_DUMP_SPEC.md."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&robust_debug_dump,
+		false,
 		NULL, NULL, NULL
 	},
 	{
@@ -3505,6 +3527,37 @@ struct config_int ConfigureNamesInt[] =
 		NULL, NULL, NULL
 	},
 
+	{
+		{"error_sample_count", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the number of selectivity samples used by RobDP robust planning."),
+			NULL,
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&error_sample_count,
+		20, 1, ROBUST_MAX_SAMPLES,
+		NULL, NULL, NULL
+	},
+	{
+		{"error_sample_seed", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the random seed RobDP uses to sample error profiles."),
+			NULL,
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&error_sample_seed,
+		42, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+	{
+		{"error_bin_count", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the number of estimated-selectivity bins of each RobDP error profile."),
+			NULL,
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&error_bin_count,
+		1, 1, ROBUST_MAX_BINS,
+		NULL, NULL, NULL
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, 0, 0, 0, NULL, NULL, NULL
@@ -3783,6 +3836,18 @@ struct config_real ConfigureNamesReal[] =
 		},
 		&log_xact_sample_rate,
 		0.0, 0.0, 1.0,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"error_sample_kde_bandwidth", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the KDE bandwidth RobDP uses to sample error profiles."),
+			gettext_noop("0 resamples the profile's points without smoothing; "
+						 "a negative value uses Silverman's rule of thumb per bin."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&error_sample_kde_bandwidth,
+		0.0, -1.0, 10.0,
 		NULL, NULL, NULL
 	},
 
@@ -4547,6 +4612,18 @@ struct config_string ConfigureNamesString[] =
 		&debug_io_direct_string,
 		"",
 		check_debug_io_direct, assign_debug_io_direct, NULL
+	},
+
+	{
+		{"error_profile_path", PGC_SUSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the directory of RobDP error profiles."),
+			gettext_noop("Each <alias>.txt or <alias>=<alias>.txt file in it is the error "
+						 "profile of a relation or a join.  Empty means no profiles."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&error_profile_path,
+		"",
+		NULL, NULL, NULL
 	},
 
 	/* End-of-list marker */

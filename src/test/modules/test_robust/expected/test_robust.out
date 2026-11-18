@@ -1,0 +1,77 @@
+--
+-- Unit tests for the RobDP support code added in step S1: the per-sample
+-- vector type, the debug dump format and the GUCs.
+--
+CREATE EXTENSION test_robust;
+-- RobustVec API (raises an error naming the failed check)
+SELECT test_robustvec();
+ test_robustvec 
+----------------
+ ok
+(1 row)
+
+-- Exact dump format: %.17g numbers, "nan"/"inf" strings, JSON escaping
+SET client_min_messages = log;
+SELECT test_robust_dump();
+LOG:  ROBDP {"ev":"test","s":"quote\" backslash\\ tab\t é","null_s":null,"i":-9223372036854775808,"big":1.2345678901234568e+17,"ninf":"-inf","t":true,"f":false,"v":[0.10000000000000001,0.33333333333333331,1e-300,"nan","inf",-0],"c":[2],"null_v":null}
+ test_robust_dump 
+------------------
+ 
+(1 row)
+
+RESET client_min_messages;
+-- Defaults: robust planning is off
+SELECT name, setting, context FROM pg_settings
+WHERE name IN ('enable_rows_dist', 'error_sample_count', 'error_sample_seed',
+               'error_bin_count', 'error_sample_kde_bandwidth',
+               'error_profile_path', 'robust_debug_dump')
+ORDER BY name;
+            name            | setting |  context  
+----------------------------+---------+-----------
+ enable_rows_dist           | off     | user
+ error_bin_count            | 1       | user
+ error_profile_path         |         | superuser
+ error_sample_count         | 20      | user
+ error_sample_kde_bandwidth | 0       | user
+ error_sample_seed          | 42      | user
+ robust_debug_dump          | off     | superuser
+(7 rows)
+
+-- Ranges
+SET error_sample_count = 0;
+ERROR:  0 is outside the valid range for parameter "error_sample_count" (1 .. 1000)
+SET error_sample_count = 1001;
+ERROR:  1001 is outside the valid range for parameter "error_sample_count" (1 .. 1000)
+SET error_sample_count = 1;
+SET error_sample_count = 1000;
+SET error_bin_count = 9;
+ERROR:  9 is outside the valid range for parameter "error_bin_count" (1 .. 8)
+SET error_sample_kde_bandwidth = -1.5;
+ERROR:  -1.5 is outside the valid range for parameter "error_sample_kde_bandwidth" (-1 .. 10)
+RESET ALL;
+-- The profile directory and the dump are superuser-only: an ordinary user
+-- must not make the server read files or flood the log
+CREATE ROLE regress_robust_user;
+SET ROLE regress_robust_user;
+SET error_profile_path = '/tmp';
+ERROR:  permission denied to set parameter "error_profile_path"
+SET robust_debug_dump = on;
+ERROR:  permission denied to set parameter "robust_debug_dump"
+SET enable_rows_dist = on;
+SET error_sample_count = 5;
+RESET ROLE;
+RESET ALL;
+DROP ROLE regress_robust_user;
+-- The "query" event of standard_planner
+SET robust_debug_dump = on;
+SET error_sample_count = 7;
+SET client_min_messages = log;
+SELECT 1 AS one;
+LOG:  ROBDP {"ev":"query","enabled":false,"N":7,"seed":42,"bins":1,"bandwidth":0,"profile_path":""}
+ one 
+-----
+   1
+(1 row)
+
+RESET client_min_messages;
+RESET ALL;
