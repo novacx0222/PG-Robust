@@ -1,0 +1,1 @@
+SELECT DISTINCT t2.b FROM t1 JOIN t2 ON t1.fk = t2.id WHERE t1.a = 3

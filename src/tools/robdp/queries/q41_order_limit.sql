@@ -1,0 +1,1 @@
+SELECT * FROM t1 JOIN t2 ON t1.fk = t2.id ORDER BY t1.id LIMIT 10
