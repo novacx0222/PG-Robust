@@ -30,6 +30,7 @@
 #include "optimizer/planmain.h"
 #include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/sample.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
@@ -366,6 +367,71 @@ set_cheapest(RelOptInfo *parent_rel)
 }
 
 /*
+ * RobDP: add_path() and friends behave differently while robust planning is
+ * active (see standard_join_search):
+ *
+ * - In pass 0 (base relations) and pass 2 (vector DP) every path that
+ *	 reaches a pathlist must carry sample vectors; paths whose cost function
+ *	 has no per-sample version get constant ones (robust_fill_path_samples).
+ *
+ * - In pass 2 nothing is pruned here.  Each joinrel collects all of its
+ *	 candidate paths, sorted by mean total cost, and standard_join_search
+ *	 keeps the ones chosen by the configured objective once the level is
+ *	 complete.  The prechecks therefore always succeed.  Bitmap heap paths are
+ *	 dropped as in v20 (they only appear on base relations, which are built in
+ *	 pass 0).
+ *
+ * root is NULL when called from mark_dummy_rel() or set_dummy_rel_pathlist().
+ * Such calls take the ordinary code path, but the dummy path still gets
+ * constant vectors, since the joinrel it belongs to may be read by the pass-2
+ * selection.
+ */
+static inline bool
+robust_needs_samples(const PlannerInfo *root)
+{
+	return enable_rows_dist &&
+		(root == NULL || root->pass == 0 || root->pass == 2);
+}
+
+static inline bool
+robust_collect_all_paths(const PlannerInfo *root)
+{
+	return enable_rows_dist && root != NULL && root->pass == 2;
+}
+
+/*
+ * robust_collect_path
+ *	  Pass-2 replacement for add_path / add_partial_path: insert new_path into
+ *	  *pathlist ordered by total_cost, without discarding anything.
+ */
+static void
+robust_collect_path(List **pathlist, Path *new_path)
+{
+	int			insert_at = 0;
+	ListCell   *lc;
+
+	switch (new_path->pathtype)
+	{
+		case T_BitmapHeapScan:
+		case T_BitmapAnd:
+		case T_BitmapOr:
+			return;
+		default:
+			break;
+	}
+
+	foreach(lc, *pathlist)
+	{
+		Path	   *old_path = (Path *) lfirst(lc);
+
+		if (new_path->total_cost < old_path->total_cost)
+			break;
+		insert_at++;
+	}
+	*pathlist = list_insert_nth(*pathlist, insert_at, new_path);
+}
+
+/*
  * add_path
  *	  Consider a potential implementation path for the specified parent rel,
  *	  and add it to the rel's pathlist if it is worthy of consideration.
@@ -424,7 +490,7 @@ set_cheapest(RelOptInfo *parent_rel)
  * Returns nothing, but modifies parent_rel->pathlist.
  */
 void
-add_path(RelOptInfo *parent_rel, Path *new_path)
+add_path(PlannerInfo *root, RelOptInfo *parent_rel, Path *new_path)
 {
 	bool		accept_new = true;	/* unless we find a superior old path */
 	int			insert_at = 0;	/* where to insert new item */
@@ -436,6 +502,15 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 	 * planner goes very long without calling add_path().
 	 */
 	CHECK_FOR_INTERRUPTS();
+
+	/* RobDP: see the comments above robust_needs_samples() */
+	if (robust_needs_samples(root))
+		robust_fill_path_samples(root, new_path);
+	if (robust_collect_all_paths(root))
+	{
+		robust_collect_path(&parent_rel->pathlist, new_path);
+		return;
+	}
 
 	/* Pretend parameterized paths have no pathkeys, per comment above */
 	new_path_pathkeys = new_path->param_info ? NIL : new_path->pathkeys;
@@ -646,13 +721,17 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
  * so the required information has to be passed piecemeal.
  */
 bool
-add_path_precheck(RelOptInfo *parent_rel,
+add_path_precheck(PlannerInfo *root, RelOptInfo *parent_rel,
 				  Cost startup_cost, Cost total_cost,
 				  List *pathkeys, Relids required_outer)
 {
 	List	   *new_path_pathkeys;
 	bool		consider_startup;
 	ListCell   *p1;
+
+	/* RobDP: pass 2 keeps every candidate (see robust_collect_path) */
+	if (robust_collect_all_paths(root))
+		return true;
 
 	/* Pretend parameterized paths have no pathkeys, per add_path policy */
 	new_path_pathkeys = required_outer ? NIL : pathkeys;
@@ -751,7 +830,7 @@ add_path_precheck(RelOptInfo *parent_rel,
  *	  referenced by partial BitmapHeapPaths.
  */
 void
-add_partial_path(RelOptInfo *parent_rel, Path *new_path)
+add_partial_path(PlannerInfo *root, RelOptInfo *parent_rel, Path *new_path)
 {
 	bool		accept_new = true;	/* unless we find a superior old path */
 	int			insert_at = 0;	/* where to insert new item */
@@ -765,6 +844,15 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 
 	/* Relation should be OK for parallelism, too. */
 	Assert(parent_rel->consider_parallel);
+
+	/* RobDP: see the comments above robust_needs_samples() */
+	if (robust_needs_samples(root))
+		robust_fill_path_samples(root, new_path);
+	if (robust_collect_all_paths(root))
+	{
+		robust_collect_path(&parent_rel->partial_pathlist, new_path);
+		return;
+	}
 
 	/*
 	 * As in add_path, throw out any paths which are dominated by the new
@@ -869,10 +957,14 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
  * is surely a loser.
  */
 bool
-add_partial_path_precheck(RelOptInfo *parent_rel, Cost total_cost,
-						  List *pathkeys)
+add_partial_path_precheck(PlannerInfo *root, RelOptInfo *parent_rel,
+						  Cost total_cost, List *pathkeys)
 {
 	ListCell   *p1;
+
+	/* RobDP: pass 2 keeps every candidate (see robust_collect_path) */
+	if (robust_collect_all_paths(root))
+		return true;
 
 	/*
 	 * Our goal here is twofold.  First, we want to find out whether this path
@@ -913,7 +1005,7 @@ add_partial_path_precheck(RelOptInfo *parent_rel, Cost total_cost,
 	 * partial path; the resulting plans, if run in parallel, will be run to
 	 * completion.
 	 */
-	if (!add_path_precheck(parent_rel, total_cost, total_cost, pathkeys,
+	if (!add_path_precheck(root, parent_rel, total_cost, total_cost, pathkeys,
 						   NULL))
 		return false;
 
@@ -1925,6 +2017,10 @@ create_gather_merge_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	cost_gather_merge(pathnode, root, rel, pathnode->path.param_info,
 					  input_startup_cost, input_total_cost, rows);
 
+	/* RobDP: upper-planning paths inherit the score of their input */
+	if (root->pass == 3)
+		pathnode->path.score = pathnode->subpath->score;
+
 	return pathnode;
 }
 
@@ -1995,6 +2091,10 @@ create_gather_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	}
 
 	cost_gather(pathnode, root, rel, pathnode->path.param_info, rows);
+
+	/* RobDP: upper-planning paths inherit the score of their input */
+	if (root->pass == 3)
+		pathnode->path.score = pathnode->subpath->score;
 
 	return pathnode;
 }
@@ -2722,6 +2822,10 @@ create_projection_path(PlannerInfo *root,
 			(cpu_tuple_cost + target->cost.per_tuple) * subpath->rows;
 	}
 
+	/* RobDP: upper-planning paths inherit the score of their input */
+	if (root->pass == 3)
+		pathnode->path.score = subpath->score;
+
 	return pathnode;
 }
 
@@ -2941,6 +3045,10 @@ create_incremental_sort_path(PlannerInfo *root,
 
 	sort->nPresortedCols = presorted_keys;
 
+	/* RobDP: upper-planning paths inherit the score of their input */
+	if (root->pass == 3)
+		pathnode->path.score = subpath->score;
+
 	return sort;
 }
 
@@ -2983,6 +3091,10 @@ create_sort_path(PlannerInfo *root,
 			  subpath->pathtarget->width,
 			  0.0,				/* XXX comparison_cost shouldn't be 0? */
 			  work_mem, limit_tuples);
+
+	/* RobDP: upper-planning paths inherit the score of their input */
+	if (root->pass == 3)
+		pathnode->path.score = subpath->score;
 
 	return pathnode;
 }
@@ -3037,6 +3149,10 @@ create_group_path(PlannerInfo *root,
 	pathnode->path.startup_cost += target->cost.startup;
 	pathnode->path.total_cost += target->cost.startup +
 		target->cost.per_tuple * pathnode->path.rows;
+
+	/* RobDP: upper-planning paths inherit the score of their input */
+	if (root->pass == 3)
+		pathnode->path.score = subpath->score;
 
 	return pathnode;
 }
@@ -3172,6 +3288,10 @@ create_agg_path(PlannerInfo *root,
 	pathnode->path.startup_cost += target->cost.startup;
 	pathnode->path.total_cost += target->cost.startup +
 		target->cost.per_tuple * pathnode->path.rows;
+
+	/* RobDP: upper-planning paths inherit the score of their input */
+	if (root->pass == 3)
+		pathnode->path.score = subpath->score;
 
 	return pathnode;
 }
@@ -4391,6 +4511,7 @@ do { \
 		new_ppi = makeNode(ParamPathInfo);
 		new_ppi->ppi_req_outer = bms_copy(required_outer);
 		new_ppi->ppi_rows = old_ppi->ppi_rows;
+		new_ppi->ppi_rows_sample = old_ppi->ppi_rows_sample;
 		new_ppi->ppi_clauses = old_ppi->ppi_clauses;
 		ADJUST_CHILD_ATTRS(new_ppi->ppi_clauses);
 		new_ppi->ppi_serials = bms_copy(old_ppi->ppi_serials);

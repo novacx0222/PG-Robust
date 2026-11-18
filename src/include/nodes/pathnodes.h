@@ -22,6 +22,18 @@
 #include "nodes/parsenodes.h"
 #include "storage/block.h"
 
+/*
+ * RobDP: a Sample is a vector of per-error-sample values (row counts or
+ * costs) attached to relations and paths; see optimizer/sample.h.  Only the
+ * forward declaration is needed here.
+ *
+ * JCW_MAX_SAMPLE bounds the per-sample arrays in JoinCostWorkspace.  It must
+ * equal DIST_MAX_SAMPLE (checked in sample.c).
+ */
+typedef struct Sample Sample;
+
+#define JCW_MAX_SAMPLE 100
+
 
 /*
  * Relids
@@ -287,8 +299,30 @@ struct PlannerInfo
 	 * Note: we've already printed all baserel and joinrel RelOptInfos above,
 	 * so we don't dump join_rel_level or other lists of RelOptInfos.
 	 */
+
+	/*
+	 * RobDP: which planning pass is running (see standard_join_search): 0 =
+	 * base relations and anything outside the join search, 1 = per-sample
+	 * point-estimate DP (one round per error sample), 2 = vector-cost DP, 3 =
+	 * upper planning.  "round" is the error sample used by pass 1, or -1.
+	 */
+	int			pass;
+	int			round;
+
+	/*
+	 * RobDP: counters of the 1p/2p cost cross check (cost_check.c), or NULL
+	 * when robust_debug_check_costs is off.
+	 */
+	struct RobustCheckStats *robust_check pg_node_attr(read_write_ignore);
+
+	/*
+	 * RobDP: row-count vectors of the join relations built so far, by relids
+	 * (set_joinrel_rows_sample); NULL until the first one.
+	 */
+	struct HTAB *robust_join_rows_hash pg_node_attr(read_write_ignore);
 	/* lists of join-relation RelOptInfos */
 	List	  **join_rel_level pg_node_attr(read_write_ignore);
+
 	/* index of list being extended */
 	int			join_cur_level;
 
@@ -1028,6 +1062,13 @@ typedef struct RelOptInfo
 	List	  **partexprs pg_node_attr(read_write_ignore);
 	/* Nullable partition key expressions */
 	List	  **nullable_partexprs pg_node_attr(read_write_ignore);
+
+	/*
+	 * RobDP: per-error-sample row counts of this relation (length 1 or
+	 * error_sample_count; "rows" above holds their mean, or the round's value
+	 * during pass 1).
+	 */
+	Sample	   *rows_sample pg_node_attr(read_write_ignore);
 } RelOptInfo;
 
 /*
@@ -1548,6 +1589,8 @@ typedef struct ParamPathInfo
 	Cardinality ppi_rows;		/* estimated number of result tuples */
 	List	   *ppi_clauses;	/* join clauses available from outer rels */
 	Bitmapset  *ppi_serials;	/* set of rinfo_serial for enforced quals */
+	/* RobDP: per-error-sample version of ppi_rows */
+	Sample	   *ppi_rows_sample pg_node_attr(read_write_ignore);
 } ParamPathInfo;
 
 
@@ -1631,6 +1674,16 @@ typedef struct Path
 
 	/* sort ordering of path's output; a List of PathKey nodes; see above */
 	List	   *pathkeys;
+
+	/*
+	 * RobDP: per-error-sample versions of rows, startup_cost and total_cost
+	 * (length 1 or error_sample_count; NULL if the path was costed without
+	 * samples), and the objective score assigned by the robust selection.
+	 */
+	Sample	   *rows_sample pg_node_attr(read_write_ignore);
+	Sample	   *startup_cost_sample pg_node_attr(read_write_ignore);
+	Sample	   *total_cost_sample pg_node_attr(read_write_ignore);
+	double		score;
 } Path;
 
 /* Macro for extracting a path's parameterization relids; beware double eval */
@@ -1959,6 +2012,14 @@ typedef struct MemoizePath
 	uint32		est_entries;	/* The maximum number of entries that the
 								 * planner expects will fit in the cache, or 0
 								 * if unknown */
+
+	/*
+	 * RobDP: "calls" per error sample, i.e. the rows vector of the outer path
+	 * the Memoize was built for (get_memoize_path), or NULL.  Shared, not
+	 * copied; cost_memoize_rescan reads it through the per-sample rescan cost
+	 * of the nestloop.
+	 */
+	Sample	   *calls_sample pg_node_attr(read_write_ignore);
 } MemoizePath;
 
 /*
@@ -2110,6 +2171,13 @@ typedef struct HashPath
 	List	   *path_hashclauses;	/* join clauses used for hashing */
 	int			num_batches;	/* number of batches expected */
 	Cardinality inner_rows_total;	/* total inner rows expected */
+
+	/*
+	 * RobDP: number of batches per error sample (final_cost_hashjoin_2p), or
+	 * NULL.  num_batches above is the representative value the plan uses;
+	 * cost_rescan of a nestloop above reads the per-sample one.
+	 */
+	Sample	   *num_batches_sample pg_node_attr(read_write_ignore);
 } HashPath;
 
 /*
@@ -3278,6 +3346,11 @@ typedef struct
  *
  * (Ideally we'd declare this in cost.h, but it's also needed in pathnode.h,
  * so seems best to put it here.)
+ *
+ * RobDP: the *_sample arrays are the per-error-sample counterparts of the
+ * scalar fields, filled by the vector (pass-2) join cost functions for
+ * entries [0, sample_count).  sample_count == 0 means only the scalar fields
+ * are valid.
  */
 typedef struct JoinCostWorkspace
 {
@@ -3302,6 +3375,39 @@ typedef struct JoinCostWorkspace
 	int			numbuckets;
 	int			numbatches;
 	Cardinality inner_rows_total;
+
+	/*
+	 * RobDP: the inner path initial_cost_nestloop_2p costed.  try_nestloop_path
+	 * may replace the inner by reparameterize_path_by_child() between the two
+	 * phases, so the final path's inner is not always the one the initial
+	 * phase saw; the cost cross check (cost_check.c) needs the original.
+	 */
+	Path	   *nestloop_initial_inner;
+
+	/* RobDP: number of valid entries in the arrays below, or 0 */
+	int			sample_count;
+	unsigned	samples_epoch_id;	/* producer-defined debug marker; 0 if
+									 * unused */
+
+	/* per-sample preliminary costs */
+	Cost		startup_cost_sample[JCW_MAX_SAMPLE];
+	Cost		total_cost_sample[JCW_MAX_SAMPLE];
+	Cost		run_cost_sample[JCW_MAX_SAMPLE];
+
+	/* per-sample private fields for cost_nestloop / cost_mergejoin code */
+	Cost		inner_run_cost_sample[JCW_MAX_SAMPLE];
+	Cost		inner_rescan_run_cost_sample[JCW_MAX_SAMPLE];
+
+	/* per-sample private fields for cost_mergejoin code */
+	Cardinality outer_rows_sample[JCW_MAX_SAMPLE];
+	Cardinality inner_rows_sample[JCW_MAX_SAMPLE];
+	Cardinality outer_skip_rows_sample[JCW_MAX_SAMPLE];
+	Cardinality inner_skip_rows_sample[JCW_MAX_SAMPLE];
+
+	/* per-sample private fields for cost_hashjoin code */
+	int			numbuckets_sample[JCW_MAX_SAMPLE];
+	int			numbatches_sample[JCW_MAX_SAMPLE];
+	Cardinality inner_rows_total_sample[JCW_MAX_SAMPLE];
 } JoinCostWorkspace;
 
 /*

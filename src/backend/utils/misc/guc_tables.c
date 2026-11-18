@@ -48,10 +48,13 @@
 #include "libpq/scram.h"
 #include "nodes/queryjumble.h"
 #include "optimizer/cost.h"
+#include "optimizer/cost_check.h"
 #include "optimizer/geqo.h"
+#include "optimizer/kde.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
+#include "optimizer/sample.h"
 #include "parser/parse_expr.h"
 #include "parser/parser.h"
 #include "pgstat.h"
@@ -82,6 +85,7 @@
 #include "utils/portal.h"
 #include "utils/ps_status.h"
 #include "utils/inval.h"
+#include "utils/smem.h"
 #include "utils/xml.h"
 
 /* This value is normally passed in from the Makefile */
@@ -1997,6 +2001,31 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 
+	{
+		{"enable_rows_dist", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Enables robust (RobDP) planning with per-sample row count distributions."),
+			gettext_noop("When off, the planner behaves exactly like PostgreSQL."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&enable_rows_dist,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"robust_debug_check_costs", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Cross-checks the RobDP per-sample cost functions against the scalar ones."),
+			gettext_noop("After every per-sample (2p) cost computation the path is recosted "
+						 "once per error sample with the scalar (1p) function, and "
+						 "differences are reported.  Only for debugging; planning "
+						 "becomes much slower."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&robust_debug_check_costs,
+		false,
+		NULL, NULL, NULL
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, false, NULL, NULL, NULL
@@ -3505,6 +3534,99 @@ struct config_int ConfigureNamesInt[] =
 		NULL, NULL, NULL
 	},
 
+	{
+		{"error_sample_count", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the number of error samples used by robust planning."),
+			gettext_noop("Each relation with an error profile draws this many samples "
+						 "when it is planned."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&error_sample_count,
+		20, 4, DIST_MAX_SAMPLE,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"error_sample_seed", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the random seed used to sample error profiles."),
+			NULL,
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&error_sample_seed,
+		42, 1, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"error_bin_count", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the number of selectivity bins of each error profile."),
+			NULL,
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&error_bin_count,
+		1, 1, EP_MAX_BIN,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"add_path_limit", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the number of paths robust planning keeps per join relation "
+						 "by the main objective."),
+			NULL,
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&add_path_limit,
+		1, 1, 64,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"retain_path_limit", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the number of additional paths robust planning keeps per join "
+						 "relation by the retain strategy."),
+			NULL,
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&retain_path_limit,
+		1, 0, 64,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"main_objective_id", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Selects the objective robust planning uses to keep paths."),
+			NULL,
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&main_objective_id,
+		0, 0, 16,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"retain_strategy_id", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Selects the objective robust planning uses to keep some of the "
+						 "paths the main objective dropped."),
+			NULL,
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&retain_strategy_id,
+		0, 0, 16,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"final_score_id", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Selects the objective whose value is stored as the score of the "
+						 "final paths."),
+			NULL,
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&final_score_id,
+		0, 0, 16,
+		NULL, NULL, NULL
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, 0, 0, 0, NULL, NULL, NULL
@@ -3783,6 +3905,18 @@ struct config_real ConfigureNamesReal[] =
 		},
 		&log_xact_sample_rate,
 		0.0, 0.0, 1.0,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"error_sample_kde_bandwidth", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the KDE bandwidth used to sample error profiles."),
+			gettext_noop("0 draws the profile's points without smoothing (bootstrap); "
+						 "a negative value uses Silverman's rule of thumb per bin."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&error_sample_kde_bandwidth,
+		0.0, -1.0, 1.0,
 		NULL, NULL, NULL
 	},
 
@@ -4547,6 +4681,18 @@ struct config_string ConfigureNamesString[] =
 		&debug_io_direct_string,
 		"",
 		check_debug_io_direct, assign_debug_io_direct, NULL
+	},
+
+	{
+		{"error_profile_path", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the directory of error profiles used by robust planning."),
+			gettext_noop("All *.txt files in the directory are loaded the next time robust "
+						 "planning needs an error profile."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&error_profile_path,
+		"/opt/error_profile",
+		NULL, NULL, NULL
 	},
 
 	/* End-of-list marker */

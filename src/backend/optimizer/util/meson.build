@@ -3,8 +3,10 @@
 backend_sources += files(
   'appendinfo.c',
   'clauses.c',
+  'ep.c',
   'inherit.c',
   'joininfo.c',
+  'kde.c',
   'orclauses.c',
   'paramassign.c',
   'pathnode.c',
@@ -13,6 +15,7 @@ backend_sources += files(
   'predtest.c',
   'relnode.c',
   'restrictinfo.c',
+  'sample.c',
   'tlist.c',
   'var.c',
 )

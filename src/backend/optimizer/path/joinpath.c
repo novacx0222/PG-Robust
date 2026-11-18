@@ -698,14 +698,18 @@ get_memoize_path(PlannerInfo *root, RelOptInfo *innerrel,
 									&hash_operators,
 									&binary_mode))
 	{
-		return (Path *) create_memoize_path(root,
-											innerrel,
-											inner_path,
-											param_exprs,
-											hash_operators,
-											extra->inner_unique,
-											binary_mode,
-											outer_path->rows);
+		MemoizePath *mpath = create_memoize_path(root,
+												 innerrel,
+												 inner_path,
+												 param_exprs,
+												 hash_operators,
+												 extra->inner_unique,
+												 binary_mode,
+												 outer_path->rows);
+
+		/* RobDP: the number of calls per error sample */
+		mpath->calls_sample = outer_path->rows_sample;
+		return (Path *) mpath;
 	}
 
 	return NULL;
@@ -793,7 +797,7 @@ try_nestloop_path(PlannerInfo *root,
 	initial_cost_nestloop(root, &workspace, jointype,
 						  outer_path, inner_path, extra);
 
-	if (add_path_precheck(joinrel,
+	if (add_path_precheck(root, joinrel,
 						  workspace.startup_cost, workspace.total_cost,
 						  pathkeys, required_outer))
 	{
@@ -818,7 +822,7 @@ try_nestloop_path(PlannerInfo *root,
 			}
 		}
 
-		add_path(joinrel, (Path *)
+		add_path(root, joinrel, (Path *)
 				 create_nestloop_path(root,
 									  joinrel,
 									  jointype,
@@ -886,7 +890,7 @@ try_partial_nestloop_path(PlannerInfo *root,
 	 */
 	initial_cost_nestloop(root, &workspace, jointype,
 						  outer_path, inner_path, extra);
-	if (!add_partial_path_precheck(joinrel, workspace.total_cost, pathkeys))
+	if (!add_partial_path_precheck(root, joinrel, workspace.total_cost, pathkeys))
 		return;
 
 	/*
@@ -906,7 +910,7 @@ try_partial_nestloop_path(PlannerInfo *root,
 	}
 
 	/* Might be good enough to be worth trying, so let's try it. */
-	add_partial_path(joinrel, (Path *)
+	add_partial_path(root, joinrel, (Path *)
 					 create_nestloop_path(root,
 										  joinrel,
 										  jointype,
@@ -999,11 +1003,11 @@ try_mergejoin_path(PlannerInfo *root,
 						   outersortkeys, innersortkeys,
 						   extra);
 
-	if (add_path_precheck(joinrel,
+	if (add_path_precheck(root, joinrel,
 						  workspace.startup_cost, workspace.total_cost,
 						  pathkeys, required_outer))
 	{
-		add_path(joinrel, (Path *)
+		add_path(root, joinrel, (Path *)
 				 create_mergejoin_path(root,
 									   joinrel,
 									   jointype,
@@ -1075,11 +1079,11 @@ try_partial_mergejoin_path(PlannerInfo *root,
 						   outersortkeys, innersortkeys,
 						   extra);
 
-	if (!add_partial_path_precheck(joinrel, workspace.total_cost, pathkeys))
+	if (!add_partial_path_precheck(root, joinrel, workspace.total_cost, pathkeys))
 		return;
 
 	/* Might be good enough to be worth trying, so let's try it. */
-	add_partial_path(joinrel, (Path *)
+	add_partial_path(root, joinrel, (Path *)
 					 create_mergejoin_path(root,
 										   joinrel,
 										   jointype,
@@ -1144,11 +1148,11 @@ try_hashjoin_path(PlannerInfo *root,
 	initial_cost_hashjoin(root, &workspace, jointype, hashclauses,
 						  outer_path, inner_path, extra, false);
 
-	if (add_path_precheck(joinrel,
+	if (add_path_precheck(root, joinrel,
 						  workspace.startup_cost, workspace.total_cost,
 						  NIL, required_outer))
 	{
-		add_path(joinrel, (Path *)
+		add_path(root, joinrel, (Path *)
 				 create_hashjoin_path(root,
 									  joinrel,
 									  jointype,
@@ -1210,11 +1214,11 @@ try_partial_hashjoin_path(PlannerInfo *root,
 	 */
 	initial_cost_hashjoin(root, &workspace, jointype, hashclauses,
 						  outer_path, inner_path, extra, parallel_hash);
-	if (!add_partial_path_precheck(joinrel, workspace.total_cost, NIL))
+	if (!add_partial_path_precheck(root, joinrel, workspace.total_cost, NIL))
 		return;
 
 	/* Might be good enough to be worth trying, so let's try it. */
-	add_partial_path(joinrel, (Path *)
+	add_partial_path(root, joinrel, (Path *)
 					 create_hashjoin_path(root,
 										  joinrel,
 										  jointype,

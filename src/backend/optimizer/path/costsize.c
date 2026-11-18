@@ -86,6 +86,8 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
+#include "optimizer/cost_check.h"
+#include "optimizer/cost_ext.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
@@ -93,6 +95,7 @@
 #include "optimizer/plancat.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/sample.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
@@ -167,12 +170,6 @@ static MergeScanSelCache *cached_scansel(PlannerInfo *root,
 static void cost_rescan(PlannerInfo *root, Path *path,
 						Cost *rescan_startup_cost, Cost *rescan_total_cost);
 static bool cost_qual_eval_walker(Node *node, cost_qual_eval_context *context);
-static void get_restriction_qual_cost(PlannerInfo *root, RelOptInfo *baserel,
-									  ParamPathInfo *param_info,
-									  QualCost *qpqual_cost);
-static bool has_indexed_join_quals(NestPath *path);
-static double approx_tuple_count(PlannerInfo *root, JoinPath *path,
-								 List *quals);
 static double calc_joinrel_size_estimate(PlannerInfo *root,
 										 RelOptInfo *joinrel,
 										 RelOptInfo *outer_rel,
@@ -189,10 +186,6 @@ static Selectivity get_foreign_key_join_selectivity(PlannerInfo *root,
 static Cost append_nonpartial_cost(List *subpaths, int numpaths,
 								   int parallel_workers);
 static void set_rel_width(PlannerInfo *root, RelOptInfo *rel);
-static int32 get_expr_width(PlannerInfo *root, const Node *expr);
-static double relation_byte_size(double tuples, int width);
-static double page_size(double tuples, int width);
-static double get_parallel_divisor(Path *path);
 
 
 /*
@@ -262,6 +255,24 @@ cost_seqscan(Path *path, PlannerInfo *root,
 	double		spc_seq_page_cost;
 	QualCost	qpqual_cost;
 	Cost		cpu_per_tuple;
+
+	/*
+	 * RobDP: while robust planning is active, use the scalar per-round model
+	 * (pass 1) or the per-sample vector model (cost_ext.h explains when).
+	 */
+	switch (robust_scan_cost_model(root, baserel))
+	{
+		case ROBUST_COST_1P:
+			cost_seqscan_1p(path, root, baserel, param_info);
+			return;
+		case ROBUST_COST_2P:
+			cost_seqscan_2p(path, root, baserel, param_info);
+			if (robust_debug_check_costs)
+				robust_check_seqscan(root, path, baserel, param_info);
+			return;
+		case ROBUST_COST_STOCK:
+			break;
+	}
 
 	/* Should only be applied to base relations */
 	Assert(baserel->relid > 0);
@@ -412,6 +423,26 @@ cost_gather(GatherPath *path, PlannerInfo *root,
 	Cost		startup_cost = 0;
 	Cost		run_cost = 0;
 
+	/*
+	 * RobDP: while robust planning is active, use the scalar per-round model
+	 * (pass 1) or the per-sample vector model (cost_ext.h explains when).
+	 */
+	switch (robust_gather_cost_model(root))
+	{
+		case ROBUST_COST_1P:
+			robust_fill_path_samples(root, path->subpath);
+			cost_gather_1p(path, root, rel, param_info, rows);
+			return;
+		case ROBUST_COST_2P:
+			robust_fill_path_samples(root, path->subpath);
+			cost_gather_2p(path, root, rel, param_info, rows);
+			if (robust_debug_check_costs)
+				robust_check_gather(root, path, rel, param_info, rows);
+			return;
+		case ROBUST_COST_STOCK:
+			break;
+	}
+
 	/* Mark the path with the correct row estimate */
 	if (rows)
 		path->path.rows = *rows;
@@ -453,6 +484,28 @@ cost_gather_merge(GatherMergePath *path, PlannerInfo *root,
 	Cost		comparison_cost;
 	double		N;
 	double		logN;
+
+	/*
+	 * RobDP: while robust planning is active, use the scalar per-round model
+	 * (pass 1) or the per-sample vector model (cost_ext.h explains when).
+	 */
+	switch (robust_gather_cost_model(root))
+	{
+		case ROBUST_COST_1P:
+			robust_fill_path_samples(root, path->subpath);
+			cost_gather_merge_1p(path, root, rel, param_info,
+								 input_startup_cost, input_total_cost, rows);
+			return;
+		case ROBUST_COST_2P:
+			robust_fill_path_samples(root, path->subpath);
+			cost_gather_merge_2p(path, root, rel, param_info,
+								 input_startup_cost, input_total_cost, rows);
+			if (robust_debug_check_costs)
+				robust_check_gather_merge(root, path, rel, param_info, rows);
+			return;
+		case ROBUST_COST_STOCK:
+			break;
+	}
 
 	/* Mark the path with the correct row estimate */
 	if (rows)
@@ -544,6 +597,24 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 	double		pages_fetched;
 	double		rand_heap_pages;
 	double		index_pages;
+
+	/*
+	 * RobDP: while robust planning is active, use the scalar per-round model
+	 * (pass 1) or the per-sample vector model (cost_ext.h explains when).
+	 */
+	switch (robust_scan_cost_model(root, baserel))
+	{
+		case ROBUST_COST_1P:
+			cost_index_1p(path, root, loop_count, partial_path);
+			return;
+		case ROBUST_COST_2P:
+			cost_index_2p(path, root, loop_count, partial_path);
+			if (robust_debug_check_costs)
+				robust_check_index(root, path, loop_count, partial_path);
+			return;
+		case ROBUST_COST_STOCK:
+			break;
+	}
 
 	/* Should only be applied to base relations */
 	Assert(IsA(baserel, RelOptInfo) &&
@@ -1763,6 +1834,12 @@ cost_resultscan(Path *path, PlannerInfo *root,
 	else
 		path->rows = baserel->rows;
 
+	/* RobDP: carry the per-sample row counts as well */
+	if (enable_rows_dist)
+		path->rows_sample = duplicate_sample(param_info ?
+											 param_info->ppi_rows_sample :
+											 baserel->rows_sample);
+
 	/* We charge qual cost plus cpu_tuple_cost */
 	get_restriction_qual_cost(root, baserel, param_info, &qpqual_cost);
 
@@ -2807,6 +2884,16 @@ cost_agg(Path *path, PlannerInfo *root,
 	path->rows = output_tuples;
 	path->startup_cost = startup_cost;
 	path->total_cost = total_cost;
+
+	/*
+	 * RobDP: aggregation is not modeled per sample yet, and the path gets no
+	 * vectors here.  Callers such as create_agg_path still add the tlist
+	 * cost to the scalars after this returns, so constant vectors made now
+	 * would be stale; robust_fill_path_samples() builds them from the final
+	 * scalars when the path is added or used as an input.  (RobDP P1: v20
+	 * attached them here, and a Gather Merge above saw costs without the
+	 * tlist.)
+	 */
 }
 
 /*
@@ -2974,6 +3061,28 @@ initial_cost_nestloop(PlannerInfo *root, JoinCostWorkspace *workspace,
 	Cost		inner_run_cost;
 	Cost		inner_rescan_run_cost;
 
+	/*
+	 * RobDP: while robust planning is active, use the scalar per-round model
+	 * (pass 1) or the per-sample vector model (cost_ext.h explains when).
+	 */
+	switch (robust_join_cost_model(root))
+	{
+		case ROBUST_COST_1P:
+			robust_fill_path_samples(root, outer_path);
+			robust_fill_path_samples(root, inner_path);
+			initial_cost_nestloop_1p(root, workspace, jointype,
+									 outer_path, inner_path, extra);
+			return;
+		case ROBUST_COST_2P:
+			robust_fill_path_samples(root, outer_path);
+			robust_fill_path_samples(root, inner_path);
+			initial_cost_nestloop_2p(root, workspace, jointype,
+									 outer_path, inner_path, extra);
+			return;
+		case ROBUST_COST_STOCK:
+			break;
+	}
+
 	/* estimate costs to rescan the inner relation */
 	cost_rescan(root, inner_path,
 				&inner_rescan_start_cost,
@@ -3049,6 +3158,28 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 	Cost		cpu_per_tuple;
 	QualCost	restrict_qual_cost;
 	double		ntuples;
+
+	/*
+	 * RobDP: while robust planning is active, use the scalar per-round model
+	 * (pass 1) or the per-sample vector model (cost_ext.h explains when).
+	 */
+	switch (robust_join_cost_model(root))
+	{
+		case ROBUST_COST_1P:
+			robust_fill_path_samples(root, outer_path);
+			robust_fill_path_samples(root, inner_path);
+			final_cost_nestloop_1p(root, path, workspace, extra);
+			return;
+		case ROBUST_COST_2P:
+			robust_fill_path_samples(root, outer_path);
+			robust_fill_path_samples(root, inner_path);
+			final_cost_nestloop_2p(root, path, workspace, extra);
+			if (robust_debug_check_costs)
+				robust_check_nestloop(root, path, workspace, extra);
+			return;
+		case ROBUST_COST_STOCK:
+			break;
+	}
 
 	/* Protect some assumptions below that rowcounts aren't zero */
 	if (outer_path_rows <= 0)
@@ -3263,6 +3394,30 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 				innerstartsel,
 				innerendsel;
 	Path		sort_path;		/* dummy for result of cost_sort */
+
+	/*
+	 * RobDP: while robust planning is active, use the scalar per-round model
+	 * (pass 1) or the per-sample vector model (cost_ext.h explains when).
+	 */
+	switch (robust_join_cost_model(root))
+	{
+		case ROBUST_COST_1P:
+			robust_fill_path_samples(root, outer_path);
+			robust_fill_path_samples(root, inner_path);
+			initial_cost_mergejoin_1p(root, workspace, jointype, mergeclauses,
+									  outer_path, inner_path,
+									  outersortkeys, innersortkeys, extra);
+			return;
+		case ROBUST_COST_2P:
+			robust_fill_path_samples(root, outer_path);
+			robust_fill_path_samples(root, inner_path);
+			initial_cost_mergejoin_2p(root, workspace, jointype, mergeclauses,
+									  outer_path, inner_path,
+									  outersortkeys, innersortkeys, extra);
+			return;
+		case ROBUST_COST_STOCK:
+			break;
+	}
 
 	/* Protect some assumptions below that rowcounts aren't zero */
 	if (outer_path_rows <= 0)
@@ -3497,6 +3652,28 @@ final_cost_mergejoin(PlannerInfo *root, MergePath *path,
 	double		mergejointuples,
 				rescannedtuples;
 	double		rescanratio;
+
+	/*
+	 * RobDP: while robust planning is active, use the scalar per-round model
+	 * (pass 1) or the per-sample vector model (cost_ext.h explains when).
+	 */
+	switch (robust_join_cost_model(root))
+	{
+		case ROBUST_COST_1P:
+			robust_fill_path_samples(root, outer_path);
+			robust_fill_path_samples(root, inner_path);
+			final_cost_mergejoin_1p(root, path, workspace, extra);
+			return;
+		case ROBUST_COST_2P:
+			robust_fill_path_samples(root, outer_path);
+			robust_fill_path_samples(root, inner_path);
+			final_cost_mergejoin_2p(root, path, workspace, extra);
+			if (robust_debug_check_costs)
+				robust_check_mergejoin(root, path, extra);
+			return;
+		case ROBUST_COST_STOCK:
+			break;
+	}
 
 	/* Protect some assumptions below that rowcounts aren't zero */
 	if (inner_path_rows <= 0)
@@ -3819,6 +3996,30 @@ initial_cost_hashjoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 	int			num_skew_mcvs;
 	size_t		space_allowed;	/* unused */
 
+	/*
+	 * RobDP: while robust planning is active, use the scalar per-round model
+	 * (pass 1) or the per-sample vector model (cost_ext.h explains when).
+	 */
+	switch (robust_join_cost_model(root))
+	{
+		case ROBUST_COST_1P:
+			robust_fill_path_samples(root, outer_path);
+			robust_fill_path_samples(root, inner_path);
+			initial_cost_hashjoin_1p(root, workspace, jointype, hashclauses,
+									 outer_path, inner_path, extra,
+									 parallel_hash);
+			return;
+		case ROBUST_COST_2P:
+			robust_fill_path_samples(root, outer_path);
+			robust_fill_path_samples(root, inner_path);
+			initial_cost_hashjoin_2p(root, workspace, jointype, hashclauses,
+									 outer_path, inner_path, extra,
+									 parallel_hash);
+			return;
+		case ROBUST_COST_STOCK:
+			break;
+	}
+
 	/* cost of source data */
 	startup_cost += outer_path->startup_cost;
 	run_cost += outer_path->total_cost - outer_path->startup_cost;
@@ -3931,6 +4132,28 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 	Selectivity innerbucketsize;
 	Selectivity innermcvfreq;
 	ListCell   *hcl;
+
+	/*
+	 * RobDP: while robust planning is active, use the scalar per-round model
+	 * (pass 1) or the per-sample vector model (cost_ext.h explains when).
+	 */
+	switch (robust_join_cost_model(root))
+	{
+		case ROBUST_COST_1P:
+			robust_fill_path_samples(root, outer_path);
+			robust_fill_path_samples(root, inner_path);
+			final_cost_hashjoin_1p(root, path, workspace, extra);
+			return;
+		case ROBUST_COST_2P:
+			robust_fill_path_samples(root, outer_path);
+			robust_fill_path_samples(root, inner_path);
+			final_cost_hashjoin_2p(root, path, workspace, extra);
+			if (robust_debug_check_costs)
+				robust_check_hashjoin(root, path, extra);
+			return;
+		case ROBUST_COST_STOCK:
+			break;
+	}
 
 	/* Mark the path with the correct row estimate */
 	if (path->jpath.path.param_info)
@@ -4688,9 +4911,9 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
  * some of the quals.  We assume baserestrictcost was previously set by
  * set_baserel_size_estimates().
  */
-static void
-get_restriction_qual_cost(PlannerInfo *root, RelOptInfo *baserel,
-						  ParamPathInfo *param_info,
+void
+get_restriction_qual_cost(PlannerInfo *root, const RelOptInfo *baserel,
+						  const ParamPathInfo *param_info,
 						  QualCost *qpqual_cost)
 {
 	if (param_info)
@@ -4843,7 +5066,7 @@ compute_semi_anti_join_factors(PlannerInfo *root,
  * unmatched outer tuple is cheap to process, whereas otherwise it's probably
  * expensive.
  */
-static bool
+bool
 has_indexed_join_quals(NestPath *path)
 {
 	JoinPath   *joinpath = &path->jpath;
@@ -4936,8 +5159,8 @@ has_indexed_join_quals(NestPath *path)
  * output tuples are generated and passed through qpqual checking, it
  * seems OK to live with the approximation.
  */
-static double
-approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
+double
+approx_tuple_count(PlannerInfo *root, const JoinPath *path, List *quals)
 {
 	double		tuples;
 	double		outer_tuples = path->outerjoinpath->rows;
@@ -5000,22 +5223,30 @@ void
 set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 {
 	double		nrows;
+	Selectivity sel;
 
 	/* Should only be applied to base relations */
 	Assert(rel->relid > 0);
 
-	nrows = rel->tuples *
-		clauselist_selectivity(root,
-							   rel->baserestrictinfo,
-							   0,
-							   JOIN_INNER,
-							   NULL);
+	sel = clauselist_selectivity(root,
+								 rel->baserestrictinfo,
+								 0,
+								 JOIN_INNER,
+								 NULL);
+	nrows = rel->tuples * sel;
 
 	rel->rows = clamp_row_est(nrows);
 
 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
 
 	set_rel_width(root, rel);
+
+	/*
+	 * RobDP: build the per-sample row counts from the relation's error
+	 * profile.  This also replaces rel->rows with their mean (see sample.c).
+	 */
+	if (enable_rows_dist)
+		set_baserel_rows_sample(root, rel, sel);
 }
 
 /*
@@ -5082,6 +5313,19 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 						   SpecialJoinInfo *sjinfo,
 						   List *restrictlist)
 {
+	/*
+	 * RobDP: the per-sample join sizes, PostgreSQL's estimate applied to each
+	 * sample of the input sizes and of the join clauses' estimation error,
+	 * replace the estimate; rel->rows becomes their mean, or the round's
+	 * sample during pass 1 (see set_joinrel_rows_sample).
+	 */
+	if (enable_rows_dist)
+	{
+		set_joinrel_rows_sample(root, rel, outer_rel, inner_rel, sjinfo,
+								restrictlist);
+		return;
+	}
+
 	rel->rows = calc_joinrel_size_estimate(root,
 										   rel,
 										   outer_rel,
@@ -5147,6 +5391,10 @@ get_parameterized_joinrel_size(PlannerInfo *root, RelOptInfo *rel,
  * outer_rel/inner_rel are the relations being joined, but they should be
  * assumed to have sizes outer_rows/inner_rows; those numbers might be less
  * than what rel->rows says, when we are considering parameterized paths.
+ *
+ * RobDP: split into calc_joinrel_selectivities and calc_joinrel_rows, so
+ * that the per-sample join sizes (set_joinrel_rows_sample) use the same
+ * formula for each sample's input sizes.  The result is unchanged.
  */
 static double
 calc_joinrel_size_estimate(PlannerInfo *root,
@@ -5158,11 +5406,31 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 						   SpecialJoinInfo *sjinfo,
 						   List *restrictlist)
 {
+	JoinSizeSelectivities sel;
+
+	calc_joinrel_selectivities(root, joinrel, outer_rel, inner_rel, sjinfo,
+							   restrictlist, &sel);
+	return calc_joinrel_rows(&sel, outer_rows, inner_rows, 1.0);
+}
+
+/*
+ * calc_joinrel_selectivities
+ *		The selectivities calc_joinrel_size_estimate combines with the input
+ *		sizes (RobDP; the code is PostgreSQL's).
+ */
+void
+calc_joinrel_selectivities(PlannerInfo *root,
+						   RelOptInfo *joinrel,
+						   RelOptInfo *outer_rel,
+						   RelOptInfo *inner_rel,
+						   SpecialJoinInfo *sjinfo,
+						   List *restrictlist,
+						   JoinSizeSelectivities *sel)
+{
 	JoinType	jointype = sjinfo->jointype;
 	Selectivity fkselec;
 	Selectivity jselec;
 	Selectivity pselec;
-	double		nrows;
 
 	/*
 	 * Compute joinclause selectivity.  Note that we are only considering
@@ -5231,6 +5499,40 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 										jointype,
 										sjinfo);
 		pselec = 0.0;			/* not used, keep compiler quiet */
+	}
+
+	sel->jointype = jointype;
+	sel->fkselec = fkselec;
+	sel->jselec = jselec;
+	sel->pselec = pselec;
+}
+
+/*
+ * calc_joinrel_rows
+ *		The join size for given input sizes and selectivities (RobDP; the
+ *		formula is PostgreSQL's).
+ *
+ * error_factor multiplies the selectivity of the join's own clauses,
+ * fkselec * jselec (the result is clamped to a probability); RobDP passes
+ * exp(x_s), the sampled estimation error of the join's clauses, and 1.0
+ * when there is none, which gives exactly PostgreSQL's estimate.
+ */
+double
+calc_joinrel_rows(const JoinSizeSelectivities *sel,
+				  double outer_rows, double inner_rows,
+				  double error_factor)
+{
+	JoinType	jointype = sel->jointype;
+	Selectivity fkselec = sel->fkselec;
+	Selectivity jselec = sel->jselec;
+	Selectivity pselec = sel->pselec;
+	double		nrows;
+
+	if (error_factor != 1.0)
+	{
+		jselec = fkselec * jselec * error_factor;
+		CLAMP_PROBABILITY(jselec);
+		fkselec = 1.0;
 	}
 
 	/*
@@ -6053,8 +6355,8 @@ set_pathtarget_cost_width(PlannerInfo *root, PathTarget *target)
  *		cached in a Var's owning RelOptInfo, else fallback on the type's
  *		average width when unable to or when the given Node is not a Var.
  */
-static int32
-get_expr_width(PlannerInfo *root, const Node *expr)
+int32
+get_expr_width(const PlannerInfo *root, const Node *expr)
 {
 	int32		width;
 
@@ -6101,7 +6403,7 @@ get_expr_width(PlannerInfo *root, const Node *expr)
  *	  Estimate the storage space in bytes for a given number of tuples
  *	  of a given width (size in bytes).
  */
-static double
+double
 relation_byte_size(double tuples, int width)
 {
 	return tuples * (MAXALIGN(width) + MAXALIGN(SizeofHeapTupleHeader));
@@ -6112,7 +6414,7 @@ relation_byte_size(double tuples, int width)
  *	  Returns an estimate of the number of pages covered by a given
  *	  number of tuples of a given width (size in bytes).
  */
-static double
+double
 page_size(double tuples, int width)
 {
 	return ceil(relation_byte_size(tuples, width) / BLCKSZ);
@@ -6122,8 +6424,8 @@ page_size(double tuples, int width)
  * Estimate the fraction of the work that each worker will do given the
  * number of workers budgeted for the path.
  */
-static double
-get_parallel_divisor(Path *path)
+double
+get_parallel_divisor(const Path *path)
 {
 	double		parallel_divisor = path->parallel_workers;
 

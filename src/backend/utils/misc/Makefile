@@ -28,6 +28,7 @@ OBJS = \
 	queryenvironment.o \
 	rls.o \
 	sampling.o \
+	smem.o \
 	superuser.o \
 	timeout.o \
 	tzparser.o
@@ -39,6 +40,10 @@ override CPPFLAGS += -DPG_KRB_SRVTAB='"$(krb_srvtab)"'
 endif
 
 include $(top_srcdir)/src/backend/common.mk
+
+# RobDP: the files imported from v20 declare variables after statements
+# throughout; silence that one warning for them until they are reformatted.
+smem.o: CFLAGS += -Wno-declaration-after-statement
 
 # Note: guc-file.c is not deleted by 'make clean',
 # since we want to ship it in distribution tarballs.

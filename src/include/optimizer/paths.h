@@ -25,6 +25,13 @@ extern PGDLLIMPORT int geqo_threshold;
 extern PGDLLIMPORT int min_parallel_table_scan_size;
 extern PGDLLIMPORT int min_parallel_index_scan_size;
 
+/* RobDP GUCs (see standard_join_search and pathstrategy.c) */
+extern PGDLLIMPORT int add_path_limit;
+extern PGDLLIMPORT int retain_path_limit;
+extern PGDLLIMPORT int main_objective_id;
+extern PGDLLIMPORT int retain_strategy_id;
+extern PGDLLIMPORT int final_score_id;
+
 /* Hook for plugins to get control in set_rel_pathlist() */
 typedef void (*set_rel_pathlist_hook_type) (PlannerInfo *root,
 											RelOptInfo *rel,

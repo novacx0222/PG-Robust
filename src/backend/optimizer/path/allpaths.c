@@ -31,9 +31,11 @@
 #ifdef OPTIMIZER_DEBUG
 #include "nodes/print.h"
 #endif
+#include "optimizer/addpath.h"
 #include "optimizer/appendinfo.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
+#include "optimizer/cost_check.h"
 #include "optimizer/geqo.h"
 #include "optimizer/inherit.h"
 #include "optimizer/optimizer.h"
@@ -42,6 +44,7 @@
 #include "optimizer/plancat.h"
 #include "optimizer/planner.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/sample.h"
 #include "optimizer/tlist.h"
 #include "parser/parse_clause.h"
 #include "parser/parsetree.h"
@@ -50,6 +53,7 @@
 #include "port/pg_bitutils.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 
 
 /* Bitmask flags for pushdown_safety_info.unsafeFlags */
@@ -84,6 +88,23 @@ int			geqo_threshold;
 int			min_parallel_table_scan_size;
 int			min_parallel_index_scan_size;
 
+/*
+ * RobDP parameters, set by GUC.  The *_id values index path_strategy_funcs[]
+ * (pathstrategy.c):
+ *
+ * main_objective_id: objective used to keep add_path_limit paths per joinrel
+ *		(1 at the top level)
+ * retain_strategy_id: objective used to keep retain_path_limit more paths out
+ *		of the ones the main objective dropped (not at the top level)
+ * final_score_id: objective whose value is stored as Path.score for the
+ *		top-level paths
+ */
+int			add_path_limit = 1;
+int			retain_path_limit = 1;
+int			main_objective_id = 0;
+int			retain_strategy_id = 0;
+int			final_score_id = 0;
+
 /* Hook for plugins to get control in set_rel_pathlist() */
 set_rel_pathlist_hook_type set_rel_pathlist_hook = NULL;
 
@@ -92,6 +113,8 @@ join_search_hook_type join_search_hook = NULL;
 
 
 static void set_base_rel_consider_startup(PlannerInfo *root);
+static RelOptInfo *robust_join_search(PlannerInfo *root, int levels_needed,
+									  List *initial_rels);
 static void set_base_rel_sizes(PlannerInfo *root);
 static void set_base_rel_pathlists(PlannerInfo *root);
 static void set_rel_size(PlannerInfo *root, RelOptInfo *rel,
@@ -776,7 +799,7 @@ set_plain_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	required_outer = rel->lateral_relids;
 
 	/* Consider sequential scan */
-	add_path(rel, create_seqscan_path(root, rel, required_outer, 0));
+	add_path(root, rel, create_seqscan_path(root, rel, required_outer, 0));
 
 	/* If appropriate, consider parallel sequential scan */
 	if (rel->consider_parallel && required_outer == NULL)
@@ -806,7 +829,7 @@ create_plain_partial_paths(PlannerInfo *root, RelOptInfo *rel)
 		return;
 
 	/* Add an unordered partial path based on a parallel sequential scan. */
-	add_partial_path(rel, create_seqscan_path(root, rel, NULL, parallel_workers));
+	add_partial_path(root, rel, create_seqscan_path(root, rel, NULL, parallel_workers));
 }
 
 /*
@@ -892,7 +915,7 @@ set_tablesample_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *
 		path = (Path *) create_material_path(rel, path);
 	}
 
-	add_path(rel, path);
+	add_path(root, rel, path);
 
 	/* For the moment, at least, there are no other paths to consider */
 }
@@ -1474,9 +1497,9 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * if we have zero or one live subpath due to constraint exclusion.)
 	 */
 	if (subpaths_valid)
-		add_path(rel, (Path *) create_append_path(root, rel, subpaths, NIL,
-												  NIL, NULL, 0, false,
-												  -1));
+		add_path(root, rel, (Path *) create_append_path(root, rel, subpaths, NIL,
+														NIL, NULL, 0, false,
+														-1));
 
 	/*
 	 * Consider an append of unordered, unparameterized partial paths.  Make
@@ -1528,7 +1551,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		partial_rows = appendpath->path.rows;
 
 		/* Add the path. */
-		add_partial_path(rel, (Path *) appendpath);
+		add_partial_path(root, rel, (Path *) appendpath);
 	}
 
 	/*
@@ -1569,7 +1592,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 										pa_partial_subpaths,
 										NIL, NULL, parallel_workers, true,
 										partial_rows);
-		add_partial_path(rel, (Path *) appendpath);
+		add_partial_path(root, rel, (Path *) appendpath);
 	}
 
 	/*
@@ -1626,7 +1649,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		}
 
 		if (subpaths_valid)
-			add_path(rel, (Path *)
+			add_path(root, rel, (Path *)
 					 create_append_path(root, rel, subpaths, NIL,
 										NIL, required_outer, 0, false,
 										-1));
@@ -1657,7 +1680,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 											NIL, NULL,
 											path->parallel_workers, true,
 											partial_rows);
-			add_partial_path(rel, (Path *) appendpath);
+			add_partial_path(root, rel, (Path *) appendpath);
 		}
 	}
 }
@@ -1911,58 +1934,58 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 		if (match_partition_order)
 		{
 			/* We only need Append */
-			add_path(rel, (Path *) create_append_path(root,
-													  rel,
-													  startup_subpaths,
-													  NIL,
-													  pathkeys,
-													  NULL,
-													  0,
-													  false,
-													  -1));
+			add_path(root, rel, (Path *) create_append_path(root,
+															rel,
+															startup_subpaths,
+															NIL,
+															pathkeys,
+															NULL,
+															0,
+															false,
+															-1));
 			if (startup_neq_total)
-				add_path(rel, (Path *) create_append_path(root,
-														  rel,
-														  total_subpaths,
-														  NIL,
-														  pathkeys,
-														  NULL,
-														  0,
-														  false,
-														  -1));
+				add_path(root, rel, (Path *) create_append_path(root,
+																rel,
+																total_subpaths,
+																NIL,
+																pathkeys,
+																NULL,
+																0,
+																false,
+																-1));
 
 			if (fractional_subpaths)
-				add_path(rel, (Path *) create_append_path(root,
-														  rel,
-														  fractional_subpaths,
-														  NIL,
-														  pathkeys,
-														  NULL,
-														  0,
-														  false,
-														  -1));
+				add_path(root, rel, (Path *) create_append_path(root,
+																rel,
+																fractional_subpaths,
+																NIL,
+																pathkeys,
+																NULL,
+																0,
+																false,
+																-1));
 		}
 		else
 		{
 			/* We need MergeAppend */
-			add_path(rel, (Path *) create_merge_append_path(root,
-															rel,
-															startup_subpaths,
-															pathkeys,
-															NULL));
+			add_path(root, rel, (Path *) create_merge_append_path(root,
+																  rel,
+																  startup_subpaths,
+																  pathkeys,
+																  NULL));
 			if (startup_neq_total)
-				add_path(rel, (Path *) create_merge_append_path(root,
-																rel,
-																total_subpaths,
-																pathkeys,
-																NULL));
+				add_path(root, rel, (Path *) create_merge_append_path(root,
+																	  rel,
+																	  total_subpaths,
+																	  pathkeys,
+																	  NULL));
 
 			if (fractional_subpaths)
-				add_path(rel, (Path *) create_merge_append_path(root,
-																rel,
-																fractional_subpaths,
-																pathkeys,
-																NULL));
+				add_path(root, rel, (Path *) create_merge_append_path(root,
+																	  rel,
+																	  fractional_subpaths,
+																	  pathkeys,
+																	  NULL));
 		}
 	}
 }
@@ -2153,9 +2176,9 @@ set_dummy_rel_pathlist(RelOptInfo *rel)
 	rel->partial_pathlist = NIL;
 
 	/* Set up the dummy path */
-	add_path(rel, (Path *) create_append_path(NULL, rel, NIL, NIL,
-											  NIL, rel->lateral_relids,
-											  0, false, -1));
+	add_path(NULL, rel, (Path *) create_append_path(NULL, rel, NIL, NIL,
+													NIL, rel->lateral_relids,
+													0, false, -1));
 
 	/*
 	 * We set the cheapest-path fields immediately, just in case they were
@@ -2720,7 +2743,7 @@ set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 											 make_tlist_from_pathtarget(subpath->pathtarget));
 
 		/* Generate outer path using this subpath */
-		add_path(rel, (Path *)
+		add_path(root, rel, (Path *)
 				 create_subqueryscan_path(root, rel, subpath,
 										  trivial_pathtarget,
 										  pathkeys, required_outer));
@@ -2746,7 +2769,7 @@ set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 												 make_tlist_from_pathtarget(subpath->pathtarget));
 
 			/* Generate outer path using this subpath */
-			add_partial_path(rel, (Path *)
+			add_partial_path(root, rel, (Path *)
 							 create_subqueryscan_path(root, rel, subpath,
 													  trivial_pathtarget,
 													  pathkeys,
@@ -2818,8 +2841,8 @@ set_function_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	}
 
 	/* Generate appropriate path */
-	add_path(rel, create_functionscan_path(root, rel,
-										   pathkeys, required_outer));
+	add_path(root, rel, create_functionscan_path(root, rel,
+												 pathkeys, required_outer));
 }
 
 /*
@@ -2839,7 +2862,7 @@ set_values_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	required_outer = rel->lateral_relids;
 
 	/* Generate appropriate path */
-	add_path(rel, create_valuesscan_path(root, rel, required_outer));
+	add_path(root, rel, create_valuesscan_path(root, rel, required_outer));
 }
 
 /*
@@ -2859,8 +2882,8 @@ set_tablefunc_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	required_outer = rel->lateral_relids;
 
 	/* Generate appropriate path */
-	add_path(rel, create_tablefuncscan_path(root, rel,
-											required_outer));
+	add_path(root, rel, create_tablefuncscan_path(root, rel,
+												  required_outer));
 }
 
 /*
@@ -2927,7 +2950,7 @@ set_cte_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	required_outer = rel->lateral_relids;
 
 	/* Generate appropriate path */
-	add_path(rel, create_ctescan_path(root, rel, required_outer));
+	add_path(root, rel, create_ctescan_path(root, rel, required_outer));
 }
 
 /*
@@ -2954,7 +2977,7 @@ set_namedtuplestore_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	required_outer = rel->lateral_relids;
 
 	/* Generate appropriate path */
-	add_path(rel, create_namedtuplestorescan_path(root, rel, required_outer));
+	add_path(root, rel, create_namedtuplestorescan_path(root, rel, required_outer));
 
 	/* Select cheapest path (pretty easy in this case...) */
 	set_cheapest(rel);
@@ -2984,7 +3007,7 @@ set_result_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	required_outer = rel->lateral_relids;
 
 	/* Generate appropriate path */
-	add_path(rel, create_resultscan_path(root, rel, required_outer));
+	add_path(root, rel, create_resultscan_path(root, rel, required_outer));
 
 	/* Select cheapest path (pretty easy in this case...) */
 	set_cheapest(rel);
@@ -3037,7 +3060,7 @@ set_worktable_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	required_outer = rel->lateral_relids;
 
 	/* Generate appropriate path */
-	add_path(rel, create_worktablescan_path(root, rel, required_outer));
+	add_path(root, rel, create_worktablescan_path(root, rel, required_outer));
 }
 
 /*
@@ -3084,7 +3107,7 @@ generate_gather_paths(PlannerInfo *root, RelOptInfo *rel, bool override_rows)
 	simple_gather_path = (Path *)
 		create_gather_path(root, rel, cheapest_partial_path, rel->reltarget,
 						   NULL, rowsp);
-	add_path(rel, simple_gather_path);
+	add_path(root, rel, simple_gather_path);
 
 	/*
 	 * For each useful ordering, we can consider an order-preserving Gather
@@ -3101,7 +3124,7 @@ generate_gather_paths(PlannerInfo *root, RelOptInfo *rel, bool override_rows)
 		rows = subpath->rows * subpath->parallel_workers;
 		path = create_gather_merge_path(root, rel, subpath, rel->reltarget,
 										subpath->pathkeys, NULL, rowsp);
-		add_path(rel, &path->path);
+		add_path(root, rel, &path->path);
 	}
 }
 
@@ -3298,7 +3321,7 @@ generate_useful_gather_paths(PlannerInfo *root, RelOptInfo *rel, bool override_r
 											NULL,
 											rowsp);
 
-			add_path(rel, &path->path);
+			add_path(root, rel, &path->path);
 		}
 	}
 }
@@ -3377,6 +3400,19 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		 */
 		root->initial_rels = initial_rels;
 
+		/*
+		 * RobDP: the two-pass robust search is part of standard_join_search.
+		 * A plugin's search or GEQO joins the rels with the standard cost
+		 * model (see robust_join_cost_model()), so say so.
+		 */
+		if (enable_rows_dist &&
+			(join_search_hook ||
+			 (enable_geqo && levels_needed >= geqo_threshold)))
+			ereport(NOTICE,
+					(errmsg("robust join search is not used for this join problem"),
+					 errdetail("%s plans the joins with the standard cost model.",
+							   join_search_hook ? "join_search_hook" : "GEQO")));
+
 		if (join_search_hook)
 			return (*join_search_hook) (root, levels_needed, initial_rels);
 		else if (enable_geqo && levels_needed >= geqo_threshold)
@@ -3420,6 +3456,10 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 {
 	int			lev;
 	RelOptInfo *rel;
+
+	/* RobDP: robust planning replaces the search below */
+	if (enable_rows_dist)
+		return robust_join_search(root, levels_needed, initial_rels);
 
 	/*
 	 * This function cannot be invoked recursively within any one planning
@@ -3499,6 +3539,618 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 	root->join_rel_level = NULL;
 
 	return rel;
+}
+
+/*
+ * objective_needs_envelope
+ *	  Does path_strategy_funcs[objective_id] use the pass-1 minimum envelope?
+ *
+ * The cost-only objectives (worst / expected total cost, worst / expected
+ * startup cost, random, jointype-based expected cost) do not, and the
+ * penalty-style ones do.  This is the list v20 uses.
+ */
+static bool
+objective_needs_envelope(int objective_id)
+{
+	switch (objective_id)
+	{
+		case 2:
+		case 3:
+		case 4:
+		case 5:
+		case 7:
+		case 16:
+			return false;
+		default:
+			return true;
+	}
+}
+
+/*
+ * robust_prune_pathlist
+ *	  Keep the paths of one joinrel pathlist that the objectives select.
+ *
+ * The main objective keeps up to 'limit' paths; at intermediate levels the
+ * retain strategy may then keep up to retain_path_limit of the dropped ones.
+ * Returns the kept paths sorted by (mean) total cost.
+ */
+static List *
+robust_prune_pathlist(List *pathlist, const double *min_envelope_sample,
+					  int limit, bool top_level)
+{
+	List	   *kept = NIL;
+	List	   *dropped;
+	List	   *final_dropped = NIL;
+
+	dropped = select_path_by_strategy_dispatch(pathlist, &kept,
+											   min_envelope_sample,
+											   path_strategy_funcs[main_objective_id],
+											   limit, error_sample_count,
+											   true);
+	if (!top_level && retain_path_limit > 0 && dropped != NIL)
+		final_dropped = select_path_by_strategy_dispatch(dropped, &kept,
+														 min_envelope_sample,
+														 path_strategy_funcs[retain_strategy_id],
+														 retain_path_limit,
+														 error_sample_count,
+														 false);
+
+	list_free(pathlist);
+	list_free(dropped);
+	list_free(final_dropped);
+
+	return sort_pathlist_by_total_cost(kept);
+}
+
+/*
+ * Pass-1 round view (RobDP P1, plan items C1 and E4).
+ *
+ * Pass 1 runs the scalar (1p) cost functions, which read the scalar fields
+ * rows, startup_cost and total_cost of their inputs.  The joinrels built in
+ * a round take the round's component of their row vector, but the level-1
+ * rels were built before the join search, with per-sample vectors and the
+ * vectors' means in the scalar fields.  v20 therefore planned every round
+ * on top of the mean base relations (get_path_rows_1p was meant to fix that
+ * but was never called), so C*(U, s) was not PostgreSQL's optimum for the
+ * cardinalities of sample s.
+ *
+ * For round s we overwrite, for every level-1 rel (and its partitions, which
+ * partitionwise joins use directly), rel->rows, ppi_rows of its
+ * ParamPathInfos, and rows / startup_cost / total_cost (and num_batches of a
+ * HashPath) of every path in its pathlist, partial_pathlist and
+ * cheapest_parameterized_paths with their s-th components, and rerun
+ * set_cheapest(), so that the round sees exactly the inputs PostgreSQL would
+ * see if the true cardinalities were those of sample s.  Constant vectors
+ * are left alone (their component is the scalar).  Every overwritten value
+ * is recorded and put back by robust_round_view_end(), including the
+ * cheapest_* fields; cheapest_unique_path is cleared for the round, since
+ * create_unique_path caches a UniquePath costed with the round's inputs on
+ * the rel (v20 reused the one of round 0 in pass 2).
+ *
+ * Paths of a level-1 rel are not recosted in pass 1, so their per-sample
+ * costs come from the 2p functions alone and level 1 satisfies the
+ * correspondence invariant by construction.  Two approximations remain and
+ * are accepted for P1: pass 0 pruned the level-1 pathlists by mean cost, so
+ * a path that would be cheapest at sample s may be gone (P3 replaces that
+ * with vector dominance); and nodes below the top of a level-1 path keep
+ * their scalar fields, which no cost function reads.
+ */
+typedef struct RoundViewRel
+{
+	RelOptInfo *rel;
+	double		rows;
+	struct Path *cheapest_startup_path;
+	struct Path *cheapest_total_path;
+	struct Path *cheapest_unique_path;
+	List	   *cheapest_parameterized_paths;
+} RoundViewRel;
+
+typedef struct RoundViewPath
+{
+	Path	   *path;
+	double		rows;
+	Cost		startup_cost;
+	Cost		total_cost;
+	double		num_batches;	/* HashPath only */
+} RoundViewPath;
+
+typedef struct RoundViewPpi
+{
+	ParamPathInfo *ppi;
+	double		ppi_rows;
+} RoundViewPpi;
+
+typedef struct RoundViewPpilist
+{
+	RelOptInfo *rel;
+	int			length;
+} RoundViewPpilist;
+
+typedef struct RobustRoundView
+{
+	List	   *rels;			/* RoundViewRel */
+	List	   *paths;			/* RoundViewPath */
+	List	   *ppis;			/* RoundViewPpi */
+	List	   *ppilists;		/* RoundViewPpilist */
+} RobustRoundView;
+
+/* Is this vector longer than 1 (and so has a component per sample)? */
+static inline bool
+robust_varies(const Sample *v)
+{
+	return v != NULL && v->sample_count > 1;
+}
+
+/* Project one path onto sample s, once */
+static void
+round_view_path(RobustRoundView *view, Path *path, int s)
+{
+	RoundViewPath *saved;
+	ListCell   *lc;
+
+	foreach(lc, view->paths)
+	{
+		if (((RoundViewPath *) lfirst(lc))->path == path)
+			return;
+	}
+
+	saved = palloc(sizeof(RoundViewPath));
+	saved->path = path;
+	saved->rows = path->rows;
+	saved->startup_cost = path->startup_cost;
+	saved->total_cost = path->total_cost;
+	saved->num_batches = 0;
+	view->paths = lappend(view->paths, saved);
+
+	if (robust_varies(path->rows_sample))
+		path->rows = path->rows_sample->sample[s];
+	if (robust_varies(path->startup_cost_sample))
+		path->startup_cost = path->startup_cost_sample->sample[s];
+	if (robust_varies(path->total_cost_sample))
+		path->total_cost = path->total_cost_sample->sample[s];
+	if (IsA(path, HashPath))
+	{
+		HashPath   *hpath = (HashPath *) path;
+
+		saved->num_batches = hpath->num_batches;
+		if (robust_varies(hpath->num_batches_sample))
+			hpath->num_batches = (int) hpath->num_batches_sample->sample[s];
+	}
+}
+
+/* Project one rel, its paths and its partitions onto sample s */
+static void
+round_view_rel(RobustRoundView *view, RelOptInfo *rel, int s)
+{
+	RoundViewRel *saved = palloc(sizeof(RoundViewRel));
+	ListCell   *lc;
+
+	saved->rel = rel;
+	saved->rows = rel->rows;
+	saved->cheapest_startup_path = rel->cheapest_startup_path;
+	saved->cheapest_total_path = rel->cheapest_total_path;
+	saved->cheapest_unique_path = rel->cheapest_unique_path;
+	saved->cheapest_parameterized_paths = rel->cheapest_parameterized_paths;
+	view->rels = lappend(view->rels, saved);
+
+	if (robust_varies(rel->rows_sample))
+		rel->rows = rel->rows_sample->sample[s];
+
+	foreach(lc, rel->ppilist)
+	{
+		ParamPathInfo *ppi = (ParamPathInfo *) lfirst(lc);
+		RoundViewPpi *savedppi;
+
+		if (!robust_varies(ppi->ppi_rows_sample))
+			continue;
+		savedppi = palloc(sizeof(RoundViewPpi));
+		savedppi->ppi = ppi;
+		savedppi->ppi_rows = ppi->ppi_rows;
+		view->ppis = lappend(view->ppis, savedppi);
+		ppi->ppi_rows = ppi->ppi_rows_sample->sample[s];
+	}
+
+	foreach(lc, rel->pathlist)
+		round_view_path(view, (Path *) lfirst(lc), s);
+	foreach(lc, rel->partial_pathlist)
+		round_view_path(view, (Path *) lfirst(lc), s);
+	foreach(lc, rel->cheapest_parameterized_paths)
+		round_view_path(view, (Path *) lfirst(lc), s);
+
+	if (rel->pathlist != NIL)
+		set_cheapest(rel);		/* also clears cheapest_unique_path */
+
+	if (rel->part_rels != NULL)
+	{
+		for (int i = 0; i < rel->nparts; i++)
+		{
+			if (rel->part_rels[i] != NULL)
+				round_view_rel(view, rel->part_rels[i], s);
+		}
+	}
+}
+
+/* Remember the length of a long-lived rel's ppilist */
+static void
+round_view_ppilist(RobustRoundView *view, RelOptInfo *rel)
+{
+	RoundViewPpilist *saved = palloc(sizeof(RoundViewPpilist));
+
+	saved->rel = rel;
+	saved->length = list_length(rel->ppilist);
+	view->ppilists = lappend(view->ppilists, saved);
+}
+
+/*
+ * robust_round_view_begin
+ *		Project the level-1 rels of the current join search onto sample "s".
+ *
+ * The saved values are allocated in the current memory context, which must
+ * live until robust_round_view_end().
+ *
+ * Besides, the ppilist of every base and other-member rel (and of the
+ * level-1 joinrels) is cut back to its current length at the end of the
+ * round: get_baserel_parampathinfo and friends append a new ParamPathInfo,
+ * allocated in the current memory context, when a round reparameterizes a
+ * path for a new set of outer rels, and the round's context is deleted.
+ * (The round's ParamPathInfo also carries the round's row estimate, which
+ * the next round must not reuse.)
+ */
+static void
+robust_round_view_begin(PlannerInfo *root, List *initial_rels, int s,
+						RobustRoundView *view)
+{
+	ListCell   *lc;
+
+	view->rels = NIL;
+	view->paths = NIL;
+	view->ppis = NIL;
+	view->ppilists = NIL;
+	foreach(lc, initial_rels)
+	{
+		RelOptInfo *rel = (RelOptInfo *) lfirst(lc);
+
+		round_view_rel(view, rel, s);
+		if (IS_JOIN_REL(rel))
+			round_view_ppilist(view, rel);
+	}
+	for (int i = 1; i < root->simple_rel_array_size; i++)
+	{
+		if (root->simple_rel_array[i] != NULL)
+			round_view_ppilist(view, root->simple_rel_array[i]);
+	}
+}
+
+/*
+ * robust_round_view_end
+ *		Put back everything robust_round_view_begin() overwrote.
+ */
+static void
+robust_round_view_end(RobustRoundView *view)
+{
+	ListCell   *lc;
+
+	foreach(lc, view->paths)
+	{
+		RoundViewPath *saved = (RoundViewPath *) lfirst(lc);
+		Path	   *path = saved->path;
+
+		path->rows = saved->rows;
+		path->startup_cost = saved->startup_cost;
+		path->total_cost = saved->total_cost;
+		if (IsA(path, HashPath))
+			((HashPath *) path)->num_batches = (int) saved->num_batches;
+	}
+	foreach(lc, view->ppis)
+	{
+		RoundViewPpi *saved = (RoundViewPpi *) lfirst(lc);
+
+		saved->ppi->ppi_rows = saved->ppi_rows;
+	}
+	foreach(lc, view->rels)
+	{
+		RoundViewRel *saved = (RoundViewRel *) lfirst(lc);
+		RelOptInfo *rel = saved->rel;
+
+		rel->rows = saved->rows;
+		rel->cheapest_startup_path = saved->cheapest_startup_path;
+		rel->cheapest_total_path = saved->cheapest_total_path;
+		rel->cheapest_unique_path = saved->cheapest_unique_path;
+		rel->cheapest_parameterized_paths = saved->cheapest_parameterized_paths;
+	}
+	foreach(lc, view->ppilists)
+	{
+		RoundViewPpilist *saved = (RoundViewPpilist *) lfirst(lc);
+
+		saved->rel->ppilist = list_truncate(saved->rel->ppilist,
+											saved->length);
+	}
+}
+
+/*
+ * Give every path of the level-1 rels (and their partitions) its vectors
+ * now, in the search's memory context.  They have them already (add_path
+ * fills them in pass 0); this only makes sure pass 1 never attaches vectors
+ * allocated in a round's short-lived context to a long-lived path.
+ */
+static void
+robust_fill_initial_rels(PlannerInfo *root, List *rels)
+{
+	ListCell   *lc;
+
+	foreach(lc, rels)
+	{
+		RelOptInfo *rel = (RelOptInfo *) lfirst(lc);
+		ListCell   *lp;
+
+		foreach(lp, rel->pathlist)
+			robust_fill_path_samples(root, (Path *) lfirst(lp));
+		foreach(lp, rel->partial_pathlist)
+			robust_fill_path_samples(root, (Path *) lfirst(lp));
+		if (rel->part_rels != NULL)
+		{
+			for (int i = 0; i < rel->nparts; i++)
+			{
+				if (rel->part_rels[i] != NULL)
+					robust_fill_initial_rels(root,
+											 list_make1(rel->part_rels[i]));
+			}
+		}
+	}
+}
+
+/*
+ * The pass-1 minimum envelope (RobDP P1, plan items E1-E3, E5): for each
+ * joinrel U, C*(U, s) for s = 0 .. error_sample_count - 1, keyed by relids.
+ *
+ * C*(U, s) is the total cost of U's cheapest_total_path at the end of round
+ * s, i.e. after partitionwise joins and Gather paths were added and
+ * set_cheapest() ran: the cheapest complete, unparameterized path, Gather
+ * views of partial paths included (or, for a rel that has only
+ * parameterized paths because of lateral references, the cheapest of the
+ * least parameterized ones).  v20 took the minimum over the raw pathlist and
+ * partial_pathlist before gathering, so parameterized paths (cheaper since
+ * they return fewer rows per call) and partial paths (costed per worker)
+ * pulled the envelope below anything a complete plan can reach (E1, E2), and
+ * it matched rels between passes by list position (E3).
+ */
+typedef struct RobustEnvelopeEntry
+{
+	Relids		relids;			/* hash key --- MUST BE FIRST */
+	double		cost[DIST_MAX_SAMPLE];
+} RobustEnvelopeEntry;
+
+static HTAB *
+robust_envelope_create(void)
+{
+	HASHCTL		hash_ctl;
+
+	hash_ctl.keysize = sizeof(Relids);
+	hash_ctl.entrysize = sizeof(RobustEnvelopeEntry);
+	hash_ctl.hash = bitmap_hash;
+	hash_ctl.match = bitmap_match;
+	hash_ctl.hcxt = CurrentMemoryContext;
+	return hash_create("RobDP minimum envelope", 256, &hash_ctl,
+					   HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
+}
+
+/* Record C*(rel, s); the key is copied into the hash table's context */
+static void
+robust_envelope_record(HTAB *envelope, MemoryContext cxt, RelOptInfo *rel,
+					   int s)
+{
+	RobustEnvelopeEntry *entry;
+	bool		found;
+
+	Assert(rel->cheapest_total_path != NULL);
+	entry = (RobustEnvelopeEntry *) hash_search(envelope, &rel->relids,
+												HASH_ENTER, &found);
+	if (!found)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(cxt);
+
+		/* the joinrel and its relids go away with the round's context */
+		entry->relids = bms_copy(rel->relids);
+		MemoryContextSwitchTo(oldcxt);
+	}
+	entry->cost[s] = rel->cheapest_total_path->total_cost;
+}
+
+/*
+ * robust_join_search
+ *	  Two-pass join search of RobDP (VLDB 2026, Algorithm 1).
+ *
+ * Pass 1 (only if some configured objective needs it): for each error sample
+ * s = 0 .. error_sample_count - 1, run the ordinary DP with the scalar cost
+ * model at sample s (root->round = s): the level-1 rels are projected onto
+ * sample s (robust_round_view_begin) and the joinrels take their s-th row
+ * count.  At the end of every level, C*(U, s) is recorded for each joinrel
+ * U (see RobustEnvelopeEntry).
+ *
+ * Pass 2: run the DP once more with the per-sample (vector) cost model.
+ * add_path() keeps every candidate (see robust_collect_path); once a level is
+ * complete, each joinrel keeps the paths chosen by main_objective_id (and
+ * retain_strategy_id) against its envelope, and its parents are built from
+ * those.  The top-level paths get their final_score_id score stored in
+ * Path.score.
+ *
+ * Each pass-1 round runs in its own memory context, deleted at the end of
+ * the round once the envelope values are copied out, and join_rel_list /
+ * join_rel_hash are saved and restored around it, as geqo_eval() does for
+ * every candidate join order (E5; v20 kept every round's complete DP in
+ * memory until the end of pass 2).  This is safe for the same reasons as in
+ * GEQO: whatever planning caches in long-lived structures (eclass-derived
+ * clauses, merge-scan selectivities, unique paths) is allocated in the
+ * planner's context, and the round view puts back the level-1 rels.
+ *
+ * With join_collapse_limit, make_rel_from_joinlist runs one join search per
+ * subproblem, one after the other, never nested.  Each search starts in pass
+ * 0 (the previous one ended in pass 3), keeps its own envelope, and treats
+ * the result of an earlier subproblem as a level-1 rel, projected like the
+ * base rels (E8).  Subqueries have their own PlannerInfo.
+ *
+ * On return root->pass is 3 (upper planning).
+ */
+static RelOptInfo *
+robust_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
+{
+	bool		need_envelope;
+	HTAB	   *envelope = NULL;
+	MemoryContext search_cxt = CurrentMemoryContext;
+	RelOptInfo *final_rel;
+	int			lev;
+
+	/* See standard_join_search */
+	Assert(root->join_rel_level == NULL);
+	Assert(error_sample_count >= 1 && error_sample_count <= DIST_MAX_SAMPLE);
+
+	/* Back to "outside the join search" if an earlier subproblem ran */
+	root->pass = 0;
+	root->round = -1;
+
+	need_envelope = objective_needs_envelope(main_objective_id) ||
+		(retain_path_limit > 0 && objective_needs_envelope(retain_strategy_id)) ||
+		objective_needs_envelope(final_score_id);
+
+	/*
+	 * Pass 1: per-sample point-estimate DP, to get the minimum envelope.
+	 */
+	if (need_envelope)
+	{
+		int			savelength = list_length(root->join_rel_list);
+		struct HTAB *savehash = root->join_rel_hash;
+		int			round;
+
+		robust_fill_initial_rels(root, initial_rels);
+		envelope = robust_envelope_create();
+
+		root->pass = 1;
+		for (round = 0; round < error_sample_count; round++)
+		{
+			MemoryContext round_cxt;
+			RobustRoundView view;
+
+			round_cxt = AllocSetContextCreate(search_cxt,
+											  "RobDP pass-1 round",
+											  ALLOCSET_DEFAULT_SIZES);
+			MemoryContextSwitchTo(round_cxt);
+
+			root->round = round;
+			robust_round_view_begin(root, initial_rels, round, &view);
+			root->join_rel_level = (List **)
+				palloc0((levels_needed + 1) * sizeof(List *));
+			root->join_rel_level[1] = initial_rels;
+			root->join_rel_hash = NULL;
+
+			for (lev = 2; lev <= levels_needed; lev++)
+			{
+				ListCell   *lc;
+
+				join_search_one_level(root, lev);
+
+				foreach(lc, root->join_rel_level[lev])
+				{
+					RelOptInfo *rel = (RelOptInfo *) lfirst(lc);
+
+					/* As in standard_join_search */
+					generate_partitionwise_join_paths(root, rel);
+					if (!bms_equal(rel->relids, root->all_query_rels))
+						generate_useful_gather_paths(root, rel, false);
+					set_cheapest(rel);
+
+					robust_envelope_record(envelope, search_cxt, rel, round);
+				}
+			}
+
+			/* Forget this round's joinrels, as geqo_eval() does */
+			robust_round_view_end(&view);
+			root->join_rel_level = NULL;
+			root->join_rel_list = list_truncate(root->join_rel_list,
+												savelength);
+			root->join_rel_hash = savehash;
+
+			MemoryContextSwitchTo(search_cxt);
+			MemoryContextDelete(round_cxt);
+		}
+	}
+
+	/*
+	 * Pass 2: vector-cost DP with robust path selection.
+	 */
+	root->pass = 2;
+	root->round = -1;
+	root->join_rel_level = (List **)
+		palloc0((levels_needed + 1) * sizeof(List *));
+	root->join_rel_level[1] = initial_rels;
+
+	for (lev = 2; lev <= levels_needed; lev++)
+	{
+		bool		top_level = (lev == levels_needed);
+		ListCell   *lc;
+
+		join_search_one_level(root, lev);
+
+		foreach(lc, root->join_rel_level[lev])
+		{
+			RelOptInfo *rel = (RelOptInfo *) lfirst(lc);
+			const double *min_envelope_sample = NULL;
+
+			if (envelope != NULL)
+			{
+				RobustEnvelopeEntry *entry;
+
+				entry = (RobustEnvelopeEntry *) hash_search(envelope,
+															&rel->relids,
+															HASH_FIND, NULL);
+				/* pass 1 builds the same joinrels; they do not depend on costs */
+				if (entry == NULL)
+					elog(ERROR, "RobDP: no pass-1 envelope for a join relation");
+				min_envelope_sample = entry->cost;
+			}
+			robust_check_envelope(root, rel, min_envelope_sample);
+
+			rel->pathlist = robust_prune_pathlist(rel->pathlist,
+												  min_envelope_sample,
+												  top_level ? 1 : add_path_limit,
+												  top_level);
+			rel->partial_pathlist = robust_prune_pathlist(rel->partial_pathlist,
+														  min_envelope_sample,
+														  top_level ? 1 : add_path_limit,
+														  top_level);
+			if (top_level)
+			{
+				set_path_score(rel->pathlist, min_envelope_sample,
+							   path_strategy_funcs[final_score_id],
+							   error_sample_count);
+				set_path_score(rel->partial_pathlist, min_envelope_sample,
+							   path_strategy_funcs[final_score_id],
+							   error_sample_count);
+			}
+
+			/* The rest is as in standard_join_search */
+			generate_partitionwise_join_paths(root, rel);
+			if (!bms_equal(rel->relids, root->all_query_rels))
+				generate_useful_gather_paths(root, rel, false);
+			set_cheapest(rel);
+
+#ifdef OPTIMIZER_DEBUG
+			debug_print_rel(root, rel);
+#endif
+		}
+	}
+
+	if (root->join_rel_level[levels_needed] == NIL)
+		elog(ERROR, "failed to build any %d-way joins", levels_needed);
+	Assert(list_length(root->join_rel_level[levels_needed]) == 1);
+
+	final_rel = (RelOptInfo *) linitial(root->join_rel_level[levels_needed]);
+
+	if (envelope != NULL)
+		hash_destroy(envelope);
+	root->pass = 3;
+	root->join_rel_level = NULL;
+
+	return final_rel;
 }
 
 /*****************************************************************************
@@ -4187,8 +4839,8 @@ create_partial_bitmap_paths(PlannerInfo *root, RelOptInfo *rel,
 	if (parallel_workers <= 0)
 		return;
 
-	add_partial_path(rel, (Path *) create_bitmap_heap_path(root, rel,
-														   bitmapqual, rel->lateral_relids, 1.0, parallel_workers));
+	add_partial_path(root, rel, (Path *) create_bitmap_heap_path(root, rel,
+																 bitmapqual, rel->lateral_relids, 1.0, parallel_workers));
 }
 
 /*
