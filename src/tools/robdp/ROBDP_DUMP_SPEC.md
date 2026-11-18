@@ -18,7 +18,7 @@ Formatting rules:
 
 - Every double is printed with `%.17g`, so values round-trip exactly.
 - JSON has no NaN or Infinity. Those values are written as the strings `"nan"`, `"inf"` and `"-inf"`.
-- A relation is named by `"rels"`: a space-separated, sorted list of range-table aliases, for example `"t1 t2"`. Outer-join relids are left out.
+- A relation is named by `"rels"`: a space-separated, sorted list of its base relations' names, for example `"t1 t2"`. Outer-join relids are left out. A base relation's name is its alias, plus `#<rti>` when another range-table entry of the same query level has the same alias (`t1#1`, `t1#3`). An inheritance child is named `<parent>:<relation>` (`p:p1`), because PostgreSQL gives children their parent's alias.
 
 ## Events
 
@@ -27,8 +27,8 @@ Formatting rules:
 | `query` | `standard_planner` starts (S1) | `enabled`, `N`, `seed`, `bins`, `bandwidth`, `profile_path` |
 | `profile` | a profile is loaded or reloaded (S2) | `key`, `path`, `n` (valid points), `skipped` (invalid lines), `bins`: list of `{first, n, lo, hi, mean, sd, h}` |
 | `draw` | a querylet's samples are drawn (S3) | `key` (profile key), `inst` (instance key), `seed` (16 hex digits), `sel_est`, `bin`, `h` (bandwidth used), `x` (list of N) |
-| `rel` | a rel gets its row vector (S4/S5) | `pass`, `rels`, `kind` (`base`/`join`/`append`/`other`), `tuples`, `sel_est` (base only), `querylets` (list of `{key, sel_est, bin}`), `rows_point`, `rows` (list of 1 or N), `pair` (join only: `[outer rels, inner rels]` of the pair that built it) |
-| `ppi` | a ParamPathInfo gets its row vector (S4/S5) | `rels`, `outer` (required_outer as rels), `rows_point`, `rows` |
+| `rel` | a rel gets its row vector (S4/S5) | `pass`, `rels`, `kind` (`base`/`join`/`append`/`other`), `tuples`, `sel_est` (base/other only), `querylets` (list of `{key, inst, sel_est, bin}`, only those with a profile), `children` (append only: the live children's rels, in summation order), `rows_point`, `rows` (list of 1 or N), `pair` (join only: `[outer rels, inner rels]` of the pair that built it) |
+| `ppi` | a ParamPathInfo gets its row vector (S4/S5) | `rels`, `outer` (required_outer as rels), `tuples`, `sel_est` (selectivity of restrictions plus enforced join clauses), `querylets` (the rel's own, then the join querylets), `rows_point`, `rows` |
 | `path` | a path is costed in pass 0/2 (S6) | `pass`, `rels`, `id` (unique within the query), `type` (path type name), `children` (ids), `param` (rels or null), `npathkeys`, `partial`, `rows_point`, `startup_point`, `total_point`, `rows`, `startup`, `total` |
 | `env` | pass 1 records an envelope entry (S7) | `rels`, `s`, `cost` |
 | `keep` | pass 2 finishes pruning a rel (S8) | `rels`, `cands` (ids), `kept` (ids), `obj` (objective value per candidate, same order as `cands`), `group` (feature group of each candidate) |
@@ -48,7 +48,7 @@ Vector conventions:
 | S1 | Exactly one `query` event per planning, matching the GUCs. Every printed number parses back to the exact double, and `nan`/`inf`/`-inf` survive. |
 | S2 | `profile` bins are bit-identical to an independent Python implementation of the rules in `robustprofile.c`, and so is the bin lookup. A cached profile is not re-emitted. |
 | S3 | `seed` and `x` are bit-identical to a Python port of `pg_prng`/`hash_bytes_extended` and the rules in `robustsample.c`. With bandwidth 0, every `draw.x[s]` is one of the bin's log ratios. Draws are reproducible across runs, the draws for N are a prefix of those for a larger N, and the bandwidth does not change the points drawn. The two instances of a self-join have different `inst` and independent `x`. |
-| S4/S5 | Trivial profile: `rows[s] == rows_point` exactly, and `rows_point` equals the stock estimate. Shift / two-point profiles: `rows[s]` equals the closed form computed from `tuples`, `sel_est` and `x`. |
+| S4/S5 | Plans equal stock (nothing reads the vectors yet). Trivial profile: `rows[s] == rows_point` exactly. Any profile: `rows[s]` equals the closed form of `optimizer/robustrows.h` recomputed from the profile files (bins, draws, multipliers `m = clamp01(sel·e^x)/sel`, then `clamp_row_est(tuples · clamp01(sel_est · Π m))`, min with the rel's rows for a ppi, children summed in order for an append rel). |
 | S5 | For inner-join chains, `rows[s]` of a joinrel does not depend on which `pair` built it, up to `clamp_row_est` rounding. |
 | S6 | Trivial profile: `startup[s] == startup_point` and `total[s] == total_point`, and the points equal stock costs. |
 | S7 | Trivial profile: `env.cost` equals the stock cheapest total of `rels` for every `s`. Any profile: `total[s] >= env.cost(rels, s) * (1 - 0.01)` for every pass-2 path (T4). |

@@ -14,6 +14,7 @@
 #include "nodes/bitmapset.h"
 #include "optimizer/robust.h"
 #include "parser/parsetree.h"
+#include "utils/lsyscache.h"
 #include "utils/json.h"
 
 /* GUC parameters, see guc_tables.c */
@@ -146,25 +147,89 @@ cmp_cstring(const void *a, const void *b)
 }
 
 /*
- * robust_dump_relids
- *		A set of relations as the sorted, space-separated list of their
- *		range-table aliases, e.g. "t1 t2".  Outer-join relids (RTE_JOIN
- *		entries) are left out.  NULL relids are written as null.
+ * Is range-table entry rti a child of an inheritance (or partitioned) parent?
+ * Children of UNION ALL subqueries are not: they are relations of their own.
  */
-void
-robust_dump_relids(RobustDump *d, const char *key, PlannerInfo *root,
-				   Relids relids)
+static bool
+is_inheritance_child(PlannerInfo *root, Index rti)
 {
-	const char **names;
+	AppendRelInfo *appinfo;
+
+	if (root->append_rel_array == NULL)
+		return false;
+	appinfo = root->append_rel_array[rti];
+	return appinfo != NULL &&
+		root->simple_rte_array[appinfo->parent_relid]->rtekind == RTE_RELATION;
+}
+
+/*
+ * robust_instance_relid
+ *		The relation whose querylets relid's querylets are: relid itself, or
+ *		for an inheritance child its topmost inheritance parent, since a
+ *		partition applies its parent's restrictions.
+ */
+Index
+robust_instance_relid(PlannerInfo *root, Index relid)
+{
+	while (is_inheritance_child(root, relid))
+		relid = root->append_rel_array[relid]->parent_relid;
+	return relid;
+}
+
+/*
+ * robust_rel_name
+ *		A name for base relation relid that is unique within its query level.
+ *
+ * It is the range-table alias, followed by "#<rti>" if another entry of the
+ * range table has the same alias (a table referenced twice without
+ * aliases, or a pulled-up subquery reusing an alias).  Inheritance children
+ * carry their parent's alias, so they are named "<parent>:<relation>",
+ * e.g. "p:p_1", and do not count as duplicates of their parent.  RTE_JOIN
+ * entries are ignored.
+ */
+char *
+robust_rel_name(PlannerInfo *root, Index relid)
+{
+	RangeTblEntry *rte = root->simple_rte_array[relid];
+	const char *alias = rte->eref->aliasname;
+	bool		dup = false;
+
+	if (is_inheritance_child(root, relid))
+	{
+		char	   *relname = rte->relid != InvalidOid ? get_rel_name(rte->relid) : NULL;
+
+		return psprintf("%s:%s",
+						robust_rel_name(root, root->append_rel_array[relid]->parent_relid),
+						relname ? relname : "?");
+	}
+	for (int i = 1; i < root->simple_rel_array_size && !dup; i++)
+	{
+		RangeTblEntry *other = root->simple_rte_array[i];
+
+		if (i == relid || other == NULL || other->rtekind == RTE_JOIN ||
+			is_inheritance_child(root, i))
+			continue;
+		dup = strcmp(other->eref->aliasname, alias) == 0;
+	}
+	return dup ? psprintf("%s#%u", alias, relid) : pstrdup(alias);
+}
+
+/*
+ * robust_relids_name
+ *		A set of relations as the sorted, space-separated list of their
+ *		robust_rel_name()s, e.g. "t1 t2".  Outer-join relids (RTE_JOIN
+ *		entries) are left out.  NULL for NULL relids.
+ */
+char *
+robust_relids_name(PlannerInfo *root, Relids relids)
+{
+	char	  **names;
 	int			n = 0;
 	int			relid = -1;
 	StringInfoData s;
 
 	if (relids == NULL)
-	{
-		robust_dump_str(d, key, NULL);
-		return;
-	}
+		return NULL;
 	names = palloc(sizeof(char *) * bms_num_members(relids));
 	while ((relid = bms_next_member(relids, relid)) >= 0)
 	{
@@ -175,7 +240,7 @@ robust_dump_relids(RobustDump *d, const char *key, PlannerInfo *root,
 		rte = root->simple_rte_array[relid];
 		if (rte == NULL || rte->rtekind == RTE_JOIN)
 			continue;
-		names[n++] = rte->eref->aliasname;
+		names[n++] = robust_rel_name(root, relid);
 	}
 	qsort(names, n, sizeof(char *), cmp_cstring);
 
@@ -185,10 +250,22 @@ robust_dump_relids(RobustDump *d, const char *key, PlannerInfo *root,
 		if (i > 0)
 			appendStringInfoChar(&s, ' ');
 		appendStringInfoString(&s, names[i]);
+		pfree(names[i]);
 	}
-	robust_dump_str(d, key, s.data);
-	pfree(s.data);
 	pfree(names);
+	return s.data;
+}
+
+/* A set of relations, named by robust_relids_name(); null for NULL relids */
+void
+robust_dump_relids(RobustDump *d, const char *key, PlannerInfo *root,
+				   Relids relids)
+{
+	char	   *name = robust_relids_name(root, relids);
+
+	robust_dump_str(d, key, name);
+	if (name)
+		pfree(name);
 }
 
 void

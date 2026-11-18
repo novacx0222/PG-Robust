@@ -93,6 +93,8 @@
 #include "optimizer/plancat.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/robust.h"
+#include "optimizer/robustrows.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
@@ -5000,22 +5002,27 @@ void
 set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 {
 	double		nrows;
+	Selectivity sel;
 
 	/* Should only be applied to base relations */
 	Assert(rel->relid > 0);
 
-	nrows = rel->tuples *
-		clauselist_selectivity(root,
-							   rel->baserestrictinfo,
-							   0,
-							   JOIN_INNER,
-							   NULL);
+	sel = clauselist_selectivity(root,
+								 rel->baserestrictinfo,
+								 0,
+								 JOIN_INNER,
+								 NULL);
+	nrows = rel->tuples * sel;
 
 	rel->rows = clamp_row_est(nrows);
 
 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
 
 	set_rel_width(root, rel);
+
+	/* RobDP: the row count in each error scenario */
+	if (enable_rows_dist)
+		robust_set_baserel_rows(root, rel, sel);
 }
 
 /*
@@ -5030,6 +5037,20 @@ double
 get_parameterized_baserel_size(PlannerInfo *root, RelOptInfo *rel,
 							   List *param_clauses)
 {
+	Selectivity sel;
+
+	return get_parameterized_baserel_size_sel(root, rel, param_clauses, &sel);
+}
+
+/*
+ * get_parameterized_baserel_size_sel
+ *		get_parameterized_baserel_size(), also returning in *sel the
+ *		selectivity it estimated (for RobDP, see robust_set_baserel_ppi_rows).
+ */
+double
+get_parameterized_baserel_size_sel(PlannerInfo *root, RelOptInfo *rel,
+								   List *param_clauses, Selectivity *sel)
+{
 	List	   *allclauses;
 	double		nrows;
 
@@ -5040,12 +5061,12 @@ get_parameterized_baserel_size(PlannerInfo *root, RelOptInfo *rel,
 	 * non-join clauses during selectivity estimation.
 	 */
 	allclauses = list_concat_copy(param_clauses, rel->baserestrictinfo);
-	nrows = rel->tuples *
-		clauselist_selectivity(root,
-							   allclauses,
-							   rel->relid,	/* do not use 0! */
-							   JOIN_INNER,
-							   NULL);
+	*sel = clauselist_selectivity(root,
+								  allclauses,
+								  rel->relid,	/* do not use 0! */
+								  JOIN_INNER,
+								  NULL);
+	nrows = rel->tuples * *sel;
 	nrows = clamp_row_est(nrows);
 	/* For safety, make sure result is not more than the base estimate */
 	if (nrows > rel->rows)

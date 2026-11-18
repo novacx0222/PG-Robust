@@ -27,6 +27,8 @@
 #include "optimizer/placeholder.h"
 #include "optimizer/plancat.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/robust.h"
+#include "optimizer/robustrows.h"
 #include "optimizer/tlist.h"
 #include "rewrite/rewriteManip.h"
 #include "parser/parse_relation.h"
@@ -1537,6 +1539,7 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 	List	   *pclauses;
 	Bitmapset  *pserials;
 	double		rows;
+	Selectivity sel;
 	ListCell   *lc;
 
 	/* If rel has LATERAL refs, every path for it should account for them */
@@ -1589,7 +1592,7 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 	}
 
 	/* Estimate the number of rows returned by the parameterized scan */
-	rows = get_parameterized_baserel_size(root, baserel, pclauses);
+	rows = get_parameterized_baserel_size_sel(root, baserel, pclauses, &sel);
 
 	/* And now we can build the ParamPathInfo */
 	ppi = makeNode(ParamPathInfo);
@@ -1598,6 +1601,10 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 	ppi->ppi_clauses = pclauses;
 	ppi->ppi_serials = pserials;
 	baserel->ppilist = lappend(baserel->ppilist, ppi);
+
+	/* RobDP: the row count in each error scenario */
+	if (enable_rows_dist)
+		robust_set_baserel_ppi_rows(root, baserel, ppi, sel);
 
 	return ppi;
 }

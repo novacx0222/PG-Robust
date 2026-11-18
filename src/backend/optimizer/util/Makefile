@@ -27,6 +27,7 @@ OBJS = \
 	restrictinfo.o \
 	robust.o \
 	robustprofile.o \
+	robustrows.o \
 	robustsample.o \
 	robustvec.o \
 	tlist.o \
