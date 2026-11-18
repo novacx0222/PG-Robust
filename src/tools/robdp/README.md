@@ -22,7 +22,7 @@ All builds share the bench cluster. They are all 16.2 with the same catalog, so 
 | `check_s2.py` | S2 gate: profile parsing, binning and lookup equal the Python reference; cache reloads; S1 gates. |
 | `check_s3.py` | S3 gate: seeds and draws bit-identical to a Python port of pg_prng and hash_bytes_extended; bootstrap draws are bin points; prefix, reproducibility and common-random-number properties; statistics; S2 gates. |
 | `check_s4.py` | S4 gate: plans unchanged; trivial profiles give rows[s] == rows_point; base, partition, append and ppi row vectors bit-identical to a Python reference from the profile files; instance naming; S3 gates. |
-| `check_s5.py` | S5 gate: join rel and join ppi vectors bit-identical to a Python recomputation; pair independence within the rounding bound; join-type bounds; semi/anti replay equal to stock estimates; S4 gates. |
+| `check_s5.py` | S5 gate: join rel and join ppi vectors bit-identical to a Python recomputation; pair independence within the rounding bound (equivalence-class cliques and stars included); spanning forests of multi-member equivalence classes vs Python; join-type bounds; semi/anti replay equal to stock estimates; S4 gates. |
 | `robdp_dump.py [DUMP.json]` | Parser for the planner's `ROBDP {json}` lines; without arguments it runs its self-test. The format is in `ROBDP_DUMP_SPEC.md`. |
 
 ## Typical gate

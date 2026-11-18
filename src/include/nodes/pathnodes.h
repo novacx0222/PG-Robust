@@ -554,6 +554,13 @@ struct PlannerInfo
 	 */
 	int			robust_pass;
 	int			robust_round;
+
+	/*
+	 * RobDP (optimizer/robustrows.h): the spanning-tree edges and their
+	 * draws of each equivalence class with 3 or more member relations,
+	 * built on first use.
+	 */
+	struct RobustECGraph *robust_ec_graph pg_node_attr(read_write_ignore);
 };
 
 
