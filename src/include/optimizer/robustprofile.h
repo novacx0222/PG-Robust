@@ -23,6 +23,7 @@
 #define ROBUSTPROFILE_H
 
 #include "optimizer/robust.h"
+#include "optimizer/robustvec.h"
 
 /*
  * Selectivities are clamped to at least this before taking the log ratio,
@@ -59,5 +60,12 @@ typedef struct RobustProfile
 
 extern const RobustProfile *robust_get_profile(const char *key);
 extern int	robust_profile_find_bin(const RobustProfile *prof, double sel_est);
+
+/* robustsample.c: drawing errors from a profile */
+extern uint64 robust_draw_seed(const char *key, const char *inst);
+extern double robust_draw_bandwidth(const RobustProfile *prof, int b);
+extern RobustVec *robust_draw_errors(const RobustProfile *prof,
+									 const char *inst, double sel_est,
+									 int *bin);
 
 #endif							/* ROBUSTPROFILE_H */

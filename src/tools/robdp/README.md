@@ -20,6 +20,7 @@ All builds share the bench cluster. They are all 16.2 with the same catalog, so 
 | `compare.py A.json B.json [-v]` | Per-query verdict: SAME, COST-DIFF, ROWS-DIFF, PLAN-DIFF or ERROR. Exit status 0 means all SAME. |
 | `check_s1.py` | S1 gate: plans unchanged with robust off and on, `query` dump events, exact number format. |
 | `check_s2.py` | S2 gate: profile parsing, binning and lookup equal the Python reference; cache reloads; S1 gates. |
+| `check_s3.py` | S3 gate: seeds and draws bit-identical to a Python port of pg_prng and hash_bytes_extended; bootstrap draws are bin points; prefix, reproducibility and common-random-number properties; statistics; S2 gates. |
 | `robdp_dump.py [DUMP.json]` | Parser for the planner's `ROBDP {json}` lines; without arguments it runs its self-test. The format is in `ROBDP_DUMP_SPEC.md`. |
 
 ## Typical gate

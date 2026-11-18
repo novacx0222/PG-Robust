@@ -16,3 +16,9 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_robust_profile(key text, sel_est float8[])
 RETURNS int[]
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Draw error_sample_count errors for querylet instance "inst" from the
+-- profile "key"; NULL if there is no such profile
+CREATE FUNCTION test_robust_draw(key text, inst text, sel_est float8)
+RETURNS float8[]
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
