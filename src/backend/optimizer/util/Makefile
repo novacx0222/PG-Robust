@@ -25,6 +25,8 @@ OBJS = \
 	predtest.o \
 	relnode.o \
 	restrictinfo.o \
+	robust.o \
+	robustvec.o \
 	tlist.o \
 	var.o
 

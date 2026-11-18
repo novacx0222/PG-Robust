@@ -54,6 +54,7 @@
 #include "optimizer/planmain.h"
 #include "optimizer/planner.h"
 #include "optimizer/prep.h"
+#include "optimizer/robust.h"
 #include "optimizer/subselect.h"
 #include "optimizer/tlist.h"
 #include "parser/analyze.h"
@@ -303,6 +304,10 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	 * PlannerInfo.
 	 */
 	glob = makeNode(PlannerGlobal);
+
+	/* RobDP: record the robust planning settings for the test harness */
+	if (robust_debug_dump)
+		robust_dump_query();
 
 	glob->boundParams = boundParams;
 	glob->subplans = NIL;

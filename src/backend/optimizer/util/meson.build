@@ -13,6 +13,8 @@ backend_sources += files(
   'predtest.c',
   'relnode.c',
   'restrictinfo.c',
+  'robust.c',
+  'robustvec.c',
   'tlist.c',
   'var.c',
 )

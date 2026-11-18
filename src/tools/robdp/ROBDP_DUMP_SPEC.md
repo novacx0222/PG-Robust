@@ -24,6 +24,7 @@ Formatting rules:
 
 | `ev` | Emitted when | Fields |
 |---|---|---|
+| `query` | `standard_planner` starts (S1) | `enabled`, `N`, `seed`, `bins`, `bandwidth`, `profile_path` |
 | `profile` | a profile is loaded and binned (S2) | `key`, `n` (points), `bins`: list of `{lo, hi, n, mean, sd, h}` |
 | `draw` | a querylet's samples are drawn (S3) | `key` (profile key), `inst` (instance key), `sel_est`, `bin`, `x` (list of N) |
 | `rel` | a rel gets its row vector (S4/S5) | `pass`, `rels`, `kind` (`base`/`join`/`append`/`other`), `tuples`, `sel_est` (base only), `querylets` (list of `{key, sel_est, bin}`), `rows_point`, `rows` (list of 1 or N), `pair` (join only: `[outer rels, inner rels]` of the pair that built it) |
@@ -32,6 +33,8 @@ Formatting rules:
 | `env` | pass 1 records an envelope entry (S7) | `rels`, `s`, `cost` |
 | `keep` | pass 2 finishes pruning a rel (S8) | `rels`, `cands` (ids), `kept` (ids), `obj` (objective value per candidate, same order as `cands`), `group` (feature group of each candidate) |
 | `final` | the final plan is chosen (S9) | `id`, `obj` |
+
+The `pass` field is the phase name: `base`, `envelope`, `main` or `upper` (`RobustPass` in `optimizer/robust.h`).
 
 Vector conventions:
 
@@ -42,6 +45,7 @@ Vector conventions:
 
 | Step | Invariant |
 |---|---|
+| S1 | Exactly one `query` event per planning, matching the GUCs. Every printed number parses back to the exact double, and `nan`/`inf`/`-inf` survive. |
 | S3 | With bandwidth 0, every `draw.x[s]` is one of the bin's log ratios. Draws are reproducible across runs. The two instances of a self-join have different `inst` and independent `x`. |
 | S4/S5 | Trivial profile: `rows[s] == rows_point` exactly, and `rows_point` equals the stock estimate. Shift / two-point profiles: `rows[s]` equals the closed form computed from `tuples`, `sel_est` and `x`. |
 | S5 | For inner-join chains, `rows[s]` of a joinrel does not depend on which `pair` built it, up to `clamp_row_est` rounding. |

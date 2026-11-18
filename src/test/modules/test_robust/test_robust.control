@@ -1,0 +1,4 @@
+comment = 'Unit tests for RobDP robust planning'
+default_version = '1.0'
+module_pathname = '$libdir/test_robust'
+relocatable = true
