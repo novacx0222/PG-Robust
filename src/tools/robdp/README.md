@@ -19,6 +19,7 @@ All builds share the bench cluster. They are all 16.2 with the same catalog, so 
 | `explain_dump.py OUT.json --install X --set g=v ...` | Plan every query in `queries/`. Records the JSON plan, the median planning time and the server messages. |
 | `compare.py A.json B.json [-v]` | Per-query verdict: SAME, COST-DIFF, ROWS-DIFF, PLAN-DIFF or ERROR. Exit status 0 means all SAME. |
 | `check_s1.py` | S1 gate: plans unchanged with robust off and on, `query` dump events, exact number format. |
+| `check_s2.py` | S2 gate: profile parsing, binning and lookup equal the Python reference; cache reloads; S1 gates. |
 | `robdp_dump.py [DUMP.json]` | Parser for the planner's `ROBDP {json}` lines; without arguments it runs its self-test. The format is in `ROBDP_DUMP_SPEC.md`. |
 
 ## Typical gate

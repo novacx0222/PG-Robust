@@ -10,3 +10,9 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_robust_dump()
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Load (or reuse) the error profile of a querylet and return the bin of
+-- each estimate; NULL if the querylet has no profile
+CREATE FUNCTION test_robust_profile(key text, sel_est float8[])
+RETURNS int[]
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

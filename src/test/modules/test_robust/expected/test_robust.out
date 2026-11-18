@@ -75,3 +75,113 @@ LOG:  ROBDP {"ev":"query","enabled":false,"N":7,"seed":42,"bins":1,"bandwidth":0
 
 RESET client_min_messages;
 RESET ALL;
+-- Error profiles (S2).  Files are written to the data directory, and
+-- error_profile_path = '.' (the server's working directory is the data
+-- directory), so that messages show stable paths.
+CREATE TEMP TABLE prof (line text);
+INSERT INTO prof VALUES
+  ('# comment and blank lines are ignored'), (''),
+  ('0.5 0.1'), ('0.01 0.1'), ('0.2 0.2'), ('0 0.3'), ('1 0.9'), ('0.9 0.9'),
+  ('not a number'), ('0.5'), ('0.5 0.5 0.5'), ('1.5 0.5'), ('0.5 -0.1'), ('nan 0.5');
+DO $$ BEGIN
+  EXECUTE format('COPY prof TO %L', current_setting('data_directory') || '/rt_a.txt');
+  EXECUTE format('COPY (SELECT ''x y'') TO %L', current_setting('data_directory') || '/rt_empty.txt');
+END $$;
+SET error_profile_path = '.';
+SET error_bin_count = 2;
+SET robust_debug_dump = on;
+SET client_min_messages = log;
+-- 6 valid points, 6 invalid lines (5 reported one by one, then a total);
+-- bins: sel_est {0.1, 0.1, 0.2} and {0.3, 0.9, 0.9}
+SELECT test_robust_profile('rt_a', '{0, 0.1, 0.15, 0.2, 0.25, 0.9, 1}');
+LOG:  ROBDP {"ev":"query","enabled":false,"N":20,"seed":42,"bins":2,"bandwidth":0,"profile_path":"."}
+WARNING:  RobDP: skipping invalid line 9 of error profile "./rt_a.txt"
+DETAIL:  Each line must be "sel_true sel_est", two numbers in [0, 1].
+WARNING:  RobDP: skipping invalid line 10 of error profile "./rt_a.txt"
+DETAIL:  Each line must be "sel_true sel_est", two numbers in [0, 1].
+WARNING:  RobDP: skipping invalid line 11 of error profile "./rt_a.txt"
+DETAIL:  Each line must be "sel_true sel_est", two numbers in [0, 1].
+WARNING:  RobDP: skipping invalid line 12 of error profile "./rt_a.txt"
+DETAIL:  Each line must be "sel_true sel_est", two numbers in [0, 1].
+WARNING:  RobDP: skipping invalid line 13 of error profile "./rt_a.txt"
+DETAIL:  Each line must be "sel_true sel_est", two numbers in [0, 1].
+WARNING:  RobDP: skipped 6 invalid lines of error profile "./rt_a.txt" in all
+LOG:  ROBDP {"ev":"profile","key":"rt_a","path":"./rt_a.txt","n":6,"skipped":6,"bins":[{"first":0,"n":3,"lo":"-inf","hi":0.20000000000000001,"mean":-0.23104906018664853,"sd":1.966219405333397,"h":1.2414497599046863},{"first":3,"n":3,"lo":0.20000000000000001,"hi":0.90000000000000002,"mean":-8.7738959319815955,"sd":15.28816918120526,"h":11.045203924477804}]}
+ test_robust_profile 
+---------------------
+ {0,0,0,0,1,1,1}
+(1 row)
+
+-- cached: no second load, no warnings
+SELECT test_robust_profile('rt_a', '{0.2}');
+LOG:  ROBDP {"ev":"query","enabled":false,"N":20,"seed":42,"bins":2,"bandwidth":0,"profile_path":"."}
+ test_robust_profile 
+---------------------
+ {0}
+(1 row)
+
+-- a new bin count rebuilds the bins; the two points with sel_est 0.9 are
+-- not split across bins, so the bin sizes are 2, 1, 3, 0
+SET error_bin_count = 4;
+SELECT test_robust_profile('rt_a', '{0.1, 0.2, 0.3, 0.9}');
+LOG:  ROBDP {"ev":"query","enabled":false,"N":20,"seed":42,"bins":4,"bandwidth":0,"profile_path":"."}
+WARNING:  RobDP: skipping invalid line 9 of error profile "./rt_a.txt"
+DETAIL:  Each line must be "sel_true sel_est", two numbers in [0, 1].
+WARNING:  RobDP: skipping invalid line 10 of error profile "./rt_a.txt"
+DETAIL:  Each line must be "sel_true sel_est", two numbers in [0, 1].
+WARNING:  RobDP: skipping invalid line 11 of error profile "./rt_a.txt"
+DETAIL:  Each line must be "sel_true sel_est", two numbers in [0, 1].
+WARNING:  RobDP: skipping invalid line 12 of error profile "./rt_a.txt"
+DETAIL:  Each line must be "sel_true sel_est", two numbers in [0, 1].
+WARNING:  RobDP: skipping invalid line 13 of error profile "./rt_a.txt"
+DETAIL:  Each line must be "sel_true sel_est", two numbers in [0, 1].
+WARNING:  RobDP: skipped 6 invalid lines of error profile "./rt_a.txt" in all
+LOG:  ROBDP {"ev":"profile","key":"rt_a","path":"./rt_a.txt","n":6,"skipped":6,"bins":[{"first":0,"n":2,"lo":"-inf","hi":0.10000000000000001,"mean":-0.34657359027997281,"sd":2.7662179952960204,"h":2.1673193706043432},{"first":2,"n":1,"lo":0.10000000000000001,"hi":0.20000000000000001,"mean":0,"sd":0,"h":0},{"first":3,"n":3,"lo":0.20000000000000001,"hi":0.90000000000000002,"mean":-8.7738959319815955,"sd":15.28816918120526,"h":11.045203924477804},{"first":6,"n":0,"lo":0.90000000000000002,"hi":0.90000000000000002,"mean":0,"sd":0,"h":0}]}
+ test_robust_profile 
+---------------------
+ {0,1,2,2}
+(1 row)
+
+RESET client_min_messages;
+RESET robust_debug_dump;
+-- no profile, no valid point, unsafe keys
+SELECT test_robust_profile('rt_missing', '{0.5}');
+ test_robust_profile 
+---------------------
+ 
+(1 row)
+
+SELECT test_robust_profile('rt_empty', '{0.5}');
+WARNING:  RobDP: skipping invalid line 1 of error profile "./rt_empty.txt"
+DETAIL:  Each line must be "sel_true sel_est", two numbers in [0, 1].
+WARNING:  RobDP: error profile "./rt_empty.txt" has no valid point and is ignored
+ test_robust_profile 
+---------------------
+ 
+(1 row)
+
+SELECT test_robust_profile('../rt_a', '{0.5}');
+WARNING:  RobDP: not looking up an error profile for "../rt_a"
+DETAIL:  A profile key must not be empty, start with "." or contain "/" or "\".
+ test_robust_profile 
+---------------------
+ 
+(1 row)
+
+SELECT test_robust_profile('.rt_a', '{0.5}');
+WARNING:  RobDP: not looking up an error profile for ".rt_a"
+DETAIL:  A profile key must not be empty, start with "." or contain "/" or "\".
+ test_robust_profile 
+---------------------
+ 
+(1 row)
+
+-- no directory configured
+RESET error_profile_path;
+SELECT test_robust_profile('rt_a', '{0.5}');
+ test_robust_profile 
+---------------------
+ 
+(1 row)
+
+RESET ALL;

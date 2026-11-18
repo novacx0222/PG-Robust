@@ -16,15 +16,19 @@
 
 #include <math.h>
 
+#include "catalog/pg_type_d.h"
 #include "fmgr.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/robust.h"
+#include "optimizer/robustprofile.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(test_robustvec);
 PG_FUNCTION_INFO_V1(test_robust_dump);
+PG_FUNCTION_INFO_V1(test_robust_profile);
 
 #define CHECK(cond) \
 	do { \
@@ -185,4 +189,30 @@ test_robust_dump(PG_FUNCTION_ARGS)
 	robust_dump_end(&d);
 
 	PG_RETURN_VOID();
+}
+
+Datum
+test_robust_profile(PG_FUNCTION_ARGS)
+{
+	char	   *key = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(1);
+	const RobustProfile *prof;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			n;
+	Datum	   *bins;
+
+	prof = robust_get_profile(key);
+	if (prof == NULL)
+		PG_RETURN_NULL();
+
+	deconstruct_array_builtin(arr, FLOAT8OID, &elems, &nulls, &n);
+	bins = palloc(sizeof(Datum) * (n > 0 ? n : 1));
+	for (int i = 0; i < n; i++)
+	{
+		if (nulls[i])
+			elog(ERROR, "test_robust_profile: null estimate");
+		bins[i] = Int32GetDatum(robust_profile_find_bin(prof, DatumGetFloat8(elems[i])));
+	}
+	PG_RETURN_ARRAYTYPE_P(construct_array_builtin(bins, n, INT4OID));
 }
