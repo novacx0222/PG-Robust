@@ -6,7 +6,8 @@
  * test_robustvec() exercises the RobustVec API and returns "ok" or raises
  * an error naming the first failed check.  test_robust_dump() emits one
  * debug line with awkward values, so that the expected output pins down
- * the exact dump format.
+ * the exact dump format.  test_robust_profile() and test_robust_draw()
+ * expose profile lookup and error drawing to SQL.
  *
  * src/test/modules/test_robust/test_robust.c
  *
@@ -29,6 +30,7 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(test_robustvec);
 PG_FUNCTION_INFO_V1(test_robust_dump);
 PG_FUNCTION_INFO_V1(test_robust_profile);
+PG_FUNCTION_INFO_V1(test_robust_draw);
 
 #define CHECK(cond) \
 	do { \
@@ -215,4 +217,28 @@ test_robust_profile(PG_FUNCTION_ARGS)
 		bins[i] = Int32GetDatum(robust_profile_find_bin(prof, DatumGetFloat8(elems[i])));
 	}
 	PG_RETURN_ARRAYTYPE_P(construct_array_builtin(bins, n, INT4OID));
+}
+
+Datum
+test_robust_draw(PG_FUNCTION_ARGS)
+{
+	char	   *key = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *inst = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	double		sel_est = PG_GETARG_FLOAT8(2);
+	const RobustProfile *prof;
+	RobustVec  *x;
+	Datum	   *vals;
+
+	prof = robust_get_profile(key);
+	if (prof == NULL)
+		PG_RETURN_NULL();
+	x = robust_draw_errors(prof, inst, sel_est, NULL);
+	if (x == NULL)
+		PG_RETURN_NULL();
+
+	vals = palloc(sizeof(Datum) * x->n);
+	for (int s = 0; s < x->n; s++)
+		vals[s] = Float8GetDatum(x->v[s]);
+	PG_RETURN_ARRAYTYPE_P(construct_array(vals, x->n, FLOAT8OID, sizeof(float8),
+										  FLOAT8PASSBYVAL, TYPALIGN_DOUBLE));
 }

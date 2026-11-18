@@ -84,3 +84,45 @@ SELECT test_robust_profile('.rt_a', '{0.5}');
 RESET error_profile_path;
 SELECT test_robust_profile('rt_a', '{0.5}');
 RESET ALL;
+
+-- Drawing errors (S3).  rt_a with 2 bins: bin 0 has the log ratios
+-- log(5), log(0.1), 0 (estimates 0.1, 0.1, 0.2); bin 1 has log(1e-12/0.3),
+-- log(1/0.9), 0.
+SET error_profile_path = '.';
+SET error_bin_count = 2;
+SET error_sample_count = 10;
+-- the points drawn (rounded, so that the output does not depend on the
+-- last bit of log()); pins the seeding and the random stream
+SELECT round(v::numeric, 6) AS x FROM unnest(test_robust_draw('rt_a', 'rt_a', 0.1)) v;
+-- an estimate in bin 1
+SELECT round(v::numeric, 6) AS x FROM unnest(test_robust_draw('rt_a', 'rt_a', 0.5)) v;
+-- reproducible; the draws for N are a prefix of those for a larger N
+SELECT test_robust_draw('rt_a', 'x', 0.1) = test_robust_draw('rt_a', 'x', 0.1) AS same;
+SET error_sample_count = 1000;
+CREATE TEMP TABLE d AS
+  SELECT test_robust_draw('rt_a', 'x', 0.1) AS x,
+         test_robust_draw('rt_a', 'y', 0.1) AS y,
+         test_robust_draw('rt_a', 'x', 0.15) AS x2;
+SET error_sample_count = 10;
+SELECT x[1:10] = test_robust_draw('rt_a', 'x', 0.1) AS prefix FROM d;
+SET error_sample_count = 1000;
+-- bandwidth 0: every draw is a point of the bin, each point is drawn
+SELECT array(SELECT DISTINCT round(v::numeric, 6) FROM unnest(x) v ORDER BY 1) AS points FROM d;
+-- another instance of the same profile gets other draws; another estimate
+-- in the same bin gets the same draws
+SELECT x <> y AS independent, x = x2 AS same_bin FROM d;
+-- a new seed gives other draws
+SET error_sample_seed = 7;
+SELECT test_robust_draw('rt_a', 'x', 0.1) <> x AS reseeded FROM d;
+RESET error_sample_seed;
+-- a fixed bandwidth adds noise: no draw is a point of the bin, and the
+-- draws use the same points as without noise when the noise is removed
+SET error_sample_kde_bandwidth = 1e-9;
+SELECT bool_and(abs(v - p) < 1e-7 AND v <> p) AS jittered
+FROM d, unnest(test_robust_draw('rt_a', 'x', 0.1), x) AS u(v, p);
+-- Silverman (bandwidth < 0): bin 0's h is positive
+SET error_sample_kde_bandwidth = -1;
+SELECT count(DISTINCT v) > 3 AS smoothed FROM unnest(test_robust_draw('rt_a', 'x', 0.1)) v;
+-- no profile
+SELECT test_robust_draw('rt_missing', 'x', 0.1);
+RESET ALL;
