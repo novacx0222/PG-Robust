@@ -45,6 +45,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/robust.h"
+#include "optimizer/robustcost.h"
 #include "optimizer/robustprofile.h"
 #include "optimizer/robustrows.h"
 #include "utils/json.h"
@@ -59,6 +60,27 @@ robust_rel_rows(const RelOptInfo *rel)
 	if (rel->robust_rows != NULL)
 		return rel->robust_rows;
 	return robust_vec_const(rel->rows);
+}
+
+/*
+ * A row vector was set: tell robustcost.c if it differs from the point
+ * estimate, and in the envelope pass return its value in the round's
+ * scenario (the point estimate otherwise).
+ */
+static double
+rows_set(PlannerInfo *root, const RobustVec *rows, double point)
+{
+	if (rows == NULL)
+		return point;
+	for (int s = 0; s < rows->n; s++)
+		if (rows->v[s] != point)
+		{
+			robust_cost_note_varies();
+			break;
+		}
+	if (root->robust_pass == ROBUST_PASS_ENVELOPE)
+		return robust_vec_at(rows, root->robust_round);
+	return point;
 }
 
 /*
@@ -1126,9 +1148,10 @@ robust_set_baserel_rows(PlannerInfo *root, RelOptInfo *rel, Selectivity sel)
 		}
 		rel->robust_rows = rows;
 		rel->robust_querylets = list_make1(q);
+		(void) rows_set(root, rows, rel->rows);
 	}
 
-	if (robust_debug_dump)
+	if (robust_dumping(root))
 		dump_rel(root, rel,
 				 rel->reloptkind == RELOPT_BASEREL ? "base" : "other",
 				 sel, NIL);
@@ -1176,9 +1199,10 @@ robust_set_appendrel_rows(PlannerInfo *root, RelOptInfo *rel)
 				rows->v[s] += robust_vec_at(c, s);
 		}
 		rel->robust_rows = rows;
+		(void) rows_set(root, rows, rel->rows);
 	}
 
-	if (robust_debug_dump)
+	if (robust_dumping(root))
 		dump_rel(root, rel, "append", NAN, children);
 	list_free(children);
 }
@@ -1237,8 +1261,9 @@ robust_set_baserel_ppi_rows(PlannerInfo *root, RelOptInfo *rel,
 		}
 		ppi->ppi_robust_rows = rows;
 	}
+	ppi->ppi_rows = rows_set(root, ppi->ppi_robust_rows, ppi->ppi_rows);
 
-	if (robust_debug_dump)
+	if (robust_dumping(root))
 	{
 		RobustDump	d;
 
@@ -1656,9 +1681,10 @@ robust_set_joinrel_rows(PlannerInfo *root, RelOptInfo *joinrel,
 	{
 		joinrel->robust_rows = rows;
 		joinrel->robust_querylets = querylets;
+		joinrel->rows = rows_set(root, rows, joinrel->rows);
 	}
 
-	if (robust_debug_dump)
+	if (robust_dumping(root))
 	{
 		RobustDump	d;
 
@@ -1729,8 +1755,9 @@ robust_set_joinrel_ppi_rows(PlannerInfo *root, RelOptInfo *joinrel,
 					 &sels);
 	ppi->ppi_robust_rows = rows;
 	ppi->ppi_robust_querylets = querylets;
+	ppi->ppi_rows = rows_set(root, rows, ppi->ppi_rows);
 
-	if (robust_debug_dump)
+	if (robust_dumping(root))
 	{
 		RobustDump	d;
 		StringInfoData buf;

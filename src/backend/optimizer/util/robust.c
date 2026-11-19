@@ -25,6 +25,8 @@ int			error_bin_count = 1;
 double		error_sample_kde_bandwidth = 0.0;
 char	   *error_profile_path = NULL;
 bool		robust_debug_dump = false;
+bool		robust_search = true;
+bool		robust_envelope = true;
 
 const char *
 robust_pass_name(RobustPass pass)

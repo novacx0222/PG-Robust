@@ -680,7 +680,7 @@ build_join_rel(PlannerInfo *root,
 		 * RobDP: with the debug dump on, report the row vector this pair
 		 * would give, to check that it does not depend on the pair much.
 		 */
-		if (enable_rows_dist && robust_debug_dump && restrictlist_ptr)
+		if (enable_rows_dist && robust_dumping(root) && restrictlist_ptr)
 			robust_set_joinrel_rows(root, joinrel, outer_rel, inner_rel,
 									sjinfo, *restrictlist_ptr, NULL, false);
 		return joinrel;

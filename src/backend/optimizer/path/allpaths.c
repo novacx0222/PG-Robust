@@ -44,6 +44,7 @@
 #include "optimizer/restrictinfo.h"
 #include "optimizer/robust.h"
 #include "optimizer/robustcost.h"
+#include "optimizer/robustsearch.h"
 #include "optimizer/robustrows.h"
 #include "optimizer/tlist.h"
 #include "parser/parse_clause.h"
@@ -53,6 +54,7 @@
 #include "port/pg_bitutils.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 
 
 /* Bitmask flags for pushdown_safety_info.unsafeFlags */
@@ -95,6 +97,8 @@ join_search_hook_type join_search_hook = NULL;
 
 
 static void set_base_rel_consider_startup(PlannerInfo *root);
+static RelOptInfo *robust_join_search(PlannerInfo *root, int levels_needed,
+									  List *initial_rels);
 static void set_base_rel_sizes(PlannerInfo *root);
 static void set_base_rel_pathlists(PlannerInfo *root);
 static void set_rel_size(PlannerInfo *root, RelOptInfo *rel,
@@ -183,6 +187,10 @@ make_one_rel(PlannerInfo *root, List *joinlist)
 	/* Mark base rels as to whether we care about fast-start plans */
 	set_base_rel_consider_startup(root);
 
+	/* RobDP: the base pass (see optimizer/robust.h) */
+	if (enable_rows_dist && robust_search)
+		root->robust_pass = ROBUST_PASS_BASE;
+
 	/*
 	 * Compute size estimates and consider_parallel flags for each base rel.
 	 */
@@ -230,6 +238,10 @@ make_one_rel(PlannerInfo *root, List *joinlist)
 	 * Generate access paths for the entire join tree.
 	 */
 	rel = make_rel_from_joinlist(root, joinlist);
+
+	/* RobDP: planning above the join tree */
+	if (root->robust_pass != ROBUST_PASS_NONE)
+		root->robust_pass = ROBUST_PASS_UPPER;
 
 	/*
 	 * The result should join all and only the query's base + outer-join rels.
@@ -3437,6 +3449,10 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 	 */
 	Assert(root->join_rel_level == NULL);
 
+	/* RobDP: the envelope and main passes */
+	if (root->robust_pass == ROBUST_PASS_BASE)
+		return robust_join_search(root, levels_needed, initial_rels);
+
 	/*
 	 * We employ a simple "dynamic programming" algorithm: we first find all
 	 * ways to build joins of two jointree items, then all ways to build joins
@@ -3507,6 +3523,122 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 	rel = (RelOptInfo *) linitial(root->join_rel_level[levels_needed]);
 
 	root->join_rel_level = NULL;
+
+	return rel;
+}
+
+/*
+ * robust_join_search
+ *	  The join search of RobDP (optimizer/robustsearch.h), called by
+ *	  standard_join_search in the base pass.
+ *
+ * Envelope pass (robust_envelope): one round of the search per scenario,
+ * in its own memory context, freed at the end of the round with the
+ * round's join relations, which are removed from join_rel_list and
+ * join_rel_hash as geqo_eval() does.  Main pass: the search of
+ * standard_join_search, add_path() comparing paths per scenario.
+ *
+ * With join_collapse_limit, make_rel_from_joinlist runs one search per
+ * subproblem; each starts and ends in the base pass and takes the results
+ * of earlier ones as level-1 relations.
+ */
+static RelOptInfo *
+robust_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
+{
+	RobustSearch *rs = robust_search_begin(root, initial_rels);
+	MemoryContext search_cxt = CurrentMemoryContext;
+	RelOptInfo *rel;
+	int			lev;
+
+	if (robust_envelope)
+	{
+		int			savelength = list_length(root->join_rel_list);
+		struct HTAB *savehash = root->join_rel_hash;
+
+		root->robust_pass = ROBUST_PASS_ENVELOPE;
+		for (int s = 0; s < error_sample_count; s++)
+		{
+			MemoryContext round_cxt;
+
+			round_cxt = AllocSetContextCreate(search_cxt,
+											  "RobDP envelope round",
+											  ALLOCSET_DEFAULT_SIZES);
+			MemoryContextSwitchTo(round_cxt);
+			root->robust_round = s;
+			robust_round_begin(rs, s);
+
+			root->join_rel_level = (List **)
+				palloc0((levels_needed + 1) * sizeof(List *));
+			root->join_rel_level[1] = initial_rels;
+			root->join_rel_hash = NULL;
+
+			for (lev = 2; lev <= levels_needed; lev++)
+			{
+				ListCell   *lc;
+
+				join_search_one_level(root, lev);
+
+				foreach(lc, root->join_rel_level[lev])
+				{
+					rel = (RelOptInfo *) lfirst(lc);
+
+					/* As in standard_join_search */
+					generate_partitionwise_join_paths(root, rel);
+					if (!bms_equal(rel->relids, root->all_query_rels))
+						generate_useful_gather_paths(root, rel, false);
+					set_cheapest(rel);
+
+					robust_round_record(rs, rel);
+				}
+			}
+
+			robust_round_end(rs);
+			root->join_rel_level = NULL;
+			root->join_rel_list = list_truncate(root->join_rel_list,
+												savelength);
+			root->join_rel_hash = savehash;
+
+			MemoryContextSwitchTo(search_cxt);
+			MemoryContextDelete(round_cxt);
+		}
+		root->robust_round = -1;
+	}
+
+	root->robust_pass = ROBUST_PASS_MAIN;
+	robust_main_begin(rs);
+
+	root->join_rel_level = (List **) palloc0((levels_needed + 1) * sizeof(List *));
+	root->join_rel_level[1] = initial_rels;
+
+	for (lev = 2; lev <= levels_needed; lev++)
+	{
+		ListCell   *lc;
+
+		join_search_one_level(root, lev);
+
+		foreach(lc, root->join_rel_level[lev])
+		{
+			rel = (RelOptInfo *) lfirst(lc);
+
+			generate_partitionwise_join_paths(root, rel);
+			if (!bms_equal(rel->relids, root->all_query_rels))
+				generate_useful_gather_paths(root, rel, false);
+			set_cheapest(rel);
+
+			if (robust_debug_dump)
+				robust_dump_pathlist(root, rel);
+		}
+	}
+
+	if (root->join_rel_level[levels_needed] == NIL)
+		elog(ERROR, "failed to build any %d-way joins", levels_needed);
+	Assert(list_length(root->join_rel_level[levels_needed]) == 1);
+
+	rel = (RelOptInfo *) linitial(root->join_rel_level[levels_needed]);
+
+	root->join_rel_level = NULL;
+	root->robust_pass = ROBUST_PASS_BASE;
+	robust_search_end(rs);
 
 	return rel;
 }

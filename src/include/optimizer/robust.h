@@ -26,6 +26,8 @@ extern PGDLLIMPORT int error_bin_count;
 extern PGDLLIMPORT double error_sample_kde_bandwidth;
 extern PGDLLIMPORT char *error_profile_path;
 extern PGDLLIMPORT bool robust_debug_dump;
+extern PGDLLIMPORT bool robust_search;
+extern PGDLLIMPORT bool robust_envelope;
 
 /* Upper limit of error_bin_count */
 #define ROBUST_MAX_BINS		8
@@ -54,6 +56,10 @@ typedef enum RobustPass
 } RobustPass;
 
 extern const char *robust_pass_name(RobustPass pass);
+
+/* Is the debug dump on for this query level?  Not in the envelope pass. */
+#define robust_dumping(root) \
+	(robust_debug_dump && (root)->robust_pass != ROBUST_PASS_ENVELOPE)
 
 /*
  * Debug output (robust_debug_dump): one LOG line "ROBDP {json}" per event,

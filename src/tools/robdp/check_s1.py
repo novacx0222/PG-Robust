@@ -74,7 +74,7 @@ def main():
         subprocess.run([sys.executable, os.path.join(common.TOOLS, 'profiles.py'),
                         'lognormal:0.5,1.5', prof], check=True, capture_output=True)
     on_sets = ['enable_rows_dist=on', 'error_sample_count=20', 'error_bin_count=2',
-               'error_profile_path=' + prof]
+               'error_profile_path=' + prof, 'robust_search=off']
     on = dump(os.path.join(RESULTS, 's1_on.json'), a.install, on_sets)
     bad = same_as_stock(stock, on)
     allok &= report('G2', not bad, '%d/%d SAME as stock %s' % (n - len(bad), n, bad or ''))

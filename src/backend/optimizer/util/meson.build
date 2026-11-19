@@ -18,6 +18,7 @@ backend_sources += files(
   'robustprofile.c',
   'robustrows.c',
   'robustsample.c',
+  'robustsearch.c',
   'robustvec.c',
   'tlist.c',
   'var.c',

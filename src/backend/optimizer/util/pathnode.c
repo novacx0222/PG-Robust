@@ -368,6 +368,130 @@ set_cheapest(RelOptInfo *parent_rel)
 }
 
 /*
+ * RobDP: dominance over the error scenarios.
+ *
+ * With robust planning on, add_path() and add_partial_path() compare two
+ * paths of which one at least has per-scenario vectors (Path.robust, see
+ * optimizer/robustcost.h) scenario by scenario: PostgreSQL's fuzzy cost
+ * comparison is made in every scenario s with the costs of s, and path1
+ * is better if it is better or fuzzily equal in every scenario (and better
+ * in one), the two are equal if they are equal in every scenario, and they
+ * are different otherwise.  Row counts likewise: "fewer rows" means no more
+ * in any scenario.  A path without vectors has its scalar in every
+ * scenario.  When neither path has vectors, this is PostgreSQL's
+ * comparison.
+ */
+static inline bool
+robust_has_vectors(const Path *path)
+{
+	const RobustPathCost *rc = path->robust;
+
+	return rc != NULL &&
+		(rc->rows != NULL || rc->startup != NULL || rc->total != NULL);
+}
+
+static inline double
+robust_at(const RobustVec *v, double scalar, int s)
+{
+	return v != NULL ? robust_vec_at(v, s) : scalar;
+}
+
+static PathCostComparison
+compare_costs_fuzzily_at(Path *path1, Path *path2, double fuzz_factor,
+						 Cost startup1, Cost total1,
+						 Cost startup2, Cost total2)
+{
+#define CONSIDER_STARTUP(p)  \
+	((p)->param_info == NULL ? (p)->parent->consider_startup : (p)->parent->consider_param_startup)
+
+	/* As compare_path_costs_fuzzily, on the costs given */
+	if (total1 > total2 * fuzz_factor)
+	{
+		if (CONSIDER_STARTUP(path1) && startup2 > startup1 * fuzz_factor)
+			return COSTS_DIFFERENT;
+		return COSTS_BETTER2;
+	}
+	if (total2 > total1 * fuzz_factor)
+	{
+		if (CONSIDER_STARTUP(path2) && startup1 > startup2 * fuzz_factor)
+			return COSTS_DIFFERENT;
+		return COSTS_BETTER1;
+	}
+	if (startup1 > startup2 * fuzz_factor)
+		return COSTS_BETTER2;
+	if (startup2 > startup1 * fuzz_factor)
+		return COSTS_BETTER1;
+	return COSTS_EQUAL;
+#undef CONSIDER_STARTUP
+}
+
+static PathCostComparison
+robust_compare_costs(Path *path1, Path *path2, double fuzz_factor,
+					 bool total_only)
+{
+	const RobustPathCost *r1 = path1->robust;
+	const RobustPathCost *r2 = path2->robust;
+	bool		better1 = false;
+	bool		better2 = false;
+
+	for (int s = 0; s < error_sample_count; s++)
+	{
+		Cost		t1 = robust_at(r1 ? r1->total : NULL, path1->total_cost, s);
+		Cost		t2 = robust_at(r2 ? r2->total : NULL, path2->total_cost, s);
+		PathCostComparison c;
+
+		if (total_only)
+			c = t1 > t2 * fuzz_factor ? COSTS_BETTER2 :
+				t2 > t1 * fuzz_factor ? COSTS_BETTER1 : COSTS_EQUAL;
+		else
+			c = compare_costs_fuzzily_at(path1, path2, fuzz_factor,
+										 robust_at(r1 ? r1->startup : NULL,
+												   path1->startup_cost, s),
+										 t1,
+										 robust_at(r2 ? r2->startup : NULL,
+												   path2->startup_cost, s),
+										 t2);
+		if (c == COSTS_DIFFERENT)
+			return COSTS_DIFFERENT;
+		if (c == COSTS_BETTER1)
+			better1 = true;
+		else if (c == COSTS_BETTER2)
+			better2 = true;
+		if (better1 && better2)
+			return COSTS_DIFFERENT;
+	}
+	return better1 ? COSTS_BETTER1 : better2 ? COSTS_BETTER2 : COSTS_EQUAL;
+}
+
+/* Rows of path1 vs path2: ROWS_LT if fewer in some scenario, ROWS_GT more */
+#define NEW_ROWS_LE_OLD \
+	(vec ? (rowscmp & ROWS_GT) == 0 : new_path->rows <= old_path->rows)
+#define NEW_ROWS_GE_OLD \
+	(vec ? (rowscmp & ROWS_LT) == 0 : new_path->rows >= old_path->rows)
+#define ROWS_LT 1
+#define ROWS_GT 2
+
+static int
+robust_compare_rows(Path *path1, Path *path2)
+{
+	const RobustVec *v1 = path1->robust ? path1->robust->rows : NULL;
+	const RobustVec *v2 = path2->robust ? path2->robust->rows : NULL;
+	int			result = 0;
+
+	for (int s = 0; s < error_sample_count; s++)
+	{
+		double		a = robust_at(v1, path1->rows, s);
+		double		b = robust_at(v2, path2->rows, s);
+
+		if (a < b)
+			result |= ROWS_LT;
+		else if (a > b)
+			result |= ROWS_GT;
+	}
+	return result;
+}
+
+/*
  * add_path
  *	  Consider a potential implementation path for the specified parent rel,
  *	  and add it to the rel's pathlist if it is worthy of consideration.
@@ -432,6 +556,8 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 	int			insert_at = 0;	/* where to insert new item */
 	List	   *new_path_pathkeys;
 	ListCell   *p1;
+	bool		robust;
+	bool		new_robust;
 
 	/*
 	 * This is a convenient place to check for query cancel --- no part of the
@@ -442,6 +568,10 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 	/* RobDP: the path's rows and costs in each error scenario */
 	if (enable_rows_dist)
 		robust_cost_add_path(new_path, false);
+
+	/* RobDP: compare per scenario (see robust_compare_costs) */
+	robust = enable_rows_dist && robust_cost_dominance();
+	new_robust = robust && robust_has_vectors(new_path);
 
 	/* Pretend parameterized paths have no pathkeys, per comment above */
 	new_path_pathkeys = new_path->param_info ? NIL : new_path->pathkeys;
@@ -458,12 +588,18 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 		PathCostComparison costcmp;
 		PathKeysComparison keyscmp;
 		BMS_Comparison outercmp;
+		bool		vec = new_robust || (robust && robust_has_vectors(old_path));
+		int			rowscmp = 0;
 
 		/*
 		 * Do a fuzzy cost comparison with standard fuzziness limit.
 		 */
-		costcmp = compare_path_costs_fuzzily(new_path, old_path,
-											 STD_FUZZ_FACTOR);
+		if (vec)
+			costcmp = robust_compare_costs(new_path, old_path,
+										   STD_FUZZ_FACTOR, false);
+		else
+			costcmp = compare_path_costs_fuzzily(new_path, old_path,
+												 STD_FUZZ_FACTOR);
 
 		/*
 		 * If the two paths compare differently for startup and total cost,
@@ -486,6 +622,8 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 									   old_path_pathkeys);
 			if (keyscmp != PATHKEYS_DIFFERENT)
 			{
+				if (vec)
+					rowscmp = robust_compare_rows(new_path, old_path);
 				switch (costcmp)
 				{
 					case COSTS_EQUAL:
@@ -495,7 +633,7 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 						{
 							if ((outercmp == BMS_EQUAL ||
 								 outercmp == BMS_SUBSET1) &&
-								new_path->rows <= old_path->rows &&
+								NEW_ROWS_LE_OLD &&
 								new_path->parallel_safe >= old_path->parallel_safe)
 								remove_old = true;	/* new dominates old */
 						}
@@ -503,7 +641,7 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 						{
 							if ((outercmp == BMS_EQUAL ||
 								 outercmp == BMS_SUBSET2) &&
-								new_path->rows >= old_path->rows &&
+								NEW_ROWS_GE_OLD &&
 								new_path->parallel_safe <= old_path->parallel_safe)
 								accept_new = false; /* old dominates new */
 						}
@@ -532,24 +670,34 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 								else if (new_path->parallel_safe <
 										 old_path->parallel_safe)
 									accept_new = false; /* old dominates new */
-								else if (new_path->rows < old_path->rows)
+								else if (vec && rowscmp == (ROWS_LT | ROWS_GT))
+								{
+									/* fewer rows in some scenarios, more in
+									 * others: keep both */
+								}
+								else if (vec ? rowscmp == ROWS_LT :
+										 new_path->rows < old_path->rows)
 									remove_old = true;	/* new dominates old */
-								else if (new_path->rows > old_path->rows)
+								else if (vec ? rowscmp == ROWS_GT :
+										 new_path->rows > old_path->rows)
 									accept_new = false; /* old dominates new */
-								else if (compare_path_costs_fuzzily(new_path,
-																	old_path,
-																	1.0000000001) == COSTS_BETTER1)
+								else if ((vec ?
+										  robust_compare_costs(new_path, old_path,
+															   1.0000000001, false) :
+										  compare_path_costs_fuzzily(new_path,
+																	 old_path,
+																	 1.0000000001)) == COSTS_BETTER1)
 									remove_old = true;	/* new dominates old */
 								else
 									accept_new = false; /* old equals or
 														 * dominates new */
 							}
 							else if (outercmp == BMS_SUBSET1 &&
-									 new_path->rows <= old_path->rows &&
+									 NEW_ROWS_LE_OLD &&
 									 new_path->parallel_safe >= old_path->parallel_safe)
 								remove_old = true;	/* new dominates old */
 							else if (outercmp == BMS_SUBSET2 &&
-									 new_path->rows >= old_path->rows &&
+									 NEW_ROWS_GE_OLD &&
 									 new_path->parallel_safe <= old_path->parallel_safe)
 								accept_new = false; /* old dominates new */
 							/* else different parameterizations, keep both */
@@ -562,7 +710,7 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 														  PATH_REQ_OUTER(old_path));
 							if ((outercmp == BMS_EQUAL ||
 								 outercmp == BMS_SUBSET1) &&
-								new_path->rows <= old_path->rows &&
+								NEW_ROWS_LE_OLD &&
 								new_path->parallel_safe >= old_path->parallel_safe)
 								remove_old = true;	/* new dominates old */
 						}
@@ -574,7 +722,7 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 														  PATH_REQ_OUTER(old_path));
 							if ((outercmp == BMS_EQUAL ||
 								 outercmp == BMS_SUBSET2) &&
-								new_path->rows >= old_path->rows &&
+								NEW_ROWS_GE_OLD &&
 								new_path->parallel_safe <= old_path->parallel_safe)
 								accept_new = false; /* old dominates new */
 						}
@@ -659,6 +807,10 @@ add_path_precheck(RelOptInfo *parent_rel,
 	List	   *new_path_pathkeys;
 	bool		consider_startup;
 	ListCell   *p1;
+
+	/* RobDP: lower bounds of point costs do not bound scenario costs */
+	if (enable_rows_dist && robust_cost_precheck_off())
+		return true;
 
 	/* Pretend parameterized paths have no pathkeys, per add_path policy */
 	new_path_pathkeys = required_outer ? NIL : pathkeys;
@@ -762,6 +914,8 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 	bool		accept_new = true;	/* unless we find a superior old path */
 	int			insert_at = 0;	/* where to insert new item */
 	ListCell   *p1;
+	bool		robust;
+	bool		new_robust;
 
 	/* Check for query cancel. */
 	CHECK_FOR_INTERRUPTS();
@@ -772,6 +926,10 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 	/* RobDP: the path's rows and costs in each error scenario */
 	if (enable_rows_dist)
 		robust_cost_add_path(new_path, true);
+
+	/* RobDP: compare per scenario (see robust_compare_costs) */
+	robust = enable_rows_dist && robust_cost_dominance();
+	new_robust = robust && robust_has_vectors(new_path);
 
 	/* Relation should be OK for parallelism, too. */
 	Assert(parent_rel->consider_parallel);
@@ -790,7 +948,38 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 		keyscmp = compare_pathkeys(new_path->pathkeys, old_path->pathkeys);
 
 		/* Unless pathkeys are incompatible, keep just one of the two paths. */
-		if (keyscmp != PATHKEYS_DIFFERENT)
+		if (keyscmp != PATHKEYS_DIFFERENT &&
+			(new_robust || (robust && robust_has_vectors(old_path))))
+		{
+			/* RobDP: as below, scenario by scenario */
+			switch (robust_compare_costs(new_path, old_path,
+										 STD_FUZZ_FACTOR, true))
+			{
+				case COSTS_BETTER2:
+					if (keyscmp != PATHKEYS_BETTER1)
+						accept_new = false;
+					break;
+				case COSTS_BETTER1:
+					if (keyscmp != PATHKEYS_BETTER2)
+						remove_old = true;
+					break;
+				case COSTS_EQUAL:
+					if (keyscmp == PATHKEYS_BETTER1)
+						remove_old = true;
+					else if (keyscmp == PATHKEYS_BETTER2)
+						accept_new = false;
+					else if (robust_compare_costs(new_path, old_path,
+												  1.0000000001, true) ==
+							 COSTS_BETTER1)
+						remove_old = true;
+					else
+						accept_new = false;
+					break;
+				case COSTS_DIFFERENT:
+					break;		/* keep both */
+			}
+		}
+		else if (keyscmp != PATHKEYS_DIFFERENT)
 		{
 			if (new_path->total_cost > old_path->total_cost * STD_FUZZ_FACTOR)
 			{
@@ -883,6 +1072,10 @@ add_partial_path_precheck(RelOptInfo *parent_rel, Cost total_cost,
 						  List *pathkeys)
 {
 	ListCell   *p1;
+
+	/* RobDP: see add_path_precheck */
+	if (enable_rows_dist && robust_cost_precheck_off())
+		return true;
 
 	/*
 	 * Our goal here is twofold.  First, we want to find out whether this path
@@ -3931,6 +4124,7 @@ reparameterize_path(PlannerInfo *root, Path *path,
 				 * the cost estimate.
 				 */
 				memcpy(newpath, ipath, sizeof(IndexPath));
+				newpath->path.robust = NULL;	/* RobDP: costed anew */
 				newpath->path.param_info =
 					get_baserel_parampathinfo(root, rel, required_outer);
 				cost_index(newpath, root, loop_count, false);

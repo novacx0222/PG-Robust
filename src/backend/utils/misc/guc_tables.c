@@ -1030,6 +1030,27 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"robust_search", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Runs RobDP's join search: dominance over the error scenarios."),
+			gettext_noop("When off (and with enable_rows_dist on), paths get their "
+						 "per-scenario costs but PostgreSQL's join search keeps them."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&robust_search,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"robust_envelope", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Runs RobDP's envelope pass: a join search per error scenario."),
+			gettext_noop("Only with robust_search on."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&robust_envelope,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_async_append", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of async append plans."),
 			NULL,

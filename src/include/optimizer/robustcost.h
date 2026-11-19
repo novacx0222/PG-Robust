@@ -41,6 +41,10 @@
  * and must reproduce the scalar fields bit for bit; if it does not, the
  * path keeps constant vectors and the debug dump reports it.
  *
+ * In an envelope round (optimizer/robustsearch.h) everything is in the
+ * round's scenario s already: the round's paths are replayed in s only and
+ * the result goes into their scalar fields, with no vectors.
+ *
  * src/include/optimizer/robustcost.h
  *
  *-------------------------------------------------------------------------
@@ -120,5 +124,13 @@ extern void robust_cost_memoize_reparameterized(MemoizePath *copy,
 												List *param_exprs);
 extern void robust_cost_bucket_filled(RestrictInfo *rinfo, bool right,
 									  Path *path, double virtualbuckets);
+
+/* The join search (robustsearch.c, pathnode.c) */
+extern void robust_cost_note_varies(void);
+extern bool robust_cost_dominance(void);
+extern bool robust_cost_precheck_off(void);
+extern void *robust_cost_search_save(void);
+extern void robust_cost_search_restore(void *save);
+extern const int *robust_cost_round_counts(void);
 
 #endif							/* ROBUSTCOST_H */

@@ -97,9 +97,31 @@ typedef struct CostState
 	HTAB	   *bucket_fill;	/* BucketFills */
 	HTAB	   *bucket_cache;	/* estimate_hash_bucket_stats results */
 	HTAB	   *groups_cache;	/* estimate_num_groups results */
+	bool		varies;			/* some row count or cost differs from the
+								 * point estimate in some scenario */
+	int			round_counts[ROBUST_COST_NOCONTEXT + 1];	/* statuses of
+															 * envelope paths */
 } CostState;
 
 static CostState *st = NULL;
+
+/* A hash clause's bucket filler (see robust_cost_bucket_filled) */
+typedef struct BucketFillKey
+{
+	const RestrictInfo *rinfo;
+	int			right;
+} BucketFillKey;
+
+typedef struct BucketFill
+{
+	BucketFillKey key;
+	const Path *filler;			/* until its replay is done */
+	double		vb;				/* the filler's buckets at the point */
+	double	   *vbs;			/* per scenario, or NULL: vb in every one */
+} BucketFill;
+
+static BucketFill *bucket_fill(const RestrictInfo *rinfo, bool right,
+							   bool create);
 
 #define jcx (st->jcx)
 
@@ -216,6 +238,145 @@ robust_cost_join_context(PlannerInfo *root, RelOptInfo *joinrel,
 		jcx.semifactors = *semifactors;
 }
 
+/*
+ * robust_cost_note_varies
+ *		A row count or cost differs from the point estimate in some scenario
+ *		(until then, every vector is the point and the join search is
+ *		PostgreSQL's).
+ */
+void
+robust_cost_note_varies(void)
+{
+	if (st)
+		st->varies = true;
+}
+
+static inline RobustPass
+current_pass(void)
+{
+	return (st && st->root) ? (RobustPass) st->root->robust_pass :
+		ROBUST_PASS_NONE;
+}
+
+/*
+ * robust_cost_dominance
+ *		Do add_path() and add_partial_path() compare paths that have vectors
+ *		scenario by scenario?  In every phase of robust planning but the
+ *		envelope pass, whose paths have their round's costs in their scalar
+ *		fields.
+ */
+bool
+robust_cost_dominance(void)
+{
+	RobustPass	pass = current_pass();
+
+	return pass == ROBUST_PASS_BASE || pass == ROBUST_PASS_MAIN ||
+		pass == ROBUST_PASS_UPPER;
+}
+
+/*
+ * robust_cost_precheck_off
+ *		add_path_precheck() and add_partial_path_precheck() reject a join
+ *		path by lower bounds of its point costs, which says nothing about
+ *		its costs in the scenarios.  In the main pass, when some scenario
+ *		differs from the point, they accept every path.  (The envelope pass
+ *		keeps them: there the costs compared are the round's, and the lower
+ *		bounds, computed from the inputs' costs in the round, are lower
+ *		bounds of the round's costs.)
+ */
+bool
+robust_cost_precheck_off(void)
+{
+	return st != NULL && st->varies && current_pass() == ROBUST_PASS_MAIN;
+}
+
+/*
+ * The envelope pass: robust_cost_search_save() before the first round,
+ * robust_cost_search_restore() after each.  Paths and relations of a round
+ * are freed with it, so the state that may point to them goes back to what
+ * it was before the round: the Appends given their rows, the translated
+ * Memoizes, the bucket fillers (the round's RestrictInfo caches are reset
+ * too, see robustsearch.c), the join context.  The cache of bucket
+ * estimates, keyed by RestrictInfo, is dropped (a round's partitionwise
+ * joins translate clauses in the round's memory).
+ */
+typedef struct CostSave
+{
+	int			nappend;
+	int			nmemo;
+	List	   *fills;			/* copies of the BucketFills */
+} CostSave;
+
+void *
+robust_cost_search_save(void)
+{
+	CostSave   *cs = palloc0(sizeof(CostSave));
+
+	if (st == NULL)
+		return cs;
+	cs->nappend = list_length(st->append_paths);
+	cs->nmemo = list_length(st->memo_copies);
+	if (st->bucket_fill != NULL)
+	{
+		HASH_SEQ_STATUS hs;
+		BucketFill *f;
+
+		hash_seq_init(&hs, st->bucket_fill);
+		while ((f = (BucketFill *) hash_seq_search(&hs)) != NULL)
+		{
+			BucketFill *c = palloc(sizeof(BucketFill));
+
+			memcpy(c, f, sizeof(BucketFill));
+			cs->fills = lappend(cs->fills, c);
+		}
+	}
+	memset(st->round_counts, 0, sizeof(st->round_counts));
+	return cs;
+}
+
+void
+robust_cost_search_restore(void *save)
+{
+	CostSave   *cs = (CostSave *) save;
+	ListCell   *lc;
+
+	if (st == NULL)
+		return;
+	st->append_paths = list_truncate(st->append_paths, cs->nappend);
+	st->append_rows = list_truncate(st->append_rows, cs->nappend);
+	st->memo_copies = list_truncate(st->memo_copies, cs->nmemo);
+	st->memo_exprs = list_truncate(st->memo_exprs, cs->nmemo);
+	st->prows_rel = NULL;
+	st->prows_path = NULL;
+	jcx.valid = false;
+	if (st->bucket_fill != NULL)
+	{
+		hash_destroy(st->bucket_fill);
+		st->bucket_fill = NULL;
+	}
+	foreach(lc, cs->fills)
+	{
+		BucketFill *c = (BucketFill *) lfirst(lc);
+		BucketFill *f = bucket_fill(c->key.rinfo, c->key.right, true);
+
+		memcpy(f, c, sizeof(BucketFill));
+	}
+	if (st->bucket_cache != NULL)
+	{
+		hash_destroy(st->bucket_cache);
+		st->bucket_cache = NULL;
+	}
+}
+
+/* How the envelope pass's paths were costed: counts by RobustCostStatus */
+const int *
+robust_cost_round_counts(void)
+{
+	static const int zero[ROBUST_COST_NOCONTEXT + 1];
+
+	return st ? st->round_counts : zero;
+}
+
 /* ------------------------------------------------- caches of estimates */
 
 /*
@@ -251,19 +412,6 @@ dbits(double d)
  * is the filler's in the scenario: the replay of the filler, which runs
  * before any other hash join can use the cache, records it per scenario.
  */
-typedef struct BucketFillKey
-{
-	const RestrictInfo *rinfo;
-	int			right;
-} BucketFillKey;
-
-typedef struct BucketFill
-{
-	BucketFillKey key;
-	const Path *filler;			/* until its replay is done */
-	double		vb;				/* the filler's buckets at the point */
-	double	   *vbs;			/* per scenario, or NULL: vb in every one */
-} BucketFill;
 
 static BucketFill *
 bucket_fill(const RestrictInfo *rinfo, bool right, bool create)
@@ -1683,6 +1831,7 @@ replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 			   *total;
 	int		   *nb = NULL;
 	MemoryContext pathcxt = GetMemoryChunkContext(path);
+	bool		round = root->robust_pass == ROBUST_PASS_ENVELOPE;
 
 	memset(&R, 0, sizeof(R));
 	R.root = root;
@@ -1701,6 +1850,14 @@ replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 		path->param_info->ppi_robust_rows != NULL;
 	varies |= base_rels_vary(root, path->parent->relids);
 	varies |= base_rels_vary(root, PATH_REQ_OUTER(path));
+
+	/*
+	 * An envelope round's paths have the round's values in their scalar
+	 * fields and no vectors; still, the round's scenario may scale the
+	 * selectivities the path's own cost function estimates.
+	 */
+	if (round)
+		varies = st->varies;
 	if (!varies)
 	{
 		rc->status = ROBUST_COST_CONST;
@@ -1807,6 +1964,30 @@ replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 			memcpy(rc->replayed, R.got, sizeof(rc->replayed));
 			return;
 		}
+	}
+
+	/* An envelope round: the round's scenario only, into the scalars */
+	if (round)
+	{
+		double		r,
+					su,
+					t;
+		int			b;
+
+		replay_once(&R, root->robust_round, &r, &su, &t, &b);
+		if (R.memo)
+		{
+			R.memo->est_entries = R.memo_entries;
+			R.memo->param_exprs = R.memo_exprs;
+		}
+		path->rows = r;
+		path->startup_cost = su;
+		path->total_cost = t;
+		if (IsA(path, HashPath))
+			((HashPath *) path)->num_batches = b;
+		rc->status = ROBUST_COST_REPLAY;
+		pfree(R.buf);
+		return;
 	}
 
 	rows = MemoryContextAlloc(pathcxt, offsetof(RobustVec, v) + sizeof(double) * N);
@@ -2083,6 +2264,7 @@ dump_path(PlannerInfo *root, Path *path, RobustPathCost *rc)
 	robust_dump_relids(&d, "param", root, PATH_REQ_OUTER(path));
 	robust_dump_int(&d, "npathkeys", list_length(path->pathkeys));
 	robust_dump_bool(&d, "partial", rc->partial);
+	robust_dump_bool(&d, "parallel_safe", path->parallel_safe);
 	robust_dump_str(&d, "status", status_name(rc->status));
 	robust_dump_str(&d, "detail", path_detail(path));
 	if (rc->semi_frozen)
@@ -2115,13 +2297,20 @@ compute(PlannerInfo *root, Path *path, bool partial)
 		return path->robust;
 	rc = MemoryContextAllocZero(GetMemoryChunkContext(path),
 								sizeof(RobustPathCost));
-	rc->id = st->next_path_id++;
+	rc->id = root->robust_pass == ROBUST_PASS_ENVELOPE ? -1 :
+		st->next_path_id++;
 	rc->partial = partial;
 	path->robust = rc;
 	replay(root, path, rc);
+	if (root->robust_pass == ROBUST_PASS_ENVELOPE)
+		st->round_counts[rc->status]++;
+	else if (cost_varies(rc))
+		st->varies = true;
 	if (IsA(path, HashPath))
 		bucket_fills_done((HashPath *) path);
-	if (robust_debug_dump)
+	/* (an envelope round's paths only when their replay failed) */
+	if (robust_dumping(root) ||
+		(robust_debug_dump && rc->status == ROBUST_COST_MISMATCH))
 		dump_path(root, path, rc);
 	return rc;
 }
