@@ -561,6 +561,9 @@ struct PlannerInfo
 	 * built on first use.
 	 */
 	struct RobustECGraph *robust_ec_graph pg_node_attr(read_write_ignore);
+
+	/* RobDP: the querylets drawn so far (see robustrows.c) */
+	List	   *robust_qcache pg_node_attr(read_write_ignore);
 };
 
 
@@ -1660,6 +1663,12 @@ typedef struct Path
 
 	/* sort ordering of path's output; a List of PathKey nodes; see above */
 	List	   *pathkeys;
+
+	/*
+	 * RobDP (optimizer/robustcost.h): the path's rows and costs in each
+	 * error scenario; NULL until computed.
+	 */
+	struct RobustPathCost *robust pg_node_attr(read_write_ignore);
 } Path;
 
 /* Macro for extracting a path's parameterization relids; beware double eval */

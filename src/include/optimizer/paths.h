@@ -72,6 +72,8 @@ extern void debug_print_rel(PlannerInfo *root, RelOptInfo *rel);
  *	  routines to generate index paths
  */
 extern void create_index_paths(PlannerInfo *root, RelOptInfo *rel);
+extern double get_loop_count(PlannerInfo *root, Index cur_relid,
+							 Relids outer_relids);
 extern bool relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
 										  List *restrictlist,
 										  List *exprlist, List *oprlist);

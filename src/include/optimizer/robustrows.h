@@ -57,6 +57,8 @@ typedef struct RobustQuerylet
 								 * pushed down (it scales pselec, not jselec) */
 	List	   *ec_num;			/* "ec": pair querylets multiplied, */
 	List	   *ec_den;			/* and divided, in this order */
+	Index		ia;				/* instance relid of the base relation, or */
+	Index		ib;				/* of the pair ia < ib; 0 for none / "ec" */
 } RobustQuerylet;
 
 /*
@@ -96,6 +98,11 @@ extern List *robust_join_querylets_at(PlannerInfo *root, List *clauses,
 extern RobustQuerylet *robust_ec_factor(PlannerInfo *root,
 										Relids *num, int nnum,
 										Relids *den, int nden, bool pushed);
+extern bool robust_ec_is_star(PlannerInfo *root, EquivalenceClass *ec);
+extern List *robust_join_querylets_ec(PlannerInfo *root, RelOptInfo *joinrel,
+									  SpecialJoinInfo *sjinfo, List *clauses,
+									  Relids *num, int nnum,
+									  Relids *den, int nden);
 
 /* Row counts */
 extern void robust_set_baserel_rows(PlannerInfo *root, RelOptInfo *rel,

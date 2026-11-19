@@ -43,6 +43,7 @@
 #include "optimizer/planner.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/robust.h"
+#include "optimizer/robustcost.h"
 #include "optimizer/robustrows.h"
 #include "optimizer/tlist.h"
 #include "parser/parse_clause.h"
@@ -1532,6 +1533,8 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		 * estimate.
 		 */
 		partial_rows = appendpath->path.rows;
+		if (enable_rows_dist)
+			robust_cost_partial_rows((Path *) appendpath);
 
 		/* Add the path. */
 		add_partial_path(rel, (Path *) appendpath);

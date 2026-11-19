@@ -117,6 +117,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "optimizer/robustcost.h"
 #include "optimizer/plancat.h"
 #include "parser/parse_clause.h"
 #include "parser/parsetree.h"
@@ -6482,6 +6483,9 @@ genericcostestimate(PlannerInfo *root,
 											  index->rel->relid,
 											  JOIN_INNER,
 											  NULL);
+	/* RobDP: in the error scenario being replayed */
+	if (unlikely(robust_replay != NULL))
+		indexSelectivity = robust_replay_index_selec(indexSelectivity);
 
 	/*
 	 * If caller didn't give us an estimate, estimate the number of index
@@ -6815,6 +6819,9 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 												  index->rel->relid,
 												  JOIN_INNER,
 												  NULL);
+		/* RobDP: in the error scenario being replayed */
+		if (unlikely(robust_replay != NULL))
+			btreeSelectivity = robust_replay_index_selec(btreeSelectivity);
 		numIndexTuples = btreeSelectivity * index->rel->tuples;
 
 		/*

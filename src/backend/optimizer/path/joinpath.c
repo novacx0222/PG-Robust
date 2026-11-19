@@ -25,6 +25,8 @@
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/robust.h"
+#include "optimizer/robustcost.h"
 #include "utils/typcache.h"
 
 /* Hook for plugins to get control in add_paths_to_joinrel() */
@@ -225,6 +227,12 @@ add_paths_to_joinrel(PlannerInfo *root,
 		compute_semi_anti_join_factors(root, joinrel, outerrel, innerrel,
 									   jointype, sjinfo, restrictlist,
 									   &extra.semifactors);
+
+	/* RobDP: what the replay of this join's paths needs besides the paths */
+	if (enable_rows_dist)
+		robust_cost_join_context(root, joinrel, outerrel, innerrel, jointype,
+								 sjinfo, restrictlist, extra.inner_unique,
+								 &extra.semifactors);
 
 	/*
 	 * Decide whether it's sensible to generate parameterized paths for this

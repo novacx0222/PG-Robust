@@ -30,6 +30,8 @@
 #include "optimizer/planmain.h"
 #include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/robust.h"
+#include "optimizer/robustcost.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
@@ -437,6 +439,10 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 	 */
 	CHECK_FOR_INTERRUPTS();
 
+	/* RobDP: the path's rows and costs in each error scenario */
+	if (enable_rows_dist)
+		robust_cost_add_path(new_path, false);
+
 	/* Pretend parameterized paths have no pathkeys, per comment above */
 	new_path_pathkeys = new_path->param_info ? NIL : new_path->pathkeys;
 
@@ -762,6 +768,10 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 
 	/* Path to be added must be parallel safe. */
 	Assert(new_path->parallel_safe);
+
+	/* RobDP: the path's rows and costs in each error scenario */
+	if (enable_rows_dist)
+		robust_cost_add_path(new_path, true);
 
 	/* Relation should be OK for parallelism, too. */
 	Assert(parent_rel->consider_parallel);
@@ -1360,7 +1370,12 @@ create_append_path(PlannerInfo *root,
 
 	/* If the caller provided a row estimate, override the computed value. */
 	if (rows >= 0)
+	{
 		pathnode->path.rows = rows;
+		/* RobDP: the scenario's rows are those of the path they came from */
+		if (enable_rows_dist)
+			robust_cost_append_rows((Path *) pathnode);
+	}
 
 	return pathnode;
 }
@@ -4342,6 +4357,10 @@ do { \
 				FLAT_COPY_PATH(mpath, path, MemoizePath);
 				REPARAMETERIZE_CHILD_PATH(mpath->subpath);
 				ADJUST_CHILD_ATTRS(mpath->param_exprs);
+				/* RobDP: the join was costed with the parent's Vars */
+				if (enable_rows_dist)
+					robust_cost_memoize_reparameterized(mpath,
+														((MemoizePath *) path)->param_exprs);
 				new_path = (Path *) mpath;
 			}
 			break;

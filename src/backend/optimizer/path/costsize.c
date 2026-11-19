@@ -94,6 +94,7 @@
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/robust.h"
+#include "optimizer/robustcost.h"
 #include "optimizer/robustrows.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
@@ -2521,8 +2522,12 @@ cost_memoize_rescan(PlannerInfo *root, MemoizePath *mpath,
 	est_cache_entries = floor(hash_mem_bytes / est_entry_bytes);
 
 	/* estimate on the distinct number of parameter values */
-	ndistinct = estimate_num_groups(root, mpath->param_exprs, calls, NULL,
-									&estinfo);
+	if (unlikely(robust_replay != NULL))
+		ndistinct = robust_replay_num_groups(root, mpath->param_exprs, calls,
+											 &estinfo);
+	else
+		ndistinct = estimate_num_groups(root, mpath->param_exprs, calls, NULL,
+										&estinfo);
 
 	/*
 	 * When the estimation fell back on using a default value, it's a bit too
@@ -3629,9 +3634,16 @@ final_cost_mergejoin(PlannerInfo *root, MergePath *path,
 		cpu_operator_cost * inner_rows * rescanratio;
 
 	/*
+	 * RobDP: a replay in an error scenario keeps the point estimate's choice
+	 * (path->materialize_inner as the path was built).
+	 */
+	if (unlikely(robust_replay != NULL))
+		 /* keep it */ ;
+
+	/*
 	 * If we don't need mark/restore at all, we don't need materialization.
 	 */
-	if (path->skip_mark_restore)
+	else if (path->skip_mark_restore)
 		path->materialize_inner = false;
 
 	/*
@@ -4005,17 +4017,33 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 			{
 				/* righthand side is inner */
 				thisbucketsize = restrictinfo->right_bucketsize;
-				if (thisbucketsize < 0)
+				if (unlikely(robust_replay != NULL))
 				{
-					/* not cached yet */
-					estimate_hash_bucket_stats(root,
-											   get_rightop(restrictinfo->clause),
+					/*
+					 * RobDP: redo the cached estimate with the scenario's
+					 * rows, for the buckets the path that filled the cache
+					 * has in the scenario
+					 */
+					robust_replay_bucket_stats(root, restrictinfo, true,
 											   virtualbuckets,
-											   &restrictinfo->right_mcvfreq,
-											   &restrictinfo->right_bucketsize);
-					thisbucketsize = restrictinfo->right_bucketsize;
+											   &thismcvfreq, &thisbucketsize);
 				}
-				thismcvfreq = restrictinfo->right_mcvfreq;
+				else
+				{
+					if (thisbucketsize < 0)
+					{
+						/* not cached yet */
+						estimate_hash_bucket_stats(root,
+												   get_rightop(restrictinfo->clause),
+												   virtualbuckets,
+												   &restrictinfo->right_mcvfreq,
+												   &restrictinfo->right_bucketsize);
+						robust_cost_bucket_filled(restrictinfo, true, &path->jpath.path,
+												  virtualbuckets);
+						thisbucketsize = restrictinfo->right_bucketsize;
+					}
+					thismcvfreq = restrictinfo->right_mcvfreq;
+				}
 			}
 			else
 			{
@@ -4023,17 +4051,29 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 									 inner_path->parent->relids));
 				/* lefthand side is inner */
 				thisbucketsize = restrictinfo->left_bucketsize;
-				if (thisbucketsize < 0)
+				if (unlikely(robust_replay != NULL))
 				{
-					/* not cached yet */
-					estimate_hash_bucket_stats(root,
-											   get_leftop(restrictinfo->clause),
+					/* RobDP: as above */
+					robust_replay_bucket_stats(root, restrictinfo, false,
 											   virtualbuckets,
-											   &restrictinfo->left_mcvfreq,
-											   &restrictinfo->left_bucketsize);
-					thisbucketsize = restrictinfo->left_bucketsize;
+											   &thismcvfreq, &thisbucketsize);
 				}
-				thismcvfreq = restrictinfo->left_mcvfreq;
+				else
+				{
+					if (thisbucketsize < 0)
+					{
+						/* not cached yet */
+						estimate_hash_bucket_stats(root,
+												   get_leftop(restrictinfo->clause),
+												   virtualbuckets,
+												   &restrictinfo->left_mcvfreq,
+												   &restrictinfo->left_bucketsize);
+						robust_cost_bucket_filled(restrictinfo, false, &path->jpath.path,
+												  virtualbuckets);
+						thisbucketsize = restrictinfo->left_bucketsize;
+					}
+					thismcvfreq = restrictinfo->left_mcvfreq;
+				}
 			}
 
 			if (innerbucketsize > thisbucketsize)
@@ -4807,6 +4847,10 @@ compute_semi_anti_join_factors(PlannerInfo *root,
 									JOIN_INNER,
 									&norm_sjinfo);
 
+	/* RobDP: in the error scenario being replayed */
+	if (unlikely(robust_replay != NULL))
+		robust_replay_semi_selec(&jselec, &nselec);
+
 	/* Avoid leaking a lot of ListCells */
 	if (IS_OUTER_JOIN(jointype))
 		list_free(joinquals);
@@ -4978,6 +5022,10 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
 		/* Note that clause_selectivity will be able to cache its result */
 		selec *= clause_selectivity(root, qual, 0, JOIN_INNER, &sjinfo);
 	}
+
+	/* RobDP: in the error scenario being replayed */
+	if (unlikely(robust_replay != NULL))
+		selec = robust_replay_qual_selec(quals, selec);
 
 	/* Apply it to the input relation sizes */
 	tuples = selec * outer_tuples * inner_tuples;

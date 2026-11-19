@@ -14,6 +14,7 @@ backend_sources += files(
   'relnode.c',
   'restrictinfo.c',
   'robust.c',
+  'robustcost.c',
   'robustprofile.c',
   'robustrows.c',
   'robustsample.c',

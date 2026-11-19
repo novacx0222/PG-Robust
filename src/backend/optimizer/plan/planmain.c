@@ -29,6 +29,7 @@
 #include "optimizer/paths.h"
 #include "optimizer/placeholder.h"
 #include "optimizer/planmain.h"
+#include "optimizer/robustcost.h"
 
 
 /*
@@ -58,6 +59,9 @@ query_planner(PlannerInfo *root,
 	Query	   *parse = root->parse;
 	List	   *joinlist;
 	RelOptInfo *final_rel;
+
+	/* RobDP: the paths built from here on belong to this query level */
+	robust_cost_set_root(root);
 
 	/*
 	 * Init planner lists to empty.

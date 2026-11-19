@@ -26,6 +26,7 @@ OBJS = \
 	relnode.o \
 	restrictinfo.o \
 	robust.o \
+	robustcost.o \
 	robustprofile.o \
 	robustrows.o \
 	robustsample.o \

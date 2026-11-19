@@ -55,6 +55,7 @@
 #include "optimizer/planner.h"
 #include "optimizer/prep.h"
 #include "optimizer/robust.h"
+#include "optimizer/robustcost.h"
 #include "optimizer/subselect.h"
 #include "optimizer/tlist.h"
 #include "parser/analyze.h"
@@ -73,6 +74,11 @@
 double		cursor_tuple_fraction = DEFAULT_CURSOR_TUPLE_FRACTION;
 int			debug_parallel_query = DEBUG_PARALLEL_OFF;
 bool		parallel_leader_participation = true;
+
+static PlannedStmt *standard_planner_internal(Query *parse,
+											  const char *query_string,
+											  int cursorOptions,
+											  ParamListInfo boundParams);
 
 /* Hook for plugins to get control in planner() */
 planner_hook_type planner_hook = NULL;
@@ -283,9 +289,36 @@ planner(Query *parse, const char *query_string, int cursorOptions,
 	return result;
 }
 
+/*
+ * RobDP: standard_planner runs standard_planner_internal with the state of
+ * robust costing (optimizer/robustcost.h) set up for this planning, and
+ * restores the state of the planning it is nested in afterwards, also on
+ * error.
+ */
 PlannedStmt *
 standard_planner(Query *parse, const char *query_string, int cursorOptions,
 				 ParamListInfo boundParams)
+{
+	void	   *robust_saved = robust_cost_begin_query();
+	PlannedStmt *result;
+
+	PG_TRY();
+	{
+		result = standard_planner_internal(parse, query_string, cursorOptions,
+										   boundParams);
+	}
+	PG_FINALLY();
+	{
+		robust_cost_end_query(robust_saved);
+	}
+	PG_END_TRY();
+
+	return result;
+}
+
+static PlannedStmt *
+standard_planner_internal(Query *parse, const char *query_string,
+						  int cursorOptions, ParamListInfo boundParams)
 {
 	PlannedStmt *result;
 	PlannerGlobal *glob;
@@ -616,6 +649,7 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
 	bool		hasResultRTEs;
 	RelOptInfo *final_rel;
 	ListCell   *l;
+	PlannerInfo *robust_saved_root = robust_cost_get_root();
 
 	/* Create a PlannerInfo data structure for this subquery */
 	root = makeNode(PlannerInfo);
@@ -1089,6 +1123,9 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
 	 * the decision, though it's unlikely that will change anything.)
 	 */
 	set_cheapest(final_rel);
+
+	/* RobDP: back to the query level that planned this one */
+	robust_cost_set_root(robust_saved_root);
 
 	return root;
 }

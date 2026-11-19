@@ -122,49 +122,106 @@ pair_name(const char *a, const char *b)
 /* -------------------------------------------------------------- querylets */
 
 /*
+ * The querylets drawn so far at a query level (PlannerInfo.robust_qcache),
+ * keyed by the profile keys tried, the instance and PostgreSQL's estimate:
+ * a querylet is drawn once, however often it is needed (the dump shows one
+ * "draw" event per querylet), and a missing profile is looked up once.
+ */
+typedef struct QueryletCacheEntry
+{
+	char	   *key;
+	char	   *fallback;		/* NULL: none */
+	char	   *inst;
+	double		sel_est;
+	RobustQuerylet *q;			/* NULL: no profile */
+} QueryletCacheEntry;
+
+static bool
+same_str(const char *a, const char *b)
+{
+	if (a == NULL || b == NULL)
+		return a == b;
+	return strcmp(a, b) == 0;
+}
+
+/*
  * Draw the errors of a querylet: profile key, else fallback (if different).
- * NULL if neither profile exists.
+ * NULL if neither profile exists.  The result is a copy the caller may
+ * change (pushed, ia, ib); the draws and multipliers are shared.
  */
 static RobustQuerylet *
-make_querylet(const char *key, const char *fallback, const char *inst,
-			  double sel_est)
+make_querylet(PlannerInfo *root, const char *key, const char *fallback,
+			  const char *inst, double sel_est)
 {
-	const RobustProfile *prof = robust_get_profile(key);
+	const RobustProfile *prof;
 	RobustQuerylet *q;
+	RobustQuerylet *copy;
 	RobustVec  *x;
 	int			bin;
+	ListCell   *lc;
+	QueryletCacheEntry *ent;
+	MemoryContext oldcxt;
 
+	foreach(lc, root->robust_qcache)
+	{
+		ent = (QueryletCacheEntry *) lfirst(lc);
+		if (ent->sel_est == sel_est && strcmp(ent->inst, inst) == 0 &&
+			strcmp(ent->key, key) == 0 && same_str(ent->fallback, fallback))
+		{
+			if (ent->q == NULL)
+				return NULL;
+			copy = palloc(sizeof(RobustQuerylet));
+			memcpy(copy, ent->q, sizeof(RobustQuerylet));
+			return copy;
+		}
+	}
+
+	oldcxt = MemoryContextSwitchTo(GetMemoryChunkContext(root));
+	ent = palloc(sizeof(QueryletCacheEntry));
+	ent->key = pstrdup(key);
+	ent->fallback = fallback ? pstrdup(fallback) : NULL;
+	ent->inst = pstrdup(inst);
+	ent->sel_est = sel_est;
+	ent->q = NULL;
+	root->robust_qcache = lappend(root->robust_qcache, ent);
+
+	prof = robust_get_profile(key);
 	if (prof == NULL && fallback != NULL && strcmp(fallback, key) != 0)
 		prof = robust_get_profile(fallback);
-	if (prof == NULL)
-		return NULL;
-	x = robust_draw_errors(prof, inst, sel_est, &bin);
-	if (x == NULL)
-		return NULL;
-
-	q = palloc(sizeof(RobustQuerylet));
-	q->key = pstrdup(prof->key);
-	q->inst = pstrdup(inst);
-	q->sel_est = sel_est;
-	q->bin = bin;
-	q->pushed = false;
-	q->x = x;
-	q->mult = robust_vec_make(x->n);
-	for (int s = 0; s < x->n; s++)
+	x = prof ? robust_draw_errors(prof, inst, sel_est, &bin) : NULL;
+	if (x != NULL)
 	{
-		double		e = exp(x->v[s]);
-		double		t;
-
-		if (sel_est > 0.0)
+		q = palloc0(sizeof(RobustQuerylet));
+		q->key = pstrdup(prof->key);
+		q->inst = pstrdup(inst);
+		q->sel_est = sel_est;
+		q->bin = bin;
+		q->pushed = false;
+		q->x = x;
+		q->mult = robust_vec_make(x->n);
+		for (int s = 0; s < x->n; s++)
 		{
-			t = sel_est * e;
-			CLAMP_PROBABILITY(t);
-			q->mult->v[s] = t / sel_est;
+			double		e = exp(x->v[s]);
+			double		t;
+
+			if (sel_est > 0.0)
+			{
+				t = sel_est * e;
+				CLAMP_PROBABILITY(t);
+				q->mult->v[s] = t / sel_est;
+			}
+			else
+				q->mult->v[s] = 1.0;
 		}
-		else
-			q->mult->v[s] = 1.0;
+		ent->q = q;
 	}
-	return q;
+	MemoryContextSwitchTo(oldcxt);
+
+	if (ent->q == NULL)
+		return NULL;
+	copy = palloc(sizeof(RobustQuerylet));
+	memcpy(copy, ent->q, sizeof(RobustQuerylet));
+	return copy;
 }
 
 /*
@@ -186,8 +243,10 @@ robust_base_querylet(PlannerInfo *root, RelOptInfo *rel, double sel_est)
 	r = robust_instance_relid(root, rel->relid);
 	alias = root->simple_rte_array[r]->eref->aliasname;
 	inst = robust_rel_name(root, r);
-	q = make_querylet(alias, std_alias(alias), inst, sel_est);
+	q = make_querylet(root, alias, std_alias(alias), inst, sel_est);
 	pfree(inst);
+	if (q != NULL)
+		q->ia = r;
 	return q;
 }
 
@@ -460,11 +519,16 @@ ec_graph(PlannerInfo *root)
 
 		dummy_inner_sjinfo(&sjinfo, pr->arels, pr->brels);
 		sel = clauselist_selectivity(root, pr->clauses, 0, JOIN_INNER, &sjinfo);
-		pr->q = make_querylet(pair_name(a, b),
+		pr->q = make_querylet(root, pair_name(a, b),
 							  (sa && sb) ? pair_name(sa, sb) : NULL,
 							  pair_name(robust_rel_name(root, pr->a),
 										robust_rel_name(root, pr->b)),
 							  sel);
+		if (pr->q != NULL)
+		{
+			pr->q->ia = pr->a;
+			pr->q->ib = pr->b;
+		}
 	}
 
 	/* Rank each class's members and order its profiled pairs */
@@ -566,8 +630,8 @@ ec_graph(PlannerInfo *root)
 }
 
 /* Is ec a multi-member equivalence class handled by spanning trees? */
-static bool
-ec_is_star(PlannerInfo *root, EquivalenceClass *ec)
+bool
+robust_ec_is_star(PlannerInfo *root, EquivalenceClass *ec)
 {
 	RobustECGraph *g = ec_graph(root);
 	ListCell   *lc;
@@ -782,7 +846,7 @@ robust_join_querylets_at(PlannerInfo *root, List *clauses, Relids joinrelids)
 		if (bms_num_members(rels) != 2)
 			continue;
 		/* Multi-member classes enter through robust_ec_factor() */
-		if (rinfo->parent_ec != NULL && ec_is_star(root, rinfo->parent_ec))
+		if (rinfo->parent_ec != NULL && robust_ec_is_star(root, rinfo->parent_ec))
 			continue;
 		r1 = bms_next_member(rels, -1);
 		r2 = bms_next_member(rels, r1);
@@ -850,12 +914,14 @@ robust_join_querylets_at(PlannerInfo *root, List *clauses, Relids joinrelids)
 		dummy_inner_sjinfo(&sjinfo, g->arels, g->brels);
 		sel = clauselist_selectivity(root, g->clauses, 0, JOIN_INNER, &sjinfo);
 
-		q = make_querylet(pair_name(a, b),
+		q = make_querylet(root, pair_name(a, b),
 						  (sa && sb) ? pair_name(sa, sb) : NULL,
 						  inst, sel);
 		if (q != NULL)
 		{
 			q->pushed = g->pushed;
+			q->ia = g->a;
+			q->ib = g->b;
 			result = lappend(result, q);
 		}
 	}
@@ -1324,6 +1390,20 @@ join_querylets(PlannerInfo *root, RelOptInfo *joinrel, SpecialJoinInfo *sjinfo,
 	if (ecq != NULL)
 		result = lappend(result, ecq);
 	return result;
+}
+
+/*
+ * robust_join_querylets_ec
+ *		The querylets of the clauses applied at a join of joinrel described by
+ *		sjinfo, followed by the factor M(num...) / M(den...) of the
+ *		multi-member equivalence classes (as for the join's row count).
+ */
+List *
+robust_join_querylets_ec(PlannerInfo *root, RelOptInfo *joinrel,
+						 SpecialJoinInfo *sjinfo, List *clauses,
+						 Relids *num, int nnum, Relids *den, int nden)
+{
+	return join_querylets(root, joinrel, sjinfo, clauses, num, nnum, den, nden);
 }
 
 static void
