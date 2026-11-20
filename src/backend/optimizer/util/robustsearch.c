@@ -18,9 +18,11 @@
 
 #include "nodes/bitmapset.h"
 #include "optimizer/pathnode.h"
+#include "optimizer/paths.h"
 #include "optimizer/robust.h"
 #include "optimizer/robustcost.h"
 #include "optimizer/robustsearch.h"
+#include "optimizer/robustselect.h"
 #include "utils/hsearch.h"
 
 /* The estimates a RestrictInfo caches, which a round may change */
@@ -40,7 +42,11 @@ typedef struct EnvEntry
 {
 	Relids		relids;			/* hash key */
 	int			level;
-	double	   *cost;			/* per scenario; NaN where not built */
+	bool		child;			/* a child join of a partitionwise join */
+	double	   *cost;			/* complete paths, per scenario; NaN where
+								 * not built */
+	double	   *partial;		/* partial paths, likewise; NaN where the
+								 * relation has none */
 } EnvEntry;
 
 /* What a round view overwrote */
@@ -85,6 +91,7 @@ struct RobustSearch
 	HTAB	   *envelope;		/* EnvEntry */
 	List	   *env_order;		/* EnvEntry, in the order first recorded */
 	int			round;			/* current round, -1 outside */
+	bool		select;			/* the main pass selects (robustselect.h) */
 	/* the current round's view (allocated in the round's memory) */
 	List	   *rel_saves;
 	List	   *path_saves;
@@ -287,6 +294,32 @@ view_rel(RobustSearch *rs, RelOptInfo *rel, int s)
 	foreach(lc, rel->partial_pathlist)
 		view_path(rs, (Path *) lfirst(lc), s);
 
+	/*
+	 * The join builders take the first partial path for the cheapest, as
+	 * add_partial_path keeps them in order of total cost: put them in the
+	 * order of s (a stable sort, as add_partial_path inserts after equals).
+	 */
+	if (list_length(rel->partial_pathlist) > 1)
+	{
+		List	   *sorted = NIL;
+
+		foreach(lc, rel->partial_pathlist)
+		{
+			Path	   *p = (Path *) lfirst(lc);
+			int			at = 0;
+			ListCell   *lc2;
+
+			foreach(lc2, sorted)
+			{
+				if (p->total_cost < ((Path *) lfirst(lc2))->total_cost)
+					break;
+				at++;
+			}
+			sorted = list_insert_nth(sorted, at, p);
+		}
+		rel->partial_pathlist = sorted;
+	}
+
 	/* set_cheapest also forgets the unique-ified path */
 	if (rel->pathlist != NIL)
 		set_cheapest(rel);
@@ -341,12 +374,18 @@ unview(RobustSearch *rs)
 
 /* ---------------------------------------------------------- envelope */
 
+/*
+ * C*(rel, s) of the round: the cheapest total cost of its complete paths
+ * (its cheapest total path, Gather paths included), and of its partial
+ * paths (per worker).
+ */
 static void
-record(RobustSearch *rs, RelOptInfo *rel, int level)
+record(RobustSearch *rs, RelOptInfo *rel, int level, bool child)
 {
 	EnvEntry   *e;
 	bool		found;
 	MemoryContext old;
+	ListCell   *lc;
 
 	if (rel->cheapest_total_path == NULL)
 		return;
@@ -360,13 +399,37 @@ record(RobustSearch *rs, RelOptInfo *rel, int level)
 		e = (EnvEntry *) hash_search(rs->envelope, &key, HASH_ENTER, &found);
 		e->relids = key;
 		e->level = level;
+		e->child = child;
 		e->cost = palloc(sizeof(double) * error_sample_count);
+		e->partial = palloc(sizeof(double) * error_sample_count);
 		for (int s = 0; s < error_sample_count; s++)
+		{
 			e->cost[s] = NAN;
+			e->partial[s] = NAN;
+		}
 		rs->env_order = lappend(rs->env_order, e);
 		MemoryContextSwitchTo(old);
 	}
 	e->cost[rs->round] = rel->cheapest_total_path->total_cost;
+	foreach(lc, rel->partial_pathlist)
+	{
+		Cost		c = ((Path *) lfirst(lc))->total_cost;
+
+		if (isnan(e->partial[rs->round]) || c < e->partial[rs->round])
+			e->partial[rs->round] = c;
+	}
+}
+
+/* The envelope of a relation (its complete or partial paths), or NULL */
+static const double *
+envelope_of(RobustSearch *rs, RelOptInfo *rel, bool partial)
+{
+	EnvEntry   *e;
+
+	e = (EnvEntry *) hash_search(rs->envelope, &rel->relids, HASH_FIND, NULL);
+	if (e == NULL)
+		return NULL;
+	return partial ? e->partial : e->cost;
 }
 
 static void
@@ -385,7 +448,10 @@ dump_envelope(RobustSearch *rs)
 		robust_dump_begin(&d, "env");
 		robust_dump_relids(&d, "rels", rs->root, e->relids);
 		robust_dump_int(&d, "level", e->level);
+		robust_dump_bool(&d, "child", e->child);
 		robust_dump_vec(&d, "cost", v);
+		memcpy(v->v, e->partial, sizeof(double) * error_sample_count);
+		robust_dump_vec(&d, "partial", v);
 		robust_dump_end(&d);
 		pfree(v);
 	}
@@ -417,6 +483,8 @@ robust_search_begin(PlannerInfo *root, List *initial_rels)
 	rs->cxt = CurrentMemoryContext;
 	rs->initial_rels = initial_rels;
 	rs->round = -1;
+	rs->select = robust_select;
+	root->robust_search = rs;
 
 	/*
 	 * A round view projects every base and other-member relation (the cost
@@ -452,6 +520,31 @@ robust_search_begin(PlannerInfo *root, List *initial_rels)
 }
 
 /*
+ * robust_search_rounds
+ *		Does the search run the envelope pass?  When robust_envelope is on
+ *		and the paths are not selected, or are selected by an objective that
+ *		compares them to the envelope.  (An error if such an objective is
+ *		set with robust_envelope off.)
+ */
+bool
+robust_search_rounds(RobustSearch *rs)
+{
+	bool		needed;
+
+	if (!rs->select)
+		return robust_envelope;
+	needed = robust_objective_needs_envelope(main_objective_id) ||
+		(retain_path_limit > 0 &&
+		 robust_objective_needs_envelope(retain_strategy_id));
+	if (needed && !robust_envelope)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("the objectives of RobDP's selection need the envelope pass"),
+				 errhint("Set robust_envelope on, or choose objectives 2 to 5.")));
+	return needed;
+}
+
+/*
  * robust_round_begin
  *		Envelope round s starts, in the round's memory context: project the
  *		level-1 relations onto s and record their C*(U, s).
@@ -473,14 +566,14 @@ robust_round_begin(RobustSearch *rs, int s)
 	foreach(lc, rs->view_rels)
 		view_rel(rs, (RelOptInfo *) lfirst(lc), s);
 	foreach(lc, rs->initial_rels)
-		record(rs, (RelOptInfo *) lfirst(lc), 1);
+		record(rs, (RelOptInfo *) lfirst(lc), 1, false);
 }
 
 /* A relation of the round is complete (set_cheapest done) */
 void
 robust_round_record(RobustSearch *rs, RelOptInfo *rel)
 {
-	record(rs, rel, bms_num_members(rel->relids));
+	record(rs, rel, bms_num_members(rel->relids), false);
 }
 
 /*
@@ -503,12 +596,116 @@ robust_round_end(RobustSearch *rs)
 void
 robust_main_begin(RobustSearch *rs)
 {
+	ListCell   *lc;
+
 	if (rs->env_order != NIL)
 	{
 		reset_rinfos(rs);
 		if (robust_debug_dump)
 			dump_envelope(rs);
 	}
+	if (!rs->select)
+		return;
+
+	/*
+	 * Score the level-1 relations' paths, so that their cheapest paths are
+	 * the best by the objective, without pruning them (v20 selected join
+	 * relations only).  The results of earlier subproblems are scored
+	 * already.
+	 */
+	foreach(lc, rs->initial_rels)
+	{
+		RelOptInfo *rel = (RelOptInfo *) lfirst(lc);
+		Path	   *first = rel->pathlist != NIL ?
+			(Path *) linitial(rel->pathlist) : NULL;
+
+		if (first == NULL || (first->robust != NULL && first->robust->scored))
+			continue;
+		robust_select_paths(rs->root, rel, true,
+							list_length(rel->partial_pathlist), 0,
+							envelope_of(rs, rel, true));
+		robust_select_paths(rs->root, rel, false,
+							list_length(rel->pathlist), 0,
+							envelope_of(rs, rel, false));
+		set_cheapest(rel);
+	}
+}
+
+/*
+ * Select the partial paths of a relation of the main pass, build the Gather
+ * paths on those kept (if 'gather'), select the complete paths, and set its
+ * cheapest paths.  At the last level of the search ('top') the main
+ * objective keeps robust_final_path_limit paths of each kind (1, as in v20)
+ * and the retain strategy none.
+ */
+static void
+select_rel(RobustSearch *rs, RelOptInfo *rel, bool top, bool gather)
+{
+	int			limit = top ? robust_final_path_limit : add_path_limit;
+	int			retain = top ? 0 : retain_path_limit;
+
+	robust_select_paths(rs->root, rel, true, limit, retain,
+						envelope_of(rs, rel, true));
+	if (gather)
+		generate_useful_gather_paths(rs->root, rel, false);
+	robust_select_paths(rs->root, rel, false, limit, retain,
+						envelope_of(rs, rel, false));
+	set_cheapest(rel);
+}
+
+/*
+ * robust_search_finish_rel
+ *		A join relation of the search is complete (its partitionwise join
+ *		paths added): generate its Gather paths, unless 'top' is the relation
+ *		of all the query's relations, and set its cheapest paths, as
+ *		standard_join_search does; in the main pass of a selecting search,
+ *		select its paths too (select_rel).  'top': the last level.
+ */
+void
+robust_search_finish_rel(RobustSearch *rs, RelOptInfo *rel, bool top)
+{
+	PlannerInfo *root = rs->root;
+	bool		gather = !bms_equal(rel->relids, root->all_query_rels);
+
+	if (root->robust_pass == ROBUST_PASS_MAIN && rs->select)
+		select_rel(rs, rel, top, gather);
+	else
+	{
+		if (gather)
+			generate_useful_gather_paths(root, rel, false);
+		set_cheapest(rel);
+	}
+	if (root->robust_pass == ROBUST_PASS_ENVELOPE)
+		robust_round_record(rs, rel);
+	else if (robust_debug_dump)
+		robust_dump_pathlist(root, rel);
+}
+
+/*
+ * robust_search_child_rel
+ *		generate_partitionwise_join_paths() is done with a child join: set
+ *		its cheapest paths; in a selecting search, record its envelope in a
+ *		round and select its paths in the main pass (no Gather: the parent's
+ *		Append combines the children's partial paths).
+ */
+void
+robust_search_child_rel(RobustSearch *rs, RelOptInfo *child)
+{
+	PlannerInfo *root = rs->root;
+
+	if (!rs->select)
+	{
+		set_cheapest(child);
+		return;
+	}
+	if (root->robust_pass == ROBUST_PASS_MAIN)
+		select_rel(rs, child, false, false);
+	else
+		set_cheapest(child);
+	if (root->robust_pass == ROBUST_PASS_ENVELOPE)
+		record(rs, child, bms_num_members(child->relids), true);
+	else if (root->robust_pass == ROBUST_PASS_MAIN && robust_debug_dump)
+		robust_dump_pathlist(root, child);
 }
 
 /*
@@ -556,6 +753,7 @@ robust_dump_pathlist(PlannerInfo *root, RelOptInfo *rel)
 void
 robust_search_end(RobustSearch *rs)
 {
+	rs->root->robust_search = NULL;
 	hash_destroy(rs->rinfos);
 	hash_destroy(rs->envelope);
 	pfree(rs);

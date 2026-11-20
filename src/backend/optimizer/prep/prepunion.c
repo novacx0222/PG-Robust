@@ -1034,6 +1034,13 @@ choose_hashed_setop(PlannerInfo *root, List *groupClauses,
 	Path		sorted_p;
 	double		tuple_fraction;
 
+	/*
+	 * RobDP: compare_fractional_path_costs below reads Path.robust (the
+	 * selection's score, optimizer/robustselect.h); these paths have none.
+	 */
+	hashed_p.robust = NULL;
+	sorted_p.robust = NULL;
+
 	/* Check whether the operators support sorting or hashing */
 	can_sort = grouping_is_sortable(groupClauses);
 	can_hash = grouping_is_hashable(groupClauses);

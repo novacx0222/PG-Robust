@@ -84,12 +84,14 @@ def dump(out, install, sets, queries=None, repeat=1):
     return json.load(open(out))
 
 
-def robust_sets(prof_dir, N=20, bw=0.0, seed=42, bins=2, debug=True, search=False):
+def robust_sets(prof_dir, N=20, bw=0.0, seed=42, bins=2, debug=True, search=False, more=()):
     """settings for robust planning; the S4..S6 gates check the rows and costs
-    PostgreSQL's own join search gives (robust_search off), S7 on"""
+    PostgreSQL's own join search gives (robust_search off), S7 on.  'more'
+    goes before the dump settings: a setting after client_min_messages = log
+    is a query whose planning is dumped (and taken for the first one)"""
     s = ['enable_rows_dist=on', 'error_sample_count=%d' % N, 'error_bin_count=%d' % bins,
          'error_sample_seed=%d' % seed, 'error_sample_kde_bandwidth=%r' % bw,
-         'error_profile_path=' + prof_dir, 'robust_search=%s' % ('on' if search else 'off')]
+         'error_profile_path=' + prof_dir, 'robust_search=%s' % ('on' if search else 'off')] + list(more)
     if debug:
         s += ['robust_debug_dump=on', 'client_min_messages=log']
     return s

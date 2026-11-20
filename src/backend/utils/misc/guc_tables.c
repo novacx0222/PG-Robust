@@ -431,6 +431,12 @@ static const struct config_enum_entry recovery_init_sync_method_options[] = {
 	{NULL, 0, false}
 };
 
+static const struct config_enum_entry robust_join_pairing_options[] = {
+	{"native", ROBUST_PAIRING_NATIVE, false},
+	{"retained", ROBUST_PAIRING_RETAINED, false},
+	{NULL, 0, false}
+};
+
 static const struct config_enum_entry shared_memory_options[] = {
 #ifndef WIN32
 	{"sysv", SHMEM_TYPE_SYSV, false},
@@ -1048,6 +1054,27 @@ struct config_bool ConfigureNamesBool[] =
 		},
 		&robust_envelope,
 		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"robust_select", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Keeps, for each join relation of RobDP's main pass, the paths its objectives select."),
+			gettext_noop("When off, the main pass keeps every path no other path "
+						 "dominates in every error scenario."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&robust_select,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"robust_dominance", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Drops dominated candidate paths before RobDP's selection."),
+			gettext_noop("When off, the main pass collects every candidate path, as v20 did."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&robust_dominance,
+		false,
 		NULL, NULL, NULL
 	},
 	{
@@ -3578,6 +3605,59 @@ struct config_int ConfigureNamesInt[] =
 		1, 1, ROBUST_MAX_BINS,
 		NULL, NULL, NULL
 	},
+	{
+		{"add_path_limit", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the number of paths RobDP's main objective keeps per join relation."),
+			gettext_noop("The final join relation keeps one."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&add_path_limit,
+		1, 1, 1000000,
+		NULL, NULL, NULL
+	},
+	{
+		{"retain_path_limit", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the number of paths RobDP's retain strategy keeps per join relation, "
+						 "out of those the main objective dropped."),
+			gettext_noop("Not at the final join relation."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&retain_path_limit,
+		1, 0, 1000000,
+		NULL, NULL, NULL
+	},
+	{
+		{"robust_final_path_limit", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the number of paths RobDP keeps at the final join relation, "
+						 "by the main objective."),
+			gettext_noop("1 as in v20; more keeps paths the upper planner may prefer (sorted ones)."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&robust_final_path_limit,
+		1, 1, 1000000,
+		NULL, NULL, NULL
+	},
+	{
+		{"main_objective_id", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the objective RobDP keeps join paths by (v20 numbering)."),
+			gettext_noop("0 worst penalty, 1 expected penalty, 2 worst total cost, "
+						 "3 expected total cost, 4 worst startup cost, 5 expected startup cost."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&main_objective_id,
+		0, 0, ROBUST_OBJECTIVE_MAX,
+		check_robust_objective, NULL, NULL
+	},
+	{
+		{"retain_strategy_id", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the objective of RobDP's retain strategy (v20 numbering)."),
+			NULL,
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&retain_strategy_id,
+		0, 0, ROBUST_OBJECTIVE_MAX,
+		check_robust_objective, NULL, NULL
+	},
 
 	/* End-of-list marker */
 	{
@@ -3869,6 +3949,16 @@ struct config_real ConfigureNamesReal[] =
 		},
 		&error_sample_kde_bandwidth,
 		0.0, -1.0, 10.0,
+		NULL, NULL, NULL
+	},
+	{
+		{"robust_penalty_tau", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the slowdown over the optimal cost RobDP's penalty objectives tolerate."),
+			gettext_noop("A path costing at most (1 + tau) times the envelope has no penalty."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&robust_penalty_tau,
+		0.2, 0.0, 1000.0,
 		NULL, NULL, NULL
 	},
 
@@ -4982,6 +5072,18 @@ struct config_enum ConfigureNamesEnum[] =
 		&recovery_prefetch,
 		RECOVERY_PREFETCH_TRY, recovery_prefetch_options,
 		check_recovery_prefetch, assign_recovery_prefetch, NULL
+	},
+
+	{
+		{"robust_join_pairing", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Selects which input paths RobDP's main pass joins."),
+			gettext_noop("native: PostgreSQL's (the cheapest paths of the inputs); "
+						 "retained: every path the inputs keep."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&robust_join_pairing,
+		ROBUST_PAIRING_RETAINED, robust_join_pairing_options,
+		NULL, NULL, NULL
 	},
 
 	{

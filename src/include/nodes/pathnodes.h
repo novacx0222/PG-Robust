@@ -562,6 +562,9 @@ struct PlannerInfo
 	 */
 	struct RobustECGraph *robust_ec_graph pg_node_attr(read_write_ignore);
 
+	/* RobDP (optimizer/robustsearch.h): the join search running, or NULL */
+	struct RobustSearch *robust_search pg_node_attr(read_write_ignore);
+
 	/* RobDP: the querylets drawn so far (see robustrows.c) */
 	List	   *robust_qcache pg_node_attr(read_write_ignore);
 };

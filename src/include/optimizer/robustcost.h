@@ -78,6 +78,12 @@ typedef struct RobustPathCost
 								 * NULL */
 	double		replayed[3];	/* MISMATCH: rows, startup, total the point
 								 * replay gave */
+	/* set by the selection of the main pass (optimizer/robustselect.h) */
+	bool		scored;
+	double		score;			/* main objective, against its relation's
+								 * envelope */
+	double		mean_startup;	/* expected startup and total cost */
+	double		mean_total;
 } RobustPathCost;
 
 /*
@@ -132,5 +138,7 @@ extern bool robust_cost_precheck_off(void);
 extern void *robust_cost_search_save(void);
 extern void robust_cost_search_restore(void *save);
 extern const int *robust_cost_round_counts(void);
+extern bool robust_cost_scores_active(void);
+extern bool robust_cost_collect(void);
 
 #endif							/* ROBUSTCOST_H */

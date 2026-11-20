@@ -48,7 +48,9 @@ from robdp_dump import parse
 
 N = 20
 FUZZ = 1.01
-SEARCH = lambda prof, **kw: robust_sets(os.path.join(PROFILES, prof), search=True, **kw)
+# S7's search: add_path keeps the paths no other dominates in every scenario,
+# without S8's selection (robust_select off)
+SEARCH = lambda prof, **kw: robust_sets(os.path.join(PROFILES, prof), search=True, more=['robust_select=off'], **kw)
 
 
 def index(evs):
@@ -124,7 +126,7 @@ def main_events(evs):
 # ------------------------------------------------------------------ K4
 
 def planning(sql, pdir, install, n=1):
-    q = ("SET enable_rows_dist=on; SET robust_search=on; SET robust_envelope=on;\n"
+    q = ("SET enable_rows_dist=on; SET robust_search=on; SET robust_envelope=on; SET robust_select=off;\n"
          "SET error_profile_path='%s'; SET error_sample_count=%d; SET error_sample_kde_bandwidth=0;\n"
          "SET robust_debug_dump=on; SET client_min_messages=log;\n"
          "EXPLAIN %s;\n" % (pdir, n, sql))

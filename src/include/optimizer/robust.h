@@ -17,6 +17,7 @@
 #include "lib/stringinfo.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/robustvec.h"
+#include "utils/guc.h"
 
 /* GUC parameters */
 extern PGDLLIMPORT bool enable_rows_dist;
@@ -28,6 +29,27 @@ extern PGDLLIMPORT char *error_profile_path;
 extern PGDLLIMPORT bool robust_debug_dump;
 extern PGDLLIMPORT bool robust_search;
 extern PGDLLIMPORT bool robust_envelope;
+extern PGDLLIMPORT bool robust_select;
+extern PGDLLIMPORT bool robust_dominance;
+extern PGDLLIMPORT int robust_join_pairing;
+extern PGDLLIMPORT int add_path_limit;
+extern PGDLLIMPORT int retain_path_limit;
+extern PGDLLIMPORT int robust_final_path_limit;
+extern PGDLLIMPORT int main_objective_id;
+extern PGDLLIMPORT int retain_strategy_id;
+extern PGDLLIMPORT double robust_penalty_tau;
+
+/* robust_join_pairing (see optimizer/robustselect.h) */
+typedef enum RobustPairing
+{
+	ROBUST_PAIRING_NATIVE,		/* PostgreSQL's input paths */
+	ROBUST_PAIRING_RETAINED,	/* every path the inputs keep */
+} RobustPairing;
+
+/* The objectives of v20 (main_objective_id, retain_strategy_id) */
+#define ROBUST_OBJECTIVE_MAX	16
+
+extern bool check_robust_objective(int *newval, void **extra, GucSource source);
 
 /* Upper limit of error_bin_count */
 #define ROBUST_MAX_BINS		8

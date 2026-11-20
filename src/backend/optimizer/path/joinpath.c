@@ -27,6 +27,7 @@
 #include "optimizer/restrictinfo.h"
 #include "optimizer/robust.h"
 #include "optimizer/robustcost.h"
+#include "optimizer/robustselect.h"
 #include "utils/typcache.h"
 
 /* Hook for plugins to get control in add_paths_to_joinrel() */
@@ -44,6 +45,49 @@ set_join_pathlist_hook_type set_join_pathlist_hook = NULL;
 
 #define PATH_PARAM_BY_REL(path, rel)	\
 	(PATH_PARAM_BY_REL_SELF(path, rel) || PATH_PARAM_BY_PARENT(path, rel))
+
+/*
+ * RobDP: robust_join_pairing = retained (optimizer/robustselect.h).
+ * PostgreSQL builds a join from a few paths of each input: its cheapest
+ * total path (and cheapest startup path, its cheapest path per
+ * parameterization or sort order) and its first partial path.  In the main
+ * pass of a selecting search the other paths the inputs keep are tried
+ * too: their other unparameterized complete paths, and all their partial
+ * paths.  Unique-ified inputs stay PostgreSQL's (create_unique_path takes
+ * the cheapest total path only).  Otherwise these are NIL and the first
+ * partial path, and the join builders below are PostgreSQL's.
+ */
+static List *
+robust_extra_paths(PlannerInfo *root, RelOptInfo *rel, Path *exclude,
+				   bool safe_only)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	if (!robust_select_retained(root))
+		return NIL;
+	foreach(lc, rel->pathlist)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+
+		if (path == rel->cheapest_total_path || path == exclude ||
+			path->param_info != NULL ||
+			(safe_only && !path->parallel_safe))
+			continue;
+		result = lappend(result, path);
+	}
+	return result;
+}
+
+static List *
+robust_partial_paths(PlannerInfo *root, RelOptInfo *rel)
+{
+	if (rel->partial_pathlist == NIL)
+		return NIL;
+	if (!robust_select_retained(root))
+		return list_make1(linitial(rel->partial_pathlist));
+	return rel->partial_pathlist;
+}
 
 static void try_partial_mergejoin_path(PlannerInfo *root,
 									   RelOptInfo *joinrel,
@@ -1293,6 +1337,10 @@ sort_inner_and_outer(PlannerInfo *root,
 	Path	   *cheapest_safe_inner = NULL;
 	List	   *all_pathkeys;
 	ListCell   *l;
+	List	   *outer_paths;	/* RobDP: see robust_extra_paths */
+	List	   *inner_paths;
+	List	   *partial_outers = NIL;
+	List	   *safe_inners = NIL;
 
 	/*
 	 * We only consider the cheapest-total-cost input paths, since we are
@@ -1339,6 +1387,17 @@ sort_inner_and_outer(PlannerInfo *root,
 		jointype = JOIN_INNER;
 	}
 
+	/* RobDP: the inputs' other paths too, with retained pairing */
+	outer_paths = list_make1(outer_path);
+	inner_paths = list_make1(inner_path);
+	if (save_jointype != JOIN_UNIQUE_OUTER && save_jointype != JOIN_UNIQUE_INNER)
+	{
+		outer_paths = list_concat(outer_paths,
+								  robust_extra_paths(root, outerrel, NULL, false));
+		inner_paths = list_concat(inner_paths,
+								  robust_extra_paths(root, innerrel, NULL, false));
+	}
+
 	/*
 	 * If the joinrel is parallel-safe, we may be able to consider a partial
 	 * merge join.  However, we can't handle JOIN_UNIQUE_OUTER, because the
@@ -1362,6 +1421,18 @@ sort_inner_and_outer(PlannerInfo *root,
 		else if (save_jointype != JOIN_UNIQUE_INNER)
 			cheapest_safe_inner =
 				get_cheapest_parallel_safe_total_inner(innerrel->pathlist);
+
+		/* RobDP: see robust_extra_paths */
+		partial_outers = robust_partial_paths(root, outerrel);
+		if (cheapest_safe_inner != NULL)
+		{
+			safe_inners = list_make1(cheapest_safe_inner);
+			if (save_jointype != JOIN_UNIQUE_INNER)
+				safe_inners = list_concat(safe_inners,
+										  robust_extra_paths(root, innerrel,
+															 cheapest_safe_inner,
+															 true));
+		}
 	}
 
 	/*
@@ -1403,6 +1474,8 @@ sort_inner_and_outer(PlannerInfo *root,
 		List	   *outerkeys;
 		List	   *innerkeys;
 		List	   *merge_pathkeys;
+		ListCell   *lo;
+		ListCell   *li;
 
 		/* Make a pathkey list with this guy first */
 		if (l != list_head(all_pathkeys))
@@ -1437,33 +1510,52 @@ sort_inner_and_outer(PlannerInfo *root,
 		 * properly.  try_mergejoin_path will detect that case and suppress an
 		 * explicit sort step, so we needn't do so here.
 		 */
-		try_mergejoin_path(root,
-						   joinrel,
-						   outer_path,
-						   inner_path,
-						   merge_pathkeys,
-						   cur_mergeclauses,
-						   outerkeys,
-						   innerkeys,
-						   jointype,
-						   extra,
-						   false);
+		foreach(lo, outer_paths)
+		{
+			foreach(li, inner_paths)
+			{
+				Path	   *o = (Path *) lfirst(lo);
+				Path	   *i = (Path *) lfirst(li);
+
+				/* (the cheapest pair was checked above) */
+				if (PATH_PARAM_BY_REL(o, innerrel) ||
+					PATH_PARAM_BY_REL(i, outerrel))
+					continue;
+				try_mergejoin_path(root,
+								   joinrel,
+								   o,
+								   i,
+								   merge_pathkeys,
+								   cur_mergeclauses,
+								   outerkeys,
+								   innerkeys,
+								   jointype,
+								   extra,
+								   false);
+			}
+		}
 
 		/*
 		 * If we have partial outer and parallel safe inner path then try
 		 * partial mergejoin path.
 		 */
 		if (cheapest_partial_outer && cheapest_safe_inner)
-			try_partial_mergejoin_path(root,
-									   joinrel,
-									   cheapest_partial_outer,
-									   cheapest_safe_inner,
-									   merge_pathkeys,
-									   cur_mergeclauses,
-									   outerkeys,
-									   innerkeys,
-									   jointype,
-									   extra);
+		{
+			foreach(lo, partial_outers)
+			{
+				foreach(li, safe_inners)
+					try_partial_mergejoin_path(root,
+											   joinrel,
+											   (Path *) lfirst(lo),
+											   (Path *) lfirst(li),
+											   merge_pathkeys,
+											   cur_mergeclauses,
+											   outerkeys,
+											   innerkeys,
+											   jointype,
+											   extra);
+			}
+		}
 	}
 }
 
@@ -1743,6 +1835,8 @@ match_unsorted_outer(PlannerInfo *root,
 	Path	   *inner_cheapest_total = innerrel->cheapest_total_path;
 	Path	   *matpath = NULL;
 	ListCell   *lc1;
+	List	   *extra_inners = NIL; /* RobDP: see robust_extra_paths */
+	List	   *extra_matpaths = NIL;
 
 	/*
 	 * Nestloop only supports inner, left, semi, and anti joins.  Also, if we
@@ -1812,6 +1906,23 @@ match_unsorted_outer(PlannerInfo *root,
 			!ExecMaterializesOutput(inner_cheapest_total->pathtype))
 			matpath = (Path *)
 				create_material_path(innerrel, inner_cheapest_total);
+	}
+
+	/* RobDP: the inner rel's other paths too, with retained pairing */
+	if (save_jointype != JOIN_UNIQUE_INNER)
+	{
+		ListCell   *lc;
+
+		extra_inners = robust_extra_paths(root, innerrel, NULL, false);
+		foreach(lc, extra_inners)
+		{
+			Path	   *p = (Path *) lfirst(lc);
+
+			if (nestjoinOK && enable_material &&
+				!ExecMaterializesOutput(p->pathtype))
+				extra_matpaths = lappend(extra_matpaths,
+										 create_material_path(innerrel, p));
+		}
 	}
 
 	foreach(lc1, outerrel->pathlist)
@@ -1910,21 +2021,39 @@ match_unsorted_outer(PlannerInfo *root,
 								  merge_pathkeys,
 								  jointype,
 								  extra);
+
+			/* RobDP: and the other inner paths, plain and materialized */
+			foreach(lc2, extra_inners)
+				try_nestloop_path(root, joinrel, outerpath,
+								  (Path *) lfirst(lc2), merge_pathkeys,
+								  jointype, extra);
+			foreach(lc2, extra_matpaths)
+				try_nestloop_path(root, joinrel, outerpath,
+								  (Path *) lfirst(lc2), merge_pathkeys,
+								  jointype, extra);
 		}
 
 		/* Can't do anything else if outer path needs to be unique'd */
 		if (save_jointype == JOIN_UNIQUE_OUTER)
 			continue;
 
-		/* Can't do anything else if inner rel is parameterized by outer */
-		if (inner_cheapest_total == NULL)
-			continue;
+		/* Generate merge join paths, unless inner rel is parameterized by outer */
+		if (inner_cheapest_total != NULL)
+			generate_mergejoin_paths(root, joinrel, innerrel, outerpath,
+									 save_jointype, extra, useallclauses,
+									 inner_cheapest_total, merge_pathkeys,
+									 false);
 
-		/* Generate merge join paths */
-		generate_mergejoin_paths(root, joinrel, innerrel, outerpath,
-								 save_jointype, extra, useallclauses,
-								 inner_cheapest_total, merge_pathkeys,
-								 false);
+		/* RobDP: and on the other inner paths */
+		{
+			ListCell   *lc2;
+
+			foreach(lc2, extra_inners)
+				generate_mergejoin_paths(root, joinrel, innerrel, outerpath,
+										 save_jointype, extra, useallclauses,
+										 (Path *) lfirst(lc2), merge_pathkeys,
+										 false);
+		}
 	}
 
 	/*
@@ -1966,6 +2095,18 @@ match_unsorted_outer(PlannerInfo *root,
 			consider_parallel_mergejoin(root, joinrel, outerrel, innerrel,
 										save_jointype, extra,
 										inner_cheapest_total);
+
+		/* RobDP: and on the other parallel-safe inner paths */
+		if (save_jointype != JOIN_UNIQUE_INNER)
+		{
+			ListCell   *lc;
+
+			foreach(lc, robust_extra_paths(root, innerrel,
+										   inner_cheapest_total, true))
+				consider_parallel_mergejoin(root, joinrel, outerrel, innerrel,
+											save_jointype, extra,
+											(Path *) lfirst(lc));
+		}
 	}
 }
 
@@ -2031,9 +2172,14 @@ consider_parallel_nestloop(PlannerInfo *root,
 {
 	JoinType	save_jointype = jointype;
 	ListCell   *lc1;
+	List	   *inner_paths = innerrel->cheapest_parameterized_paths;
 
 	if (jointype == JOIN_UNIQUE_INNER)
 		jointype = JOIN_INNER;
+	else						/* RobDP: see robust_extra_paths */
+		inner_paths = list_concat_copy(inner_paths,
+									   robust_extra_paths(root, innerrel,
+														  NULL, true));
 
 	foreach(lc1, outerrel->partial_pathlist)
 	{
@@ -2051,7 +2197,7 @@ consider_parallel_nestloop(PlannerInfo *root,
 		 * try_partial_nestloop_path.  The cheapest unparameterized path is
 		 * also in this list.
 		 */
-		foreach(lc2, innerrel->cheapest_parameterized_paths)
+		foreach(lc2, inner_paths)
 		{
 			Path	   *innerpath = (Path *) lfirst(lc2);
 			Path	   *mpath;
@@ -2224,6 +2370,8 @@ hash_inner_and_outer(PlannerInfo *root,
 			 */
 			ListCell   *lc1;
 			ListCell   *lc2;
+			List	   *outer_paths;
+			List	   *inner_paths;
 
 			if (cheapest_startup_outer != NULL)
 				try_hashjoin_path(root,
@@ -2234,7 +2382,17 @@ hash_inner_and_outer(PlannerInfo *root,
 								  jointype,
 								  extra);
 
-			foreach(lc1, outerrel->cheapest_parameterized_paths)
+			/* RobDP: and the inputs' other paths (robust_extra_paths) */
+			outer_paths =
+				list_concat_copy(outerrel->cheapest_parameterized_paths,
+								 robust_extra_paths(root, outerrel,
+													NULL, false));
+			inner_paths =
+				list_concat_copy(innerrel->cheapest_parameterized_paths,
+								 robust_extra_paths(root, innerrel,
+													NULL, false));
+
+			foreach(lc1, outer_paths)
 			{
 				Path	   *outerpath = (Path *) lfirst(lc1);
 
@@ -2245,7 +2403,7 @@ hash_inner_and_outer(PlannerInfo *root,
 				if (PATH_PARAM_BY_REL(outerpath, innerrel))
 					continue;
 
-				foreach(lc2, innerrel->cheapest_parameterized_paths)
+				foreach(lc2, inner_paths)
 				{
 					Path	   *innerpath = (Path *) lfirst(lc2);
 
@@ -2283,12 +2441,17 @@ hash_inner_and_outer(PlannerInfo *root,
 			outerrel->partial_pathlist != NIL &&
 			bms_is_empty(joinrel->lateral_relids))
 		{
-			Path	   *cheapest_partial_outer;
-			Path	   *cheapest_partial_inner = NULL;
 			Path	   *cheapest_safe_inner = NULL;
+			List	   *partial_outers;
+			List	   *safe_inners = NIL;
+			ListCell   *lc1;
+			ListCell   *lc2;
 
-			cheapest_partial_outer =
-				(Path *) linitial(outerrel->partial_pathlist);
+			/*
+			 * RobDP: the first partial path of each input, or with retained
+			 * pairing all of them (robust_partial_paths).
+			 */
+			partial_outers = robust_partial_paths(root, outerrel);
 
 			/*
 			 * Can we use a partial inner plan too, so that we can build a
@@ -2299,13 +2462,16 @@ hash_inner_and_outer(PlannerInfo *root,
 				save_jointype != JOIN_UNIQUE_INNER &&
 				enable_parallel_hash)
 			{
-				cheapest_partial_inner =
-					(Path *) linitial(innerrel->partial_pathlist);
-				try_partial_hashjoin_path(root, joinrel,
-										  cheapest_partial_outer,
-										  cheapest_partial_inner,
-										  hashclauses, jointype, extra,
-										  true /* parallel_hash */ );
+				List	   *partial_inners = robust_partial_paths(root,
+																  innerrel);
+
+				foreach(lc1, partial_outers)
+					foreach(lc2, partial_inners)
+						try_partial_hashjoin_path(root, joinrel,
+												  (Path *) lfirst(lc1),
+												  (Path *) lfirst(lc2),
+												  hashclauses, jointype, extra,
+												  true /* parallel_hash */ );
 			}
 
 			/*
@@ -2328,11 +2494,22 @@ hash_inner_and_outer(PlannerInfo *root,
 					get_cheapest_parallel_safe_total_inner(innerrel->pathlist);
 
 			if (cheapest_safe_inner != NULL)
-				try_partial_hashjoin_path(root, joinrel,
-										  cheapest_partial_outer,
-										  cheapest_safe_inner,
-										  hashclauses, jointype, extra,
-										  false /* parallel_hash */ );
+			{
+				safe_inners = list_make1(cheapest_safe_inner);
+				if (save_jointype != JOIN_UNIQUE_INNER)
+					safe_inners = list_concat(safe_inners,
+											  robust_extra_paths(root, innerrel,
+																 cheapest_safe_inner,
+																 true));
+			}
+
+			foreach(lc1, partial_outers)
+				foreach(lc2, safe_inners)
+					try_partial_hashjoin_path(root, joinrel,
+											  (Path *) lfirst(lc1),
+											  (Path *) lfirst(lc2),
+											  hashclauses, jointype, extra,
+											  false /* parallel_hash */ );
 		}
 	}
 }

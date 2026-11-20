@@ -17,8 +17,16 @@
  *				round's relations and paths are then thrown away, as GEQO
  *				does for each join order it tries.
  *	MAIN		PostgreSQL's join search once more, every path with its
- *				vectors, add_path() keeping the paths no other path dominates
- *				in every scenario (pathnode.c).
+ *				vectors.  With robust_select on, add_path() collects every
+ *				candidate and each relation, once complete, keeps the paths
+ *				its objectives select (optimizer/robustselect.h); with it
+ *				off, add_path() keeps the paths no other path dominates in
+ *				every scenario (pathnode.c).
+ *
+ * The envelope has two parts per relation: C*(U, s) of its complete paths
+ * (Gather paths included) and of its partial paths, whose costs are per
+ * worker.  It is recorded for the child joins of partitionwise joins too.
+ * A selecting search runs the envelope pass only if its objectives need it.
  *
  * Planning caches its estimates in long-lived structures that a round must
  * not leave behind: the selectivities and hash bucket statistics in the
@@ -39,10 +47,14 @@
 typedef struct RobustSearch RobustSearch;
 
 extern RobustSearch *robust_search_begin(PlannerInfo *root, List *initial_rels);
+extern bool robust_search_rounds(RobustSearch *rs);
 extern void robust_round_begin(RobustSearch *rs, int s);
 extern void robust_round_record(RobustSearch *rs, RelOptInfo *rel);
 extern void robust_round_end(RobustSearch *rs);
 extern void robust_main_begin(RobustSearch *rs);
+extern void robust_search_finish_rel(RobustSearch *rs, RelOptInfo *rel,
+									 bool top);
+extern void robust_search_child_rel(RobustSearch *rs, RelOptInfo *child);
 extern void robust_dump_pathlist(PlannerInfo *root, RelOptInfo *rel);
 extern void robust_search_end(RobustSearch *rs);
 

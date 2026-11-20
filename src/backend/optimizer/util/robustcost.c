@@ -287,7 +287,36 @@ robust_cost_dominance(void)
 bool
 robust_cost_precheck_off(void)
 {
-	return st != NULL && st->varies && current_pass() == ROBUST_PASS_MAIN;
+	return st != NULL && current_pass() == ROBUST_PASS_MAIN &&
+		(st->varies || robust_cost_collect());
+}
+
+/*
+ * robust_cost_collect
+ *		Do add_path() and add_partial_path() collect every candidate path,
+ *		for the selection at the end of each join level to choose from?  In
+ *		the main pass of a search that selects (robust_select), unless
+ *		robust_dominance prunes the candidates first.
+ */
+bool
+robust_cost_collect(void)
+{
+	return robust_select && !robust_dominance &&
+		current_pass() == ROBUST_PASS_MAIN;
+}
+
+/*
+ * robust_cost_scores_active
+ *		Does compare_path_costs() compare two scored paths by their scores
+ *		(optimizer/robustselect.h)?  Everywhere but in an envelope round,
+ *		where the scalar fields hold the round's costs.
+ */
+bool
+robust_cost_scores_active(void)
+{
+	RobustPass	pass = current_pass();
+
+	return pass != ROBUST_PASS_NONE && pass != ROBUST_PASS_ENVELOPE;
 }
 
 /*

@@ -3532,11 +3532,12 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
  *	  The join search of RobDP (optimizer/robustsearch.h), called by
  *	  standard_join_search in the base pass.
  *
- * Envelope pass (robust_envelope): one round of the search per scenario,
- * in its own memory context, freed at the end of the round with the
- * round's join relations, which are removed from join_rel_list and
+ * Envelope pass (robust_search_rounds): one round of the search per
+ * scenario, in its own memory context, freed at the end of the round with
+ * the round's join relations, which are removed from join_rel_list and
  * join_rel_hash as geqo_eval() does.  Main pass: the search of
- * standard_join_search, add_path() comparing paths per scenario.
+ * standard_join_search, with each relation's paths selected once it is
+ * complete (robust_select), or add_path() comparing paths per scenario.
  *
  * With join_collapse_limit, make_rel_from_joinlist runs one search per
  * subproblem; each starts and ends in the base pass and takes the results
@@ -3550,7 +3551,7 @@ robust_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 	RelOptInfo *rel;
 	int			lev;
 
-	if (robust_envelope)
+	if (robust_search_rounds(rs))
 	{
 		int			savelength = list_length(root->join_rel_list);
 		struct HTAB *savehash = root->join_rel_hash;
@@ -3582,13 +3583,9 @@ robust_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 				{
 					rel = (RelOptInfo *) lfirst(lc);
 
-					/* As in standard_join_search */
+					/* As in standard_join_search, and record C*(rel, s) */
 					generate_partitionwise_join_paths(root, rel);
-					if (!bms_equal(rel->relids, root->all_query_rels))
-						generate_useful_gather_paths(root, rel, false);
-					set_cheapest(rel);
-
-					robust_round_record(rs, rel);
+					robust_search_finish_rel(rs, rel, lev == levels_needed);
 				}
 			}
 
@@ -3620,13 +3617,9 @@ robust_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 		{
 			rel = (RelOptInfo *) lfirst(lc);
 
+			/* As in standard_join_search, selecting the paths kept */
 			generate_partitionwise_join_paths(root, rel);
-			if (!bms_equal(rel->relids, root->all_query_rels))
-				generate_useful_gather_paths(root, rel, false);
-			set_cheapest(rel);
-
-			if (robust_debug_dump)
-				robust_dump_pathlist(root, rel);
+			robust_search_finish_rel(rs, rel, lev == levels_needed);
 		}
 	}
 
@@ -4485,7 +4478,10 @@ generate_partitionwise_join_paths(PlannerInfo *root, RelOptInfo *rel)
 		}
 
 		/* Else, identify the cheapest path for it. */
-		set_cheapest(child_rel);
+		if (root->robust_search != NULL)
+			robust_search_child_rel(root->robust_search, child_rel);
+		else
+			set_cheapest(child_rel);
 
 		/* Dummy children need not be scanned, so ignore those. */
 		if (IS_DUMMY_REL(child_rel))

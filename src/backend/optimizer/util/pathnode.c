@@ -32,6 +32,7 @@
 #include "optimizer/restrictinfo.h"
 #include "optimizer/robust.h"
 #include "optimizer/robustcost.h"
+#include "optimizer/robustselect.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
@@ -77,6 +78,18 @@ static bool ris_contain_references_to(PlannerInfo *root, List *rinfos,
 int
 compare_path_costs(Path *path1, Path *path2, CostSelector criterion)
 {
+	/* RobDP: two paths the selection scored, by their scores first */
+	if (enable_rows_dist &&
+		path1->robust != NULL && path1->robust->scored &&
+		path2->robust != NULL && path2->robust->scored &&
+		robust_cost_scores_active())
+	{
+		int			cmp = robust_select_compare(path1, path2, criterion);
+
+		if (cmp != 0)
+			return cmp;
+	}
+
 	if (criterion == STARTUP_COST)
 	{
 		if (path1->startup_cost < path2->startup_cost)
@@ -569,6 +582,13 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 	if (enable_rows_dist)
 		robust_cost_add_path(new_path, false);
 
+	/* RobDP: every candidate, for the selection (optimizer/robustselect.h) */
+	if (enable_rows_dist && robust_cost_collect())
+	{
+		(void) robust_select_offer(&parent_rel->pathlist, new_path);
+		return;
+	}
+
 	/* RobDP: compare per scenario (see robust_compare_costs) */
 	robust = enable_rows_dist && robust_cost_dominance();
 	new_robust = robust && robust_has_vectors(new_path);
@@ -927,12 +947,19 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 	if (enable_rows_dist)
 		robust_cost_add_path(new_path, true);
 
+	/* Relation should be OK for parallelism, too. */
+	Assert(parent_rel->consider_parallel);
+
+	/* RobDP: every candidate, for the selection (optimizer/robustselect.h) */
+	if (enable_rows_dist && robust_cost_collect())
+	{
+		(void) robust_select_offer(&parent_rel->partial_pathlist, new_path);
+		return;
+	}
+
 	/* RobDP: compare per scenario (see robust_compare_costs) */
 	robust = enable_rows_dist && robust_cost_dominance();
 	new_robust = robust && robust_has_vectors(new_path);
-
-	/* Relation should be OK for parallelism, too. */
-	Assert(parent_rel->consider_parallel);
 
 	/*
 	 * As in add_path, throw out any paths which are dominated by the new

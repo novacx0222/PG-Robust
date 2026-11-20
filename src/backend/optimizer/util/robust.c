@@ -27,6 +27,15 @@ char	   *error_profile_path = NULL;
 bool		robust_debug_dump = false;
 bool		robust_search = true;
 bool		robust_envelope = true;
+bool		robust_select = true;
+bool		robust_dominance = false;
+int			robust_join_pairing = ROBUST_PAIRING_RETAINED;
+int			add_path_limit = 1;
+int			retain_path_limit = 1;
+int			robust_final_path_limit = 1;
+int			main_objective_id = 0;
+int			retain_strategy_id = 0;
+double		robust_penalty_tau = 0.2;
 
 const char *
 robust_pass_name(RobustPass pass)

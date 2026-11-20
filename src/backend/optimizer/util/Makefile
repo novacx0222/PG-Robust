@@ -31,6 +31,7 @@ OBJS = \
 	robustrows.o \
 	robustsample.o \
 	robustsearch.o \
+	robustselect.o \
 	robustvec.o \
 	tlist.o \
 	var.o
