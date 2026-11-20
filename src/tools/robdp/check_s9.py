@@ -25,7 +25,8 @@ objective (get_cheapest_fractional_path).
       of the rows in s, envelope = the cheapest F(s) of the candidates, the
       main objective's scores, the pick; the candidates are the final
       relation's paths, their costs raised by the initPlans' cost
-      (charge events: u22 .. u24)
+      (charge events: u22 .. u24) and by the targets put into them in
+      place (project events: u25, u26)
   U5  the scan/join relation's scoring (keep events of the upper pass)
       recomputed against its own envelope; it covers the top Gather paths
       and the only relation of queries without joins
@@ -43,6 +44,7 @@ import sys
 
 import common
 import compare
+import objectives
 from check_s4 import PROFILES, EXTRA, RESULTS, all_events, dump, make_profile_dirs, same_as_stock, vec, \
     report
 from check_s6 import PARALLEL, close, rows_agree, signatures
@@ -86,11 +88,18 @@ S9_QUERIES = {
                     'AND t2.b < (SELECT max(b) FROM t3 WHERE t3.a < 5)',
     'u24_initplan_limit': 'SELECT t1.a, count(*) FROM t1 JOIN t2 ON t2.fk = t1.id WHERE t1.a < 10 GROUP BY t1.a '
                           'HAVING count(*) > (SELECT count(*) / 100 FROM t3) ORDER BY t1.a LIMIT 5',
+    # targets put into paths in place (apply_projection_to_path): a volatile
+    # column evaluated after the sort, set-returning functions
+    'u25_volatile_order': 'SELECT t1.id, t2.b + random() FROM t1 JOIN t2 ON t2.fk = t1.id WHERE t1.a < 10 '
+                          'ORDER BY t1.id LIMIT 20',
+    'u26_srf_order': 'SELECT t1.id, generate_series(1, t2.b % 3) FROM t1 JOIN t2 ON t2.fk = t1.id '
+                     'WHERE t1.a < 10 ORDER BY t1.id',
 }
 # upper path types replay does not know (status unsupported where they vary)
 UNKNOWN = ('GroupingSets', 'RecursiveUnion')
 LIMIT_QUERIES = ('q41_order_limit', 'f4_order', 'u04_order_limit', 'u14_limit_join3', 'u16_sub_group_limit',
-                 'u19_limit_nojoin', 'u22_cte_limit', 'u24_initplan_limit')
+                 'u19_limit_nojoin', 'u22_cte_limit', 'u24_initplan_limit',
+                 'u25_volatile_order')
 
 
 def make_s9_queries():
@@ -251,20 +260,15 @@ def check_final(where, fe, paths, cfg, st):
         bad.append(('U4', '%s: vectors %s, recomputed %s' % (where, fe['vectors'], vectors)))
         return
     fr, tau, oid = fe['fraction'], cfg['tau'], cfg['main']
+    lam, alpha = cfg.get('lam') or 1.0, cfg.get('alpha') or 0.85
+    how = objectives.loss(oid)
     F = [[fractional(c, fr, s) for s in range(N)] for c in cands]
     env = [min(f[s] for f in F) for s in range(N)]
     scores, keys = [], []
     for i, c in enumerate(cands):
-        xs = []
-        for s in range(N):
-            f = F[i][s]
-            if oid in (0, 1):
-                xs.append(f - env[s] if f > env[s] * (1.0 + tau) else 0.0)
-            elif oid in (2, 3):
-                xs.append(f)
-            else:
-                xs.append(vec(c['startup'], N)[s])
-        sc = vmax(xs) if oid in (0, 2, 4) else mean(xs)
+        st_ = vec(c['startup'], N)
+        xs = [objectives.loss_at(how, F[i][s], st_[s], env[s], tau) for s in range(N)]
+        sc = fractional(c, fr) if how == 'point' else objectives.aggregate(objectives.agg(oid), xs, lam, alpha)
         scores.append(sc)
         keys.append((sc, mean(F[i]), fractional(c, fr), c['startup_point'], i))
     if scores != fe['scores']:
@@ -295,7 +299,8 @@ def check_upper_keep(where, k, paths, cfg, st):
     if not k['partial'] and any(c['param'] is None for c in cands):
         pool = [c for c in cands if c['param'] is None]
     env = [min(vec(c['total'], N)[s] for c in pool) for s in range(N)]
-    main = [objective(cfg['main'], c, env, cfg['tau']) for c in cands]
+    main = [objective(cfg['main'], c, env, cfg['tau'], cfg.get('lam') or 1.0, cfg.get('alpha') or 0.85)
+            for c in cands]
     if main != k['main']:
         bad.append(('U5', '%s: scores %s, recomputed %s' % (where, k['main'], main)))
         return
@@ -309,7 +314,7 @@ def check_upper_keep(where, k, paths, cfg, st):
     st['upper_single'] += ' ' not in (k['rels'] or '')
 
 
-def check_planning(where, evs, cfg, st):
+def check_planning(where, evs, cfg, st, on_final=None):
     paths = {}
     for e in evs:
         if e['ev'] == 'path':
@@ -334,15 +339,32 @@ def check_planning(where, evs, cfg, st):
                 p['total'] = [x + c for x in vec(p['total'], N)]
                 paths[i] = p
             st['charges'] += 1
+        elif e['ev'] == 'project':
+            # apply_projection_to_path: a target put into the path in place
+            i = e['id']
+            if i not in paths:
+                st['problems'].append(('U4', '%s: projected path %d without a path event' % (where, i)))
+                continue
+            p = dict(paths[i])
+            ds, dt = e['startup'], e['per_tuple']
+            rows = vec(p['rows'], N)
+            p['startup'] = [x + ds for x in vec(p['startup'], N)]
+            p['total'] = [x + (ds + dt * r) for x, r in zip(vec(p['total'], N), rows)]
+            p['startup_point'] += ds
+            p['total_point'] += ds + dt * p['rows_point']
+            paths[i] = p
+            st['projects'] += 1
         elif e['ev'] == 'final':
             check_final(where, e, paths, cfg, st)
+            if on_final:
+                on_final(e, paths)
         elif e['ev'] == 'keep' and e['pass'] == 'upper':
             check_upper_keep('%s %s%s' % (where, e['rels'], ' partial' if e['partial'] else ''), e, paths, cfg, st)
 
 
 def new_stats():
     return dict(problems=[], upper={}, finals=0, final_cands=0, picked=0, differs=0, fraction=0,
-                upper_keeps=0, upper_gathers=0, upper_single=0, charges=0)
+                upper_keeps=0, upper_gathers=0, upper_single=0, charges=0, projects=0)
 
 
 # ------------------------------------------------------------------ main
@@ -441,11 +463,12 @@ def main():
     allok &= report('U3', not probs('U3') and statuses.get('replay', 0) > 0,
                     'upper paths: %s; groups from %s' % (statuses, groups)
                     if not probs('U3') else '; '.join(probs('U3')[:5]))
-    allok &= report('U4', not probs('U4') and total['picked'] > 0 and total['charges'] > 0,
+    allok &= report('U4', not probs('U4') and total['picked'] > 0 and total['charges'] > 0 and total['projects'] > 0,
                     '%d final picks of %d candidates recomputed exactly (%d with vectors, %d fractional, '
-                    '%d final relations charged for initPlans); %d differ from PostgreSQL\'s'
+                    '%d final relations charged for initPlans, %d targets put into paths in place); '
+                    '%d differ from PostgreSQL\'s'
                     % (total['finals'], total['final_cands'], total['picked'], total['fraction'],
-                       total['charges'], total['differs'])
+                       total['charges'], total['projects'], total['differs'])
                     if not probs('U4') else '; '.join(probs('U4')[:5]))
     allok &= report('U5', not probs('U5') and total['upper_keeps'] > 0 and total['upper_gathers'] > 0
                     and total['upper_single'] > 0,

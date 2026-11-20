@@ -3013,6 +3013,8 @@ apply_projection_to_path(PlannerInfo *root,
 	 * We can just jam the desired tlist into the existing path, being sure to
 	 * update its cost estimates appropriately.
 	 */
+	if (enable_rows_dist)
+		robust_cost_project(root, path, target);
 	oldcost = path->pathtarget->cost;
 	path->pathtarget = target;
 

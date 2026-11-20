@@ -592,6 +592,81 @@ robust_cost_limit_ests(LimitPath *path, int64 offset_est, int64 count_est)
 	u->count_est = count_est;
 }
 
+static RobustPathCost *compute(PlannerInfo *root, Path *path, bool partial);
+
+/*
+ * robust_cost_project
+ *		apply_projection_to_path() is about to put 'target' into 'path' in
+ *		place, raising its startup cost by the change of the target's
+ *		startup cost and its total cost by that plus the change per tuple
+ *		times its rows: do it in every scenario, with the scenario's rows.
+ *		A path not costed yet (a GatherMerge just built) is costed first,
+ *		with the target and input it was built with.  The vectors are
+ *		replaced, not changed, as another path may share them; the expected
+ *		costs follow.  A "project" dump event gives the changes.
+ */
+void
+robust_cost_project(PlannerInfo *root, Path *path, PathTarget *target)
+{
+	RobustPathCost *rc;
+	Cost		dstartup;
+	Cost		dtuple;
+
+	if (st == NULL || root->robust_pass == ROBUST_PASS_ENVELOPE)
+		return;
+	rc = compute(root, path, false);
+	dstartup = target->cost.startup - path->pathtarget->cost.startup;
+	dtuple = target->cost.per_tuple - path->pathtarget->cost.per_tuple;
+	if (dstartup == 0 && dtuple == 0)
+		return;
+	if (rc->startup != NULL)
+	{
+		RobustVec  *v = robust_vec_copy(rc->startup);
+
+		for (int s = 0; s < v->n; s++)
+			v->v[s] += dstartup;
+		rc->startup = v;
+	}
+	if (rc->total != NULL || (rc->rows != NULL && dtuple != 0))
+	{
+		int			N = error_sample_count;
+		RobustVec  *v = robust_vec_make(N);
+
+		for (int s = 0; s < N; s++)
+		{
+			double		total = rc->total ? robust_vec_at(rc->total, s) :
+				path->total_cost;
+			double		rows = rc->rows ? robust_vec_at(rc->rows, s) :
+				path->rows;
+
+			rows *= dtuple;
+			rows += dstartup;	/* not fused: the gates recompute it */
+			v->v[s] = total + rows;
+		}
+		rc->total = v;
+	}
+	if (rc->scored)
+	{
+		double		add = dtuple * path->rows;
+
+		add += dstartup;
+		rc->mean_startup = rc->startup ? robust_vec_mean(rc->startup) :
+			path->startup_cost + dstartup;
+		rc->mean_total = rc->total ? robust_vec_mean(rc->total) :
+			path->total_cost + add;
+	}
+	if (robust_dumping(root))
+	{
+		RobustDump	d;
+
+		robust_dump_begin(&d, "project");
+		robust_dump_int(&d, "id", rc->id);
+		robust_dump_double(&d, "startup", dstartup);
+		robust_dump_double(&d, "per_tuple", dtuple);
+		robust_dump_end(&d);
+	}
+}
+
 /*
  * robust_cost_charge
  *		SS_charge_for_initplans() has added the cost of the query level's
@@ -655,7 +730,6 @@ robust_cost_charge(PlannerInfo *root, RelOptInfo *final_rel, Cost cost)
 	pfree(ids.data);
 }
 
-static RobustPathCost *compute(PlannerInfo *root, Path *path, bool partial);
 
 /*
  * The bound grouping_planner gives create_ordered_paths for its sorts: the
@@ -2401,7 +2475,14 @@ replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 	R.root = root;
 	R.path = path;
 	R.size = path_size(path);
+	/*
+	 * A sort's bound: the LIMIT's for the sorts of the ordered relation, as
+	 * create_ordered_paths is given it; none elsewhere
+	 */
 	R.limit_tuples = -1.0;
+	if ((IsA(path, SortPath) || IsA(path, IncrementalSortPath)) &&
+		is_upper_rel(root, path->parent, UPPERREL_ORDERED))
+		(void) ordered_limit(root, &R.limit_tuples);
 
 	/*
 	 * The inputs first (those of a partial path, or of a Gather, are partial:
@@ -2526,13 +2607,31 @@ replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 			(IsA(path, AggPath) || IsA(path, GroupPath) ||
 			 IsA(path, UpperUniquePath)))
 		{
-			/* the first source of the groups that gives the point */
+			/*
+			 * The first source of the groups that gives the point.  A
+			 * partial aggregation's finalize step counts them from the rows
+			 * of the relation grouped (create_ordinary_grouping_paths: its
+			 * cheapest path's), which its input, the Gather of the partial
+			 * groups, may give at the point too.
+			 */
+			static const RobustGroups order[] = {
+				ROBUST_GROUPS_EST_SUB, ROBUST_GROUPS_EST_INPUT,
+				ROBUST_GROUPS_SUB_ROWS, ROBUST_GROUPS_INPUT_ROWS,
+				ROBUST_GROUPS_FROZEN};
+			static const RobustGroups final_order[] = {
+				ROBUST_GROUPS_EST_INPUT, ROBUST_GROUPS_EST_SUB,
+				ROBUST_GROUPS_SUB_ROWS, ROBUST_GROUPS_INPUT_ROWS,
+				ROBUST_GROUPS_FROZEN};
+			const RobustGroups *o = IsA(path, AggPath) &&
+				DO_AGGSPLIT_COMBINE(((AggPath *) path)->aggsplit) ?
+				final_order : order;
+
 			ok = false;
-			for (int g = ROBUST_GROUPS_EST_SUB; g <= ROBUST_GROUPS_FROZEN && !ok; g++)
+			for (int i = 0; i < lengthof(order) && !ok; i++)
 			{
-				if (!groups_available(&R, (RobustGroups) g))
+				if (!groups_available(&R, o[i]))
 					continue;
-				R.groups = (RobustGroups) g;
+				R.groups = o[i];
 				ok = reproduces(&R);
 			}
 		}
@@ -2540,14 +2639,6 @@ replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 			ok = reproduces(&R);
 		rc->groups = ok ? R.groups : ROBUST_GROUPS_NONE;
 
-		if (!ok && (IsA(path, SortPath) || IsA(path, IncrementalSortPath)))
-		{
-			R.limit_tuples = root->limit_tuples;
-			ok = reproduces(&R);
-			if (!ok && is_upper_rel(root, path->parent, UPPERREL_ORDERED) &&
-				ordered_limit(root, &R.limit_tuples))
-				ok = reproduces(&R);
-		}
 		if (!ok && IsA(path, SubqueryScanPath))
 		{
 			R.trivial = true;

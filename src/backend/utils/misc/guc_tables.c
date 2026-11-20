@@ -3639,9 +3639,13 @@ struct config_int ConfigureNamesInt[] =
 	},
 	{
 		{"main_objective_id", PGC_USERSET, DEVELOPER_OPTIONS,
-			gettext_noop("Sets the objective RobDP keeps join paths by (v20 numbering)."),
+			gettext_noop("Sets the objective RobDP keeps join paths and picks the plan by (v20 numbering)."),
 			gettext_noop("0 worst penalty, 1 expected penalty, 2 worst total cost, "
-						 "3 expected total cost, 4 worst startup cost, 5 expected startup cost."),
+						 "3 expected total cost, 4 worst startup cost, 5 expected startup cost, "
+						 "6 penalty probability (1 - ProbNoPenalty), 8 point estimate, "
+						 "10 worst penalty + lambda stdev, 11 expected penalty + lambda stdev, "
+						 "12 alpha-quantile penalty, 17 alpha-quantile total cost, "
+						 "18 alpha-quantile startup cost."),
 			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
 		},
 		&main_objective_id,
@@ -3650,13 +3654,14 @@ struct config_int ConfigureNamesInt[] =
 	},
 	{
 		{"retain_strategy_id", PGC_USERSET, DEVELOPER_OPTIONS,
-			gettext_noop("Sets the objective of RobDP's retain strategy (v20 numbering)."),
-			NULL,
+			gettext_noop("Sets the objective or diversification function of RobDP's retain strategy (v20 numbering)."),
+			gettext_noop("An objective of main_objective_id, or 7 random, 13 similarity, "
+						 "14 mix, 15 expected penalty per join method, 16 expected cost per join method."),
 			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
 		},
 		&retain_strategy_id,
 		0, 0, ROBUST_OBJECTIVE_MAX,
-		check_robust_objective, NULL, NULL
+		check_robust_strategy, NULL, NULL
 	},
 
 	/* End-of-list marker */
@@ -3959,6 +3964,26 @@ struct config_real ConfigureNamesReal[] =
 		},
 		&robust_penalty_tau,
 		0.2, 0.0, 1000.0,
+		NULL, NULL, NULL
+	},
+	{
+		{"robust_penalty_lambda", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the weight of the standard deviation of the penalty in RobDP's objectives 10 and 11."),
+			NULL,
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&robust_penalty_lambda,
+		1.0, 0.0, 1000.0,
+		NULL, NULL, NULL
+	},
+	{
+		{"robust_quantile_alpha", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Sets the quantile of RobDP's quantile objectives (12, 17, 18)."),
+			gettext_noop("0.85 with 20 samples is v20's 4th worst."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&robust_quantile_alpha,
+		0.85, 0.01, 1.0,
 		NULL, NULL, NULL
 	},
 

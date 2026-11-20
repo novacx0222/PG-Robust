@@ -48,6 +48,7 @@ import subprocess
 import sys
 
 import common
+import objectives
 from check_s4 import PROFILES, EXTRA, RESULTS, all_events, dump, make_profile_dirs, robust_sets, \
     same_as_stock, vec, report
 from check_s6 import PARALLEL
@@ -92,12 +93,14 @@ def make_queries():
 
 
 def s8_sets(prof, main=0, retain=0, limit=1, rlimit=1, final=1, pairing='retained', dominance=False,
-            tau=0.2, envelope=True, debug=True):
+            tau=0.2, envelope=True, debug=True, lam=None, alpha=None):
+    more = [] if lam is None else ['robust_penalty_lambda=%r' % lam]
+    more += [] if alpha is None else ['robust_quantile_alpha=%r' % alpha]
     return robust_sets(os.path.join(PROFILES, prof), search=True, debug=debug, more=[
         'robust_select=on', 'main_objective_id=%d' % main, 'retain_strategy_id=%d' % retain,
         'add_path_limit=%d' % limit, 'retain_path_limit=%d' % rlimit, 'robust_final_path_limit=%d' % final,
         'robust_join_pairing=' + pairing, 'robust_dominance=' + ('on' if dominance else 'off'),
-        'robust_penalty_tau=%r' % tau, 'robust_envelope=' + ('on' if envelope else 'off')])
+        'robust_penalty_tau=%r' % tau, 'robust_envelope=' + ('on' if envelope else 'off')] + more)
 
 
 def runs(install, sets, tag, light=False):
@@ -128,24 +131,13 @@ def vmax(v):
     return m
 
 
-def objective(oid, p, env, tau):
-    """robustselect.c objective(), in the same order of operations"""
-    if oid in (0, 1):
-        t = vec(p['total'], N)
-        pen = []
-        for s in range(N):
-            if env is None or math.isnan(env[s]):
-                pen.append(0.0)
-                continue
-            e = env[s]
-            pen.append(t[s] - e if t[s] > e * (1.0 + tau) else 0.0)
-        return vmax(pen) if oid == 0 else mean(pen)
-    v = vec(p['total'] if oid in (2, 3) else p['startup'], N)
-    return vmax(v) if oid in (2, 4) else mean(v)
+def objective(oid, p, env, tau, lam=1.0, alpha=0.85):
+    """robustselect.c objective() (objectives.py)"""
+    return objectives.objective(oid, p, env, tau, lam, alpha, N)
 
 
 def needs_env(oid):
-    return oid in (0, 1)
+    return objectives.needs_env(oid)
 
 
 # ------------------------------------------------------------- G2 .. G4
@@ -164,6 +156,7 @@ class Stats:
         self.noenv = 0              # selections without an envelope under an envelope objective
         self.level1 = 0             # level-1 selections (scored only)
         self.pathlists = 0
+        self.dv_picks = 0           # paths a diversification function retained
         self.problems = []
 
 
@@ -220,14 +213,16 @@ def check_keep(name, k, paths, env, cfg, st):
         st.child += 1
         st.child_env += k['envelope']
     # scores
-    main = [objective(cfg['main'], p, ev, cfg['tau']) for p in cands]
+    lam, alpha = cfg.get('lam') or 1.0, cfg.get('alpha') or 0.85
+    main = [objective(cfg['main'], p, ev, cfg['tau'], lam, alpha) for p in cands]
     if main != k['main']:
         i = next(j for j in range(n) if main[j] != k['main'][j])
         bad.append(('G2', '%s: main score of %d: %r, recomputed %r' % (where, ids[i], k['main'][i], main[i])))
         return
     ret = None
-    if retain > 0:
-        ret = [objective(cfg['retain'], p, ev, cfg['tau']) for p in cands]
+    dv = cfg['retain'] in objectives.DIVERSIFIERS
+    if retain > 0 and not dv:
+        ret = [objective(cfg['retain'], p, ev, cfg['tau'], lam, alpha) for p in cands]
         if ret != k['retain_score']:
             bad.append(('G2', '%s: retain scores differ' % where))
             return
@@ -237,7 +232,27 @@ def check_keep(name, k, paths, env, cfg, st):
     by = ['no'] * n
     for i in order[:limit]:
         by[i] = 'main'
-    if retain > 0 and limit < n:
+    if retain > 0 and limit < n and dv:
+        rest = [i for i in range(n) if by[i] == 'no']
+        rs = k['retain_score']
+        draws = [rs[i] for i in rest] if cfg['retain'] == 7 else None
+        if draws is not None and not all(0.0 <= d < 1.0 for d in draws):
+            bad.append(('G2', '%s: Rand draws outside [0, 1): %s' % (where, draws)))
+            return
+        picks = objectives.diversify(cfg['retain'], cands, rest, retain, ev, cfg, k.get('ops'), draws, N)
+        for i in picks:
+            by[i] = 'retain'
+        if cfg['retain'] != 7:
+            want = [0.0] * n
+            for i in rest:
+                want[i] = -1.0
+            for j, i in enumerate(picks):
+                want[i] = float(j)
+            if want != [float(x) for x in rs]:
+                bad.append(('G2', '%s: pick order %s, recomputed %s' % (where, rs, want)))
+                return
+        st.dv_picks += len(picks)
+    elif retain > 0 and limit < n:
         rest = sorted((i for i in range(n) if by[i] == 'no'), key=lambda i: (ret[i], mt[i]) + pt[i] + (i,))
         for i in rest[:retain]:
             by[i] = 'retain'
@@ -281,6 +296,11 @@ def check_pathlist(name, pl, paths, last_keep, st):
         if p['type'] in ('Gather', 'GatherMerge'):
             st.gathers += 1
             sub = p['children'][0] if p['children'] else None
+            # generate_useful_gather_paths sorts a kept partial path for a
+            # Gather Merge without offering the sort to add_partial_path
+            if sub in paths and paths[sub]['type'] in ('Sort', 'IncrementalSort') and \
+                    (kp is None or sub not in kp['cands']) and paths[sub]['children']:
+                sub = paths[sub]['children'][0]
             if kp is None or sub not in kp['kept']:
                 bad.append(('G4', '%s %s: %s %d on partial path %s, not kept' % (name, rels, p['type'], i, sub)))
 
@@ -356,9 +376,9 @@ def g5(install):
     """(ok, detail)"""
     common.start(install)
     msgs = []
-    _, err = common.psql('SET main_objective_id = 6;', install, on_error_stop=False)
+    _, err = common.psql('SET main_objective_id = 9;', install, on_error_stop=False)
     ok = 'not implemented' in err
-    msgs.append('objective 6 %s' % ('rejected' if ok else 'ACCEPTED: ' + err.strip()[-200:]))
+    msgs.append('objective 9 %s' % ('rejected' if ok else 'ACCEPTED: ' + err.strip()[-200:]))
     q = dict(common.load_queries())['q05_chain4']
     sets = common.parse_sets(s8_sets('lognormal', envelope=False, debug=False))
     _, err = common.psql(sets + '\nEXPLAIN %s;\n' % q, install, on_error_stop=False)

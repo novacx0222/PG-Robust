@@ -540,7 +540,7 @@ robust_search_rounds(RobustSearch *rs)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("the objectives of RobDP's selection need the envelope pass"),
-				 errhint("Set robust_envelope on, or choose objectives 2 to 5.")));
+				 errhint("Set robust_envelope on, or choose a main objective among 2-5, 8, 17, 18 and a retain strategy among those or 7, 16.")));
 	return needed;
 }
 

@@ -13,8 +13,10 @@
  */
 #include "postgres.h"
 
+#include <float.h>
 #include <math.h>
 
+#include "common/pg_prng.h"
 #include "nodes/bitmapset.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
@@ -24,14 +26,49 @@
 #include "utils/guc.h"
 #include "utils/json.h"
 
-/* The objectives implemented, in v20's numbering */
+/*
+ * The objectives and diversification functions, in v20's numbering (see
+ * optimizer/robustselect.h).  9 (v20's "jointype-based score") was never
+ * implemented, in v20 either.
+ */
 #define OBJ_WORST_PENALTY		0
 #define OBJ_EXPECTED_PENALTY	1
 #define OBJ_WORST_TOTAL			2
 #define OBJ_EXPECTED_TOTAL		3
 #define OBJ_WORST_STARTUP		4
 #define OBJ_EXPECTED_STARTUP	5
-#define OBJ_LAST_IMPLEMENTED	OBJ_EXPECTED_STARTUP
+#define OBJ_PENALTY_PROB		6	/* 1 - ProbNoPenalty */
+#define DV_RANDOM				7
+#define OBJ_POINT_TOTAL			8
+#define OBJ_WORST_PENALTY_STD	10
+#define OBJ_EXPECTED_PENALTY_STD 11
+#define OBJ_QUANTILE_PENALTY	12
+#define DV_SIMILARITY			13
+#define DV_MIX					14
+#define DV_PENALTY_JOIN			15
+#define DV_COST_JOIN			16
+#define OBJ_QUANTILE_TOTAL		17
+#define OBJ_QUANTILE_STARTUP	18
+
+/* What an objective measures in each scenario ... */
+typedef enum Loss
+{
+	LOSS_PENALTY,				/* Penalty(s) */
+	LOSS_EXCESS,				/* 1 if Penalty(s) > 0, else 0 */
+	LOSS_TOTAL,					/* total(s) */
+	LOSS_STARTUP,				/* startup(s) */
+	LOSS_POINT,					/* PostgreSQL's estimate */
+} Loss;
+
+/* ... and how it sums the scenarios up */
+typedef enum Agg
+{
+	AGG_MAX,					/* the largest (from 0, as v20) */
+	AGG_MEAN,
+	AGG_MEAN_STD,				/* mean + lambda * standard deviation */
+	AGG_MAX_STD,				/* max + lambda * standard deviation */
+	AGG_QUANTILE,				/* the alpha-quantile */
+} Agg;
 
 /* Why a path was kept (the "by" of the keep event) */
 typedef enum KeptBy
@@ -47,7 +84,9 @@ typedef struct Cand
 	Path	   *path;
 	int			pos;			/* position among the candidates */
 	double		main;			/* main objective */
-	double		retain;			/* retain strategy */
+	double		retain;			/* retain strategy: its score, or for a
+								 * diversification function the order it
+								 * picks in (-1: not reached) */
 	double		mean_startup;
 	double		mean_total;
 	KeptBy		by;
@@ -55,24 +94,120 @@ typedef struct Cand
 
 /* --------------------------------------------------------------- GUC */
 
+/* An objective: a score per path, the lower the better */
+static bool
+is_objective(int id)
+{
+	switch (id)
+	{
+		case OBJ_WORST_PENALTY:
+		case OBJ_EXPECTED_PENALTY:
+		case OBJ_WORST_TOTAL:
+		case OBJ_EXPECTED_TOTAL:
+		case OBJ_WORST_STARTUP:
+		case OBJ_EXPECTED_STARTUP:
+		case OBJ_PENALTY_PROB:
+		case OBJ_POINT_TOTAL:
+		case OBJ_WORST_PENALTY_STD:
+		case OBJ_EXPECTED_PENALTY_STD:
+		case OBJ_QUANTILE_PENALTY:
+		case OBJ_QUANTILE_TOTAL:
+		case OBJ_QUANTILE_STARTUP:
+			return true;
+	}
+	return false;
+}
+
+/* A diversification function: picks a set of paths, has no score */
+static bool
+is_diversifier(int id)
+{
+	switch (id)
+	{
+		case DV_RANDOM:
+		case DV_SIMILARITY:
+		case DV_MIX:
+		case DV_PENALTY_JOIN:
+		case DV_COST_JOIN:
+			return true;
+	}
+	return false;
+}
+
 bool
 check_robust_objective(int *newval, void **extra, GucSource source)
 {
-	if (*newval > OBJ_LAST_IMPLEMENTED)
-	{
-		GUC_check_errdetail("Objective %d is not implemented; objectives 0 to %d are.",
-							*newval, OBJ_LAST_IMPLEMENTED);
-		return false;
-	}
-	return true;
+	if (is_objective(*newval))
+		return true;
+	if (is_diversifier(*newval))
+		GUC_check_errdetail("%d is a diversification function; it can be the retain strategy (retain_strategy_id) only.",
+							*newval);
+	else
+		GUC_check_errdetail("Objective %d is not implemented.", *newval);
+	return false;
 }
 
-/* Does the objective compare paths to the envelope? */
+bool
+check_robust_strategy(int *newval, void **extra, GucSource source)
+{
+	if (is_objective(*newval) || is_diversifier(*newval))
+		return true;
+	GUC_check_errdetail("Strategy %d is not implemented.", *newval);
+	return false;
+}
+
+static Loss
+objective_loss(int id)
+{
+	switch (id)
+	{
+		case OBJ_PENALTY_PROB:
+			return LOSS_EXCESS;
+		case OBJ_WORST_TOTAL:
+		case OBJ_EXPECTED_TOTAL:
+		case OBJ_QUANTILE_TOTAL:
+			return LOSS_TOTAL;
+		case OBJ_WORST_STARTUP:
+		case OBJ_EXPECTED_STARTUP:
+		case OBJ_QUANTILE_STARTUP:
+			return LOSS_STARTUP;
+		case OBJ_POINT_TOTAL:
+			return LOSS_POINT;
+	}
+	return LOSS_PENALTY;
+}
+
+static Agg
+objective_agg(int id)
+{
+	switch (id)
+	{
+		case OBJ_WORST_PENALTY:
+		case OBJ_WORST_TOTAL:
+		case OBJ_WORST_STARTUP:
+			return AGG_MAX;
+		case OBJ_WORST_PENALTY_STD:
+			return AGG_MAX_STD;
+		case OBJ_EXPECTED_PENALTY_STD:
+			return AGG_MEAN_STD;
+		case OBJ_QUANTILE_PENALTY:
+		case OBJ_QUANTILE_TOTAL:
+		case OBJ_QUANTILE_STARTUP:
+			return AGG_QUANTILE;
+	}
+	return AGG_MEAN;
+}
+
+/* Does the objective or diversification function use the envelope? */
 bool
 robust_objective_needs_envelope(int objective)
 {
-	return objective == OBJ_WORST_PENALTY ||
-		objective == OBJ_EXPECTED_PENALTY;
+	if (is_diversifier(objective))
+		return objective != DV_RANDOM && objective != DV_COST_JOIN;
+	if (!is_objective(objective))
+		return false;
+	return objective_loss(objective) == LOSS_PENALTY ||
+		objective_loss(objective) == LOSS_EXCESS;
 }
 
 /* Is the main pass building joins from every path its inputs keep? */
@@ -93,9 +228,9 @@ at(const RobustVec *v, double scalar, int s)
 }
 
 /*
- * Mean and maximum of a vector, the scalar standing for a vector of N
- * copies.  The sums run over s = 0 .. N-1 in order, so the test harness
- * computes the same doubles.  The maximum starts at 0, as in v20.
+ * Mean of a vector, the scalar standing for a vector of N copies.  The sums
+ * run over s = 0 .. N-1 in order, so the test harness computes the same
+ * doubles.
  */
 static double
 vec_mean(const RobustVec *v, double scalar)
@@ -107,79 +242,115 @@ vec_mean(const RobustVec *v, double scalar)
 	return sum / error_sample_count;
 }
 
-static double
-vec_max(const RobustVec *v, double scalar)
+static int
+cmp_double(const void *a, const void *b)
 {
-	double		m = 0.0;
+	double		x = *(const double *) a;
+	double		y = *(const double *) b;
 
-	for (int s = 0; s < error_sample_count; s++)
-	{
-		double		x = at(v, scalar, s);
-
-		if (x > m)
-			m = x;
-	}
-	return m;
+	return x < y ? -1 : x > y ? 1 : 0;
 }
 
 /*
- * The penalty in scenario s against the envelope C*(s): total(s) - C*(s)
- * beyond the tolerance, else 0.  No envelope (NULL, or NaN in s): 0.
+ * The objective's value of the losses x[0 .. N-1] of a path.  The maximum
+ * starts at 0 (as in v20; losses are not negative).  The standard deviation
+ * is the population's, over the N scenarios, with the mean subtracted first.
+ * The alpha-quantile is the smallest x with at least alpha N of the x not
+ * above it: the ceil(alpha N)-th smallest (Quant_alpha in the paper; v20's
+ * "4th worst" is alpha 0.85 with N = 20).
+ *
+ * Here and below, a product is never added in the same expression: the
+ * compiler may fuse a * b + c into one rounding (clang does at -O0 here),
+ * and the gates recompute these doubles exactly.
  */
 static double
-penalty(Path *path, const double *envelope, int s)
+aggregate(Agg agg, double *x, int N)
 {
-	const RobustVec *tv = path->robust ? path->robust->total : NULL;
-	double		c = at(tv, path->total_cost, s);
-	double		e;
-	double		thresh;
+	double		m = 0.0;
+	double		sum = 0.0;
+	double		mean;
+	double		ss = 0.0;
+	double		w;
+	int			k;
 
-	if (envelope == NULL || isnan(envelope[s]))
-		return 0.0;
-	e = envelope[s];
-	thresh = e * (1.0 + robust_penalty_tau);
-	if (c > thresh)
-		return c - e;
-	return 0.0;
+	for (int s = 0; s < N; s++)
+	{
+		sum += x[s];
+		if (x[s] > m)
+			m = x[s];
+	}
+	mean = sum / N;
+	switch (agg)
+	{
+		case AGG_MAX:
+			return m;
+		case AGG_MEAN:
+			return mean;
+		case AGG_MEAN_STD:
+		case AGG_MAX_STD:
+			for (int s = 0; s < N; s++)
+			{
+				double		d = x[s] - mean;
+				double		sq = d * d;
+
+				ss += sq;
+			}
+			w = robust_penalty_lambda * sqrt(ss / N);
+			return (agg == AGG_MEAN_STD ? mean : m) + w;
+		case AGG_QUANTILE:
+			w = robust_quantile_alpha * N;
+			k = (int) ceil(w - 1e-9);
+			k = Max(1, Min(N, k));
+			qsort(x, N, sizeof(double), cmp_double);
+			return x[k - 1];
+	}
+	return mean;
 }
 
+/*
+ * The loss in scenario s of a path costing 'cost' (and 'startup') there,
+ * against the envelope value 'env' (NaN: none, no penalty).
+ */
+static double
+loss_at(Loss loss, double cost, double startup, double env)
+{
+	switch (loss)
+	{
+		case LOSS_PENALTY:
+		case LOSS_EXCESS:
+			if (isnan(env) || !(cost > env * (1.0 + robust_penalty_tau)))
+				return 0.0;
+			return loss == LOSS_PENALTY ? cost - env : 1.0;
+		case LOSS_TOTAL:
+		case LOSS_POINT:
+			return cost;
+		case LOSS_STARTUP:
+			return startup;
+	}
+	return cost;
+}
+
+/* The objective's score of a path, against the relation's envelope */
 static double
 objective(int id, Path *path, const double *envelope)
 {
 	const RobustPathCost *rc = path->robust;
-	double		m = 0.0;
-	double		sum = 0.0;
+	int			N = error_sample_count;
+	Loss		loss = objective_loss(id);
+	double		x[ROBUST_MAX_SAMPLES];
 
-	switch (id)
-	{
-		case OBJ_WORST_PENALTY:
-			for (int s = 0; s < error_sample_count; s++)
-			{
-				double		p = penalty(path, envelope, s);
-
-				if (p > m)
-					m = p;
-			}
-			return m;
-		case OBJ_EXPECTED_PENALTY:
-			for (int s = 0; s < error_sample_count; s++)
-				sum += penalty(path, envelope, s);
-			return sum / error_sample_count;
-		case OBJ_WORST_TOTAL:
-			return vec_max(rc ? rc->total : NULL, path->total_cost);
-		case OBJ_EXPECTED_TOTAL:
-			return vec_mean(rc ? rc->total : NULL, path->total_cost);
-		case OBJ_WORST_STARTUP:
-			return vec_max(rc ? rc->startup : NULL, path->startup_cost);
-		case OBJ_EXPECTED_STARTUP:
-			return vec_mean(rc ? rc->startup : NULL, path->startup_cost);
-	}
-	elog(ERROR, "RobDP objective %d is not implemented", id);
-	return 0.0;					/* keep compiler quiet */
+	if (!is_objective(id))
+		elog(ERROR, "RobDP objective %d is not implemented", id);
+	if (loss == LOSS_POINT)
+		return path->total_cost;
+	for (int s = 0; s < N; s++)
+		x[s] = loss_at(loss, at(rc ? rc->total : NULL, path->total_cost, s),
+					   at(rc ? rc->startup : NULL, path->startup_cost, s),
+					   envelope ? envelope[s] : NAN);
+	return aggregate(objective_agg(id), x, N);
 }
 
-/* -------------------------------------------------------- candidates */
-
+/* Equal vectors, NULL standing for N copies of the scalar */
 static bool
 same_vec(const RobustVec *a, double sa, const RobustVec *b, double sb)
 {
@@ -293,6 +464,407 @@ cmp_retain(const void *a, const void *b)
 	return cmp_rest(x, y);
 }
 
+/* ------------------------------------------ diversification functions */
+
+/*
+ * A diversification function (or an objective, in Mix) picks paths to
+ * retain from the candidates the main objective did not keep, rest[0 ..
+ * n-1], one at a time: dv_next() gives its next pick not taken yet (by it or
+ * another function of Mix), or -1.  Objectives pick in the order of their
+ * score, then cmp_rest.
+ */
+typedef struct Dv
+{
+	int			id;
+	Cand	  **rest;
+	int			n;
+	const bool *taken;
+	int		   *order;			/* objectives, random, join: all, in order */
+	int			norder;
+	int			next;
+	/* similarity */
+	const double *envelope;
+	double	   *cost;			/* [i * N + s]: total(s) of rest[i] */
+	bool	   *eligible;		/* not pruned */
+	bool	   *center;			/* its own picks, taken or not */
+	double	   *min_dist;		/* to the nearest center */
+	int			ncenters;
+	int		   *rank;			/* position in the cmp_rest order */
+} Dv;
+
+typedef struct Keyed
+{
+	double		key;
+	Cand	   *cand;
+	int			i;
+} Keyed;
+
+static int
+cmp_keyed(const void *a, const void *b)
+{
+	const Keyed *x = (const Keyed *) a;
+	const Keyed *y = (const Keyed *) b;
+	int			c;
+
+	if ((c = cmp_key(x->key, y->key)) != 0)
+		return c;
+	return cmp_rest(x->cand, y->cand);
+}
+
+/* rest[] sorted by key[] (then cmp_rest), into order[] */
+static void
+sort_by_key(Cand **rest, int n, const double *key, int *order)
+{
+	Keyed	   *k = palloc(sizeof(Keyed) * Max(n, 1));
+
+	for (int i = 0; i < n; i++)
+	{
+		k[i].key = key[i];
+		k[i].cand = rest[i];
+		k[i].i = i;
+	}
+	qsort(k, n, sizeof(Keyed), cmp_keyed);
+	for (int i = 0; i < n; i++)
+		order[i] = k[i].i;
+	pfree(k);
+}
+
+/*
+ * Rand: uniform draws, from a stream seeded by error_sample_seed and the
+ * relation (v20 drew from one generator for the whole backend, so a plan
+ * depended on what was planned before).  The draws go into retain.
+ */
+static void
+dv_random_order(Dv *dv, RelOptInfo *rel, bool partial)
+{
+	pg_prng_state prng;
+	double	   *key = palloc(sizeof(double) * Max(dv->n, 1));
+	uint64		seed;
+
+	seed = ((uint64) (uint32) error_sample_seed << 32) ^
+		(uint64) bms_hash_value(rel->relids) ^
+		(partial ? UINT64CONST(0x9E3779B97F4A7C15) : 0);
+	pg_prng_seed(&prng, seed);
+	for (int i = 0; i < dv->n; i++)
+	{
+		key[i] = pg_prng_double(&prng);
+		dv->rest[i]->retain = key[i];
+	}
+	sort_by_key(dv->rest, dv->n, key, dv->order);
+	dv->norder = dv->n;
+	pfree(key);
+}
+
+/*
+ * E[Penalty]-Join, E[Cost]-Join: the candidates grouped by their last
+ * operator (pathtype: the join method, or the scan), the groups in the order
+ * of their best; then round by round, each group's next best.
+ */
+static void
+dv_join_order(Dv *dv, const double *envelope)
+{
+	int			obj = dv->id == DV_PENALTY_JOIN ? OBJ_EXPECTED_PENALTY :
+		OBJ_EXPECTED_TOTAL;
+	double	   *key = palloc(sizeof(double) * Max(dv->n, 1));
+	int		   *sorted = palloc(sizeof(int) * Max(dv->n, 1));
+	int		   *group = palloc(sizeof(int) * Max(dv->n, 1));
+	NodeTag    *gkey = palloc(sizeof(NodeTag) * Max(dv->n, 1));
+	int			ngroups = 0;
+	int			out = 0;
+
+	for (int i = 0; i < dv->n; i++)
+		key[i] = objective(obj, dv->rest[i]->path, envelope);
+	sort_by_key(dv->rest, dv->n, key, sorted);
+	for (int j = 0; j < dv->n; j++)
+	{
+		NodeTag		t = dv->rest[sorted[j]]->path->pathtype;
+		int			g;
+
+		for (g = 0; g < ngroups && gkey[g] != t; g++)
+			;
+		if (g == ngroups)
+			gkey[ngroups++] = t;
+		group[j] = g;
+	}
+	for (int round = 0; out < dv->n; round++)
+	{
+		for (int g = 0; g < ngroups; g++)
+		{
+			int			seen = 0;
+
+			for (int j = 0; j < dv->n; j++)
+			{
+				if (group[j] != g)
+					continue;
+				if (seen++ == round)
+				{
+					dv->order[out++] = sorted[j];
+					break;
+				}
+			}
+		}
+	}
+	dv->norder = out;
+	pfree(key);
+	pfree(sorted);
+	pfree(group);
+	pfree(gkey);
+}
+
+/*
+ * The Jensen-Shannon distance of two cost vectors, each normalized to sum
+ * to 1 (as v20 and PARQO's k_center_greedy): sqrt(KL(p || m) / 2 + KL(q ||
+ * m) / 2), m = (p + q) / 2, with 1e-10 added to each normalized entry.
+ */
+static double
+kl_divergence(const double *p, const double *q, int N)
+{
+	double		sp = 0.0;
+	double		sq = 0.0;
+	double		kl = 0.0;
+
+	for (int s = 0; s < N; s++)
+	{
+		sp += p[s];
+		sq += q[s];
+	}
+	if (sp <= 0.0 || sq <= 0.0)
+		return 0.0;
+	for (int s = 0; s < N; s++)
+	{
+		double		pi = p[s] / sp + 1e-10;
+		double		qi = q[s] / sq + 1e-10;
+		double		term = pi * log(pi / qi);
+
+		kl += term;
+	}
+	return kl;
+}
+
+static double
+js_distance(const double *p, const double *q, int N)
+{
+	double		m[ROBUST_MAX_SAMPLES];
+	double		a;
+	double		b;
+	double		d;
+
+	for (int s = 0; s < N; s++)
+		m[s] = 0.5 * (p[s] + q[s]);
+	a = 0.5 * kl_divergence(p, m, N);
+	b = 0.5 * kl_divergence(q, m, N);
+	d = a + b;
+	if (d < 0.0)
+		d = 0.0;
+	return sqrt(d);
+}
+
+/*
+ * Similarity (the paper's Section 4.2.2): farthest-first k-center over the
+ * candidates' total cost vectors, by the Jensen-Shannon distance, among the
+ * candidates that do not exceed theta = 2 max_s C*(s) in every scenario
+ * (all of them if there is no envelope; the one of least expected cost if
+ * none is left), starting from the candidate of least expected cost.  Ties
+ * go to the earlier in the cmp_rest order.  v20 started from the least
+ * point cost, took as many centers as retain_path_limit whatever its
+ * budget, and could pick a center twice.
+ */
+static void
+dv_similarity_setup(Dv *dv, const double *envelope)
+{
+	int			N = error_sample_count;
+	double		theta = NAN;
+	int		   *order = palloc(sizeof(int) * Max(dv->n, 1));
+	double	   *key = palloc(sizeof(double) * Max(dv->n, 1));
+	bool		any = false;
+
+	dv->envelope = envelope;
+	dv->cost = palloc(sizeof(double) * Max(dv->n, 1) * N);
+	dv->eligible = palloc(sizeof(bool) * Max(dv->n, 1));
+	dv->center = palloc0(sizeof(bool) * Max(dv->n, 1));
+	dv->min_dist = palloc(sizeof(double) * Max(dv->n, 1));
+	dv->rank = palloc(sizeof(int) * Max(dv->n, 1));
+	if (envelope != NULL)
+	{
+		for (int s = 0; s < N; s++)
+		{
+			if (!isnan(envelope[s]) && (isnan(theta) || envelope[s] > theta))
+				theta = envelope[s];
+		}
+		if (!isnan(theta))
+			theta *= 2.0;
+	}
+	for (int i = 0; i < dv->n; i++)
+	{
+		Path	   *path = dv->rest[i]->path;
+		const RobustVec *tv = path->robust ? path->robust->total : NULL;
+		bool		below = isnan(theta);
+
+		for (int s = 0; s < N; s++)
+		{
+			dv->cost[i * N + s] = at(tv, path->total_cost, s);
+			if (dv->cost[i * N + s] <= theta)
+				below = true;
+		}
+		dv->eligible[i] = below;
+		any |= below;
+		dv->min_dist[i] = DBL_MAX;
+		key[i] = 0.0;
+	}
+	sort_by_key(dv->rest, dv->n, key, order);	/* the cmp_rest order */
+	for (int j = 0; j < dv->n; j++)
+		dv->rank[order[j]] = j;
+	if (!any && dv->n > 0)
+		dv->eligible[order[0]] = true;
+	pfree(order);
+	pfree(key);
+}
+
+/* The next center, -1 when every eligible candidate is one */
+static int
+dv_similarity_center(Dv *dv)
+{
+	int			N = error_sample_count;
+	int			best = -1;
+
+	for (int i = 0; i < dv->n; i++)
+	{
+		if (!dv->eligible[i] || dv->center[i])
+			continue;
+		if (best < 0 ||
+			(dv->ncenters > 0 && dv->min_dist[i] > dv->min_dist[best]) ||
+			((dv->ncenters == 0 || dv->min_dist[i] == dv->min_dist[best]) &&
+			 dv->rank[i] < dv->rank[best]))
+			best = i;
+	}
+	if (best < 0)
+		return -1;
+	dv->center[best] = true;
+	dv->ncenters++;
+	for (int i = 0; i < dv->n; i++)
+	{
+		double		d;
+
+		if (!dv->eligible[i] || dv->center[i])
+			continue;
+		d = js_distance(&dv->cost[i * N], &dv->cost[best * N], N);
+		if (d < dv->min_dist[i])
+			dv->min_dist[i] = d;
+	}
+	return best;
+}
+
+static void
+dv_init(Dv *dv, int id, Cand **rest, int n, const bool *taken,
+		RelOptInfo *rel, bool partial, const double *envelope)
+{
+	memset(dv, 0, sizeof(Dv));
+	dv->id = id;
+	dv->rest = rest;
+	dv->n = n;
+	dv->taken = taken;
+	dv->order = palloc(sizeof(int) * Max(n, 1));
+	if (is_objective(id))
+	{
+		double	   *key = palloc(sizeof(double) * Max(n, 1));
+
+		for (int i = 0; i < n; i++)
+			key[i] = objective(id, rest[i]->path, envelope);
+		sort_by_key(rest, n, key, dv->order);
+		dv->norder = n;
+		pfree(key);
+	}
+	else if (id == DV_RANDOM)
+		dv_random_order(dv, rel, partial);
+	else if (id == DV_PENALTY_JOIN || id == DV_COST_JOIN)
+		dv_join_order(dv, envelope);
+	else if (id == DV_SIMILARITY)
+		dv_similarity_setup(dv, envelope);
+	else
+		elog(ERROR, "RobDP diversification function %d is not implemented", id);
+}
+
+static int
+dv_next(Dv *dv)
+{
+	if (dv->id == DV_SIMILARITY)
+	{
+		int			i;
+
+		while ((i = dv_similarity_center(dv)) >= 0)
+		{
+			if (!dv->taken[i])
+				return i;
+		}
+		return -1;
+	}
+	while (dv->next < dv->norder)
+	{
+		int			i = dv->order[dv->next++];
+
+		if (!dv->taken[i])
+			return i;
+	}
+	return -1;
+}
+
+/*
+ * Mix: the paper's ensemble of seven, the budget shared evenly by picking
+ * from each in turn.  v20's "retention set" (14) had worst penalty in place
+ * of the quantile, no E[Cost]-Join, and its coverage member took the first
+ * candidate in list order.
+ */
+static const int mix_members[] = {
+	OBJ_EXPECTED_TOTAL, OBJ_EXPECTED_PENALTY, OBJ_EXPECTED_PENALTY_STD,
+	OBJ_QUANTILE_PENALTY, OBJ_PENALTY_PROB, DV_SIMILARITY, DV_COST_JOIN,
+};
+
+/*
+ * Retain up to k of rest[0 .. n-1] by the diversification function id.
+ * The picks get KEPT_RETAIN and, but for Rand (its draws), their order of
+ * picking in retain (the others -1).
+ */
+static void
+diversify(int id, RelOptInfo *rel, bool partial, Cand **rest, int n, int k,
+		  const double *envelope)
+{
+	bool	   *taken = palloc0(sizeof(bool) * Max(n, 1));
+	int			nmembers = id == DV_MIX ? lengthof(mix_members) : 1;
+	Dv		   *dv = palloc(sizeof(Dv) * nmembers);
+	int			picked = 0;
+
+	for (int i = 0; i < n; i++)
+	{
+		if (id != DV_RANDOM)
+			rest[i]->retain = -1.0;
+	}
+	for (int m = 0; m < nmembers; m++)
+		dv_init(&dv[m], id == DV_MIX ? mix_members[m] : id, rest, n, taken,
+				rel, partial, envelope);
+	while (picked < k)
+	{
+		bool		progress = false;
+
+		for (int m = 0; m < nmembers && picked < k; m++)
+		{
+			int			i = dv_next(&dv[m]);
+
+			if (i < 0)
+				continue;
+			taken[i] = true;
+			rest[i]->by = KEPT_RETAIN;
+			if (id != DV_RANDOM)
+				rest[i]->retain = picked;
+			picked++;
+			progress = true;
+		}
+		if (!progress)
+			break;
+	}
+	pfree(taken);
+	pfree(dv);
+}
+
 static const char *
 kept_by_name(KeptBy by)
 {
@@ -346,12 +918,27 @@ dump_keep(PlannerInfo *root, RelOptInfo *rel, bool partial, int limit,
 	robust_dump_bool(&d, "partial", partial);
 	robust_dump_int(&d, "limit", limit);
 	robust_dump_int(&d, "retain", retain);
+	robust_dump_int(&d, "objective", main_objective_id);
+	robust_dump_int(&d, "strategy", retain_strategy_id);
 	robust_dump_bool(&d, "envelope", envelope != NULL);
 	dump_ids_scores(&d, "cands", c, n, true, false);
 	dump_ids_scores(&d, "main", c, n, false, false);
 	if (retain > 0)
 		dump_ids_scores(&d, "retain_score", c, n, false, true);
 	initStringInfo(&buf);
+	if (retain > 0 && (retain_strategy_id == DV_PENALTY_JOIN ||
+					   retain_strategy_id == DV_COST_JOIN ||
+					   retain_strategy_id == DV_MIX))
+	{
+		/* the last operators the join functions group by */
+		appendStringInfoChar(&buf, '[');
+		for (int i = 0; i < n; i++)
+			appendStringInfo(&buf, "%s%d", i > 0 ? "," : "",
+							 (int) c[i].path->pathtype);
+		appendStringInfoChar(&buf, ']');
+		robust_dump_raw(&d, "ops", buf.data);
+		resetStringInfo(&buf);
+	}
 	appendStringInfoChar(&buf, '[');
 	for (int i = 0; i < nkept; i++)
 	{
@@ -413,7 +1000,7 @@ robust_select_paths(PlannerInfo *root, RelOptInfo *rel, bool partial,
 		c[i].path = path;
 		c[i].pos = i;
 		c[i].main = objective(main_objective_id, path, envelope);
-		c[i].retain = retain > 0 ?
+		c[i].retain = retain > 0 && is_objective(retain_strategy_id) ?
 			objective(retain_strategy_id, path, envelope) : 0.0;
 		c[i].mean_startup = vec_mean(rc ? rc->startup : NULL, path->startup_cost);
 		c[i].mean_total = vec_mean(rc ? rc->total : NULL, path->total_cost);
@@ -437,9 +1024,15 @@ robust_select_paths(PlannerInfo *root, RelOptInfo *rel, bool partial,
 			if (c[i].by == KEPT_NOT)
 				rest[nrest++] = &c[i];
 		}
-		qsort(rest, nrest, sizeof(Cand *), cmp_retain);
-		for (int i = 0; i < nrest && i < retain; i++)
-			rest[i]->by = KEPT_RETAIN;
+		if (is_objective(retain_strategy_id))
+		{
+			qsort(rest, nrest, sizeof(Cand *), cmp_retain);
+			for (int i = 0; i < nrest && i < retain; i++)
+				rest[i]->by = KEPT_RETAIN;
+		}
+		else
+			diversify(retain_strategy_id, rel, partial, rest, nrest, retain,
+					  envelope);
 		pfree(rest);
 	}
 
@@ -621,7 +1214,8 @@ fractional_at(Path *path, double tuple_fraction, int s)
 		f = f / rows;
 	if (f <= 0.0 || f >= 1.0)
 		return total;
-	return startup + f * (total - startup);
+	f *= total - startup;
+	return startup + f;
 }
 
 /* likewise at the point (s = -1) */
@@ -634,7 +1228,8 @@ fractional_point(Path *path, double tuple_fraction)
 		f = f / path->rows;
 	if (f <= 0.0 || f >= 1.0)
 		return path->total_cost;
-	return path->startup_cost + f * (path->total_cost - path->startup_cost);
+	f *= path->total_cost - path->startup_cost;
+	return path->startup_cost + f;
 }
 
 typedef struct FinalCand
@@ -694,10 +1289,13 @@ robust_select_final(RelOptInfo *rel, double tuple_fraction, Path *pg)
 	double	   *env;
 	bool		vectors = false;
 	Path	   *chosen = NULL;
+	Loss		loss = objective_loss(main_objective_id);
 	ListCell   *lc;
 
 	if (n == 0)
 		return NULL;
+	if (!is_objective(main_objective_id))
+		elog(ERROR, "RobDP objective %d is not implemented", main_objective_id);
 	foreach(lc, rel->pathlist)
 		vectors |= has_vectors((Path *) lfirst(lc));
 
@@ -722,43 +1320,23 @@ robust_select_final(RelOptInfo *rel, double tuple_fraction, Path *pg)
 		Path	   *path = (Path *) lfirst(lc);
 		const RobustPathCost *rc = path->robust;
 		FinalCand  *k = &c[foreach_current_index(lc)];
-		double		m = 0.0;
-		double		sum = 0.0;
 		double		fsum = 0.0;
+		double		x[ROBUST_MAX_SAMPLES];
 
 		k->path = path;
 		k->pos = foreach_current_index(lc);
 		for (int s = 0; s < N; s++)
 		{
 			double		f = fractional_at(path, tuple_fraction, s);
-			double		x = 0.0;
 
 			fsum += f;
-			switch (main_objective_id)
-			{
-				case OBJ_WORST_PENALTY:
-				case OBJ_EXPECTED_PENALTY:
-					x = f > env[s] * (1.0 + robust_penalty_tau) ? f - env[s] : 0.0;
-					break;
-				case OBJ_WORST_TOTAL:
-				case OBJ_EXPECTED_TOTAL:
-					x = f;
-					break;
-				case OBJ_WORST_STARTUP:
-				case OBJ_EXPECTED_STARTUP:
-					x = at(rc ? rc->startup : NULL, path->startup_cost, s);
-					break;
-				default:
-					elog(ERROR, "RobDP objective %d is not implemented",
-						 main_objective_id);
-			}
-			sum += x;
-			if (x > m)
-				m = x;
+			x[s] = loss_at(loss, f,
+						   at(rc ? rc->startup : NULL, path->startup_cost, s),
+						   env[s]);
 		}
-		k->score = (main_objective_id == OBJ_WORST_PENALTY ||
-					main_objective_id == OBJ_WORST_TOTAL ||
-					main_objective_id == OBJ_WORST_STARTUP) ? m : sum / N;
+		k->score = loss == LOSS_POINT ?
+			fractional_point(path, tuple_fraction) :
+			aggregate(objective_agg(main_objective_id), x, N);
 		k->mean_frac = fsum / N;
 		k->point_frac = fractional_point(path, tuple_fraction);
 	}

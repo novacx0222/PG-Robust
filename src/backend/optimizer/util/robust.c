@@ -36,6 +36,8 @@ int			robust_final_path_limit = 1;
 int			main_objective_id = 0;
 int			retain_strategy_id = 0;
 double		robust_penalty_tau = 0.2;
+double		robust_penalty_lambda = 1.0;
+double		robust_quantile_alpha = 0.85;
 
 const char *
 robust_pass_name(RobustPass pass)

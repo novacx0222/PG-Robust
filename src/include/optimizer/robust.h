@@ -38,6 +38,8 @@ extern PGDLLIMPORT int robust_final_path_limit;
 extern PGDLLIMPORT int main_objective_id;
 extern PGDLLIMPORT int retain_strategy_id;
 extern PGDLLIMPORT double robust_penalty_tau;
+extern PGDLLIMPORT double robust_penalty_lambda;
+extern PGDLLIMPORT double robust_quantile_alpha;
 
 /* robust_join_pairing (see optimizer/robustselect.h) */
 typedef enum RobustPairing
@@ -46,10 +48,15 @@ typedef enum RobustPairing
 	ROBUST_PAIRING_RETAINED,	/* every path the inputs keep */
 } RobustPairing;
 
-/* The objectives of v20 (main_objective_id, retain_strategy_id) */
-#define ROBUST_OBJECTIVE_MAX	16
+/*
+ * The objectives and diversification functions, v20's numbering
+ * (main_objective_id: an objective; retain_strategy_id: either; see
+ * optimizer/robustselect.h)
+ */
+#define ROBUST_OBJECTIVE_MAX	18
 
 extern bool check_robust_objective(int *newval, void **extra, GucSource source);
+extern bool check_robust_strategy(int *newval, void **extra, GucSource source);
 
 /* Upper limit of error_bin_count */
 #define ROBUST_MAX_BINS		8

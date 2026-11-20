@@ -38,7 +38,9 @@
  * its offset and count -- is recorded by the constructor.  The cost of a
  * query level's initPlans, which SS_charge_for_initplans adds to its final
  * relation's paths once they are costed, is added to their vectors as well
- * (robust_cost_charge).  GroupingSets and RecursiveUnion are not replayed
+ * (robust_cost_charge); so is the change of target apply_projection_to_path
+ * makes in place (robust_cost_project).  GroupingSets and RecursiveUnion are
+ * not replayed
  * (status unsupported); MinMaxAgg, costed from its subqueries' plans, is
  * constant.
  *
@@ -173,6 +175,8 @@ extern void robust_cost_limit_ests(LimitPath *path, int64 offset_est,
 extern void robust_cost_charge(PlannerInfo *root, RelOptInfo *final_rel,
 							   Cost cost);
 extern void robust_cost_ordered_limit(PlannerInfo *root, double limit_tuples);
+extern void robust_cost_project(PlannerInfo *root, Path *path,
+								PathTarget *target);
 
 /* The join search (robustsearch.c, pathnode.c) */
 extern void robust_cost_note_varies(void);
