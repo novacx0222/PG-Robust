@@ -27,6 +27,21 @@
  * path's row count was computed with: the relation's or the ParamPathInfo's
  * for a scan, those of the pair joined for a join.
  *
+ * Paths above the join search are replayed as their create_*_path
+ * functions cost them (Agg, Group, Unique, WindowAgg, SetOp, Limit,
+ * LockRows, ModifyTable, and the Gather paths of a partial aggregation,
+ * given the rows of their input times its workers).  A grouping path's
+ * number of groups is estimate_num_groups' in the scenario, from the rows
+ * of its input and of the base relations (RobustGroups says how).  What a
+ * constructor is given and the path does not keep -- an Agg's
+ * AggClauseCosts, a WindowAgg's window functions, a Limit's estimates of
+ * its offset and count -- is recorded by the constructor.  The cost of a
+ * query level's initPlans, which SS_charge_for_initplans adds to its final
+ * relation's paths once they are costed, is added to their vectors as well
+ * (robust_cost_charge).  GroupingSets and RecursiveUnion are not replayed
+ * (status unsupported); MinMaxAgg, costed from its subqueries' plans, is
+ * constant.
+ *
  * Decisions taken while costing that shape the plan are kept at the point
  * estimate's choice (a merge join's materialize_inner, a Unique's method);
  * those that do not are replayed (a hash join's batches).  A hash clause's
@@ -65,12 +80,32 @@ typedef enum RobustCostStatus
 	ROBUST_COST_NOCONTEXT,		/* a join path costed outside its join */
 } RobustCostStatus;
 
+/*
+ * How an upper path's number of groups is obtained in a scenario
+ * (RobustPathCost.groups): PostgreSQL computes it before creating the path
+ * and does not record how, so the replay tries these in order and takes
+ * the first that reproduces the point.  The input rows are those of the
+ * path's input path, or of the relation the grouping reads (below the
+ * upper relations: the scan/join relation, whose rows get_number_of_groups
+ * reads also for a partial aggregation's finalize step).
+ */
+typedef enum RobustGroups
+{
+	ROBUST_GROUPS_NONE = 0,		/* not a grouping path */
+	ROBUST_GROUPS_EST_SUB,		/* estimate_num_groups, input path's rows */
+	ROBUST_GROUPS_EST_INPUT,	/* estimate_num_groups, input relation's rows */
+	ROBUST_GROUPS_SUB_ROWS,		/* the input path's rows */
+	ROBUST_GROUPS_INPUT_ROWS,	/* the input relation's rows */
+	ROBUST_GROUPS_FROZEN,		/* the point's in every scenario */
+} RobustGroups;
+
 typedef struct RobustPathCost
 {
 	int			id;				/* unique within the planning of a query */
 	RobustCostStatus status;
 	bool		partial;		/* offered to add_partial_path */
 	bool		semi_frozen;	/* semi-join factors kept at the point */
+	RobustGroups groups;		/* upper grouping paths */
 	RobustVec  *rows;			/* NULL: the scalar in every scenario */
 	RobustVec  *startup;
 	RobustVec  *total;
@@ -130,6 +165,14 @@ extern void robust_cost_memoize_reparameterized(MemoizePath *copy,
 												List *param_exprs);
 extern void robust_cost_bucket_filled(RestrictInfo *rinfo, bool right,
 									  Path *path, double virtualbuckets);
+extern void robust_cost_agg_costs(AggPath *path,
+								  const AggClauseCosts *aggcosts);
+extern void robust_cost_window_funcs(WindowAggPath *path, List *windowFuncs);
+extern void robust_cost_limit_ests(LimitPath *path, int64 offset_est,
+								   int64 count_est);
+extern void robust_cost_charge(PlannerInfo *root, RelOptInfo *final_rel,
+							   Cost cost);
+extern void robust_cost_ordered_limit(PlannerInfo *root, double limit_tuples);
 
 /* The join search (robustsearch.c, pathnode.c) */
 extern void robust_cost_note_varies(void);

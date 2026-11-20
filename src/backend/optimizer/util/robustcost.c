@@ -97,6 +97,8 @@ typedef struct CostState
 	HTAB	   *bucket_fill;	/* BucketFills */
 	HTAB	   *bucket_cache;	/* estimate_hash_bucket_stats results */
 	HTAB	   *groups_cache;	/* estimate_num_groups results */
+	HTAB	   *upper_info;		/* UpperInfos */
+	List	   *ordered_limits; /* OrderedLimits */
 	bool		varies;			/* some row count or cost differs from the
 								 * point estimate in some scenario */
 	int			round_counts[ROBUST_COST_NOCONTEXT + 1];	/* statuses of
@@ -513,7 +515,189 @@ robust_cost_partial_rows(Path *path)
 	st->prows_path = path;
 }
 
+/*
+ * What the constructors of some upper paths are given and the path does not
+ * keep: an Agg's AggClauseCosts, a WindowAgg's window functions, a Limit's
+ * estimates of its offset and count.  Recorded by the constructor, keyed by
+ * the path (a later path at the same address records its own).
+ */
+typedef struct UpperInfo
+{
+	Path	   *path;			/* hash key */
+	bool		has_aggcosts;
+	AggClauseCosts aggcosts;
+	List	   *window_funcs;
+	int64		offset_est;
+	int64		count_est;
+} UpperInfo;
+
+static UpperInfo *
+upper_info(Path *path, bool create)
+{
+	UpperInfo  *u;
+	bool		found;
+
+	if (st->upper_info == NULL)
+	{
+		HASHCTL		ctl;
+
+		if (!create)
+			return NULL;
+		ctl.keysize = sizeof(Path *);
+		ctl.entrysize = sizeof(UpperInfo);
+		ctl.hcxt = st->cxt;
+		st->upper_info = hash_create("RobDP upper paths", 64, &ctl,
+									 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	u = (UpperInfo *) hash_search(st->upper_info, &path,
+								  create ? HASH_ENTER : HASH_FIND, &found);
+	if (create)
+	{
+		memset(u, 0, sizeof(UpperInfo));
+		u->path = path;
+	}
+	return u;
+}
+
+void
+robust_cost_agg_costs(AggPath *path, const AggClauseCosts *aggcosts)
+{
+	UpperInfo  *u;
+
+	if (st == NULL)
+		return;
+	u = upper_info(&path->path, true);
+	u->has_aggcosts = aggcosts != NULL;
+	if (aggcosts != NULL)
+		u->aggcosts = *aggcosts;
+}
+
+void
+robust_cost_window_funcs(WindowAggPath *path, List *windowFuncs)
+{
+	if (st == NULL)
+		return;
+	upper_info(&path->path, true)->window_funcs = windowFuncs;
+}
+
+void
+robust_cost_limit_ests(LimitPath *path, int64 offset_est, int64 count_est)
+{
+	UpperInfo  *u;
+
+	if (st == NULL)
+		return;
+	u = upper_info(&path->path, true);
+	u->offset_est = offset_est;
+	u->count_est = count_est;
+}
+
+/*
+ * robust_cost_charge
+ *		SS_charge_for_initplans() has added the cost of the query level's
+ *		initPlans to the startup and total cost of every path of its final
+ *		relation, after their vectors were computed: add it in every scenario
+ *		too (the initPlans' costs are their plans', the same in all).  The
+ *		vectors are replaced, not changed, as another path may share them.
+ *		The scores the selection gave keep their order (the same cost is
+ *		added to all the paths of the relation); the expected costs move.
+ *		One "charge" dump event lists the paths.
+ */
+void
+robust_cost_charge(PlannerInfo *root, RelOptInfo *final_rel, Cost cost)
+{
+	StringInfoData ids;
+	ListCell   *lc;
+
+	if (!enable_rows_dist)
+		return;
+	initStringInfo(&ids);
+	appendStringInfoChar(&ids, '[');
+	foreach(lc, final_rel->pathlist)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+		RobustPathCost *rc = path->robust;
+
+		if (rc == NULL)
+			continue;
+		for (int k = 0; k < 2; k++)
+		{
+			RobustVec **v = k == 0 ? &rc->startup : &rc->total;
+
+			if (*v != NULL)
+			{
+				RobustVec  *c = robust_vec_copy(*v);
+
+				for (int s = 0; s < c->n; s++)
+					c->v[s] += cost;
+				*v = c;
+			}
+		}
+		if (rc->scored)
+		{
+			rc->mean_startup += cost;
+			rc->mean_total += cost;
+		}
+		if (ids.len > 1)
+			appendStringInfoChar(&ids, ',');
+		appendStringInfo(&ids, "%d", rc->id);
+	}
+	appendStringInfoChar(&ids, ']');
+	if (robust_dumping(root))
+	{
+		RobustDump	d;
+
+		robust_dump_begin(&d, "charge");
+		robust_dump_double(&d, "cost", cost);
+		robust_dump_raw(&d, "ids", ids.data);
+		robust_dump_end(&d);
+	}
+	pfree(ids.data);
+}
+
 static RobustPathCost *compute(PlannerInfo *root, Path *path, bool partial);
+
+/*
+ * The bound grouping_planner gives create_ordered_paths for its sorts: the
+ * LIMIT's, also where root->limit_tuples is -1 (grouping, aggregates,
+ * window functions below the ORDER BY).
+ */
+typedef struct OrderedLimit
+{
+	PlannerInfo *root;
+	double		limit_tuples;
+} OrderedLimit;
+
+void
+robust_cost_ordered_limit(PlannerInfo *root, double limit_tuples)
+{
+	OrderedLimit *o;
+
+	if (st == NULL)
+		return;
+	o = MemoryContextAlloc(st->cxt, sizeof(OrderedLimit));
+	o->root = root;
+	o->limit_tuples = limit_tuples;
+	st->ordered_limits = lcons(o, st->ordered_limits);
+}
+
+static bool
+ordered_limit(PlannerInfo *root, double *limit_tuples)
+{
+	ListCell   *lc;
+
+	foreach(lc, st->ordered_limits)
+	{
+		OrderedLimit *o = (OrderedLimit *) lfirst(lc);
+
+		if (o->root == root)
+		{
+			*limit_tuples = o->limit_tuples;
+			return true;
+		}
+	}
+	return false;
+}
 
 void
 robust_cost_append_rows(Path *path)
@@ -1206,6 +1390,16 @@ typedef struct Replay
 	MemoizePath *memo;			/* a Memoize inner whose est_entries */
 	uint32		memo_entries;	/* cost_memoize_rescan overwrites */
 	List	   *memo_exprs;		/* and whose param_exprs it gets */
+	UpperInfo  *upper;			/* Agg, WindowAgg, Limit: what the
+								 * constructor was given */
+	RobustGroups groups;		/* grouping paths: how the groups are got */
+	List	   *group_exprs;	/* the grouping expressions, or NIL */
+	bool		have_exprs;		/* they were found in the input's target */
+	RelOptInfo *input_rel;		/* the relation the grouping reads, or NULL */
+	double		frozen_groups;	/* the point's groups, if known */
+	bool		have_frozen;
+	bool		gather_rows;	/* Gather, GatherMerge: given the rows of
+								 * their input times its workers */
 	double		got[3];			/* rows, startup, total of the last point
 								 * replay */
 } Replay;
@@ -1270,6 +1464,22 @@ path_size(Path *path)
 			return sizeof(MergePath);
 		case T_HashPath:
 			return sizeof(HashPath);
+		case T_AggPath:
+			return sizeof(AggPath);
+		case T_GroupPath:
+			return sizeof(GroupPath);
+		case T_UpperUniquePath:
+			return sizeof(UpperUniquePath);
+		case T_WindowAggPath:
+			return sizeof(WindowAggPath);
+		case T_SetOpPath:
+			return sizeof(SetOpPath);
+		case T_LockRowsPath:
+			return sizeof(LockRowsPath);
+		case T_ModifyTablePath:
+			return sizeof(ModifyTablePath);
+		case T_LimitPath:
+			return sizeof(LimitPath);
 		default:
 			return 0;
 	}
@@ -1308,6 +1518,28 @@ path_children(Path *path)
 			return list_make1(((ProjectionPath *) path)->subpath);
 		case T_ProjectSetPath:
 			return list_make1(((ProjectSetPath *) path)->subpath);
+		case T_AggPath:
+			return list_make1(((AggPath *) path)->subpath);
+		case T_GroupPath:
+			return list_make1(((GroupPath *) path)->subpath);
+		case T_UpperUniquePath:
+			return list_make1(((UpperUniquePath *) path)->subpath);
+		case T_WindowAggPath:
+			return list_make1(((WindowAggPath *) path)->subpath);
+		case T_SetOpPath:
+			return list_make1(((SetOpPath *) path)->subpath);
+		case T_LockRowsPath:
+			return list_make1(((LockRowsPath *) path)->subpath);
+		case T_ModifyTablePath:
+			return list_make1(((ModifyTablePath *) path)->subpath);
+		case T_LimitPath:
+			return list_make1(((LimitPath *) path)->subpath);
+		/* not replayed (status unsupported), but their inputs are */
+		case T_GroupingSetsPath:
+			return list_make1(((GroupingSetsPath *) path)->subpath);
+		case T_RecursiveUnionPath:
+			return list_make2(((RecursiveUnionPath *) path)->leftpath,
+							  ((RecursiveUnionPath *) path)->rightpath);
 		default:
 			return NIL;
 	}
@@ -1421,6 +1653,38 @@ replay_tree(Replay *R, Path *node, int s)
 	}
 	elog(ERROR, "RobDP: unrecognized bitmap tree node: %d", (int) nodeTag(node));
 	return NULL;				/* keep compiler quiet */
+}
+
+/* The number of groups of a grouping path, sub its input, as R->groups says */
+static double
+groups_at(Replay *R, Path *sub)
+{
+	switch (R->groups)
+	{
+		case ROBUST_GROUPS_EST_SUB:
+			return robust_replay_num_groups(R->root, R->group_exprs, sub->rows,
+											NULL);
+		case ROBUST_GROUPS_EST_INPUT:
+			return robust_replay_num_groups(R->root, R->group_exprs,
+											R->input_rel->rows, NULL);
+		case ROBUST_GROUPS_SUB_ROWS:
+			return sub->rows;
+		case ROBUST_GROUPS_INPUT_ROWS:
+			return R->input_rel->rows;
+		case ROBUST_GROUPS_FROZEN:
+		case ROBUST_GROUPS_NONE:
+			break;
+	}
+	return R->frozen_groups;
+}
+
+/* Add the evaluation of the path's target per output row (create_agg_path) */
+static void
+add_target_cost(Path *t)
+{
+	t->startup_cost += t->pathtarget->cost.startup;
+	t->total_cost += t->pathtarget->cost.startup +
+		t->pathtarget->cost.per_tuple * t->rows;
 }
 
 /*
@@ -1632,7 +1896,13 @@ cost_copy(Replay *R, Path *t, int s)
 			}
 			break;
 		case T_GatherPath:
-			cost_gather((GatherPath *) t, root, rel, t->param_info, NULL);
+			{
+				Path	   *sub = ((GatherPath *) t)->subpath;
+				double		rows = sub->rows * sub->parallel_workers;
+
+				cost_gather((GatherPath *) t, root, rel, t->param_info,
+							R->gather_rows ? &rows : NULL);
+			}
 			break;
 		case T_GatherMergePath:
 			{
@@ -1656,8 +1926,13 @@ cost_copy(Replay *R, Path *t, int s)
 					input_startup_cost += sort_path.startup_cost;
 					input_total_cost += sort_path.total_cost;
 				}
-				cost_gather_merge(gm, root, rel, t->param_info,
-								  input_startup_cost, input_total_cost, NULL);
+				{
+					double		rows = sub->rows * sub->parallel_workers;
+
+					cost_gather_merge(gm, root, rel, t->param_info,
+									  input_startup_cost, input_total_cost,
+									  R->gather_rows ? &rows : NULL);
+				}
 			}
 			break;
 		case T_SortPath:
@@ -1779,6 +2054,99 @@ cost_copy(Replay *R, Path *t, int s)
 				hooks.qual_mult = 1.0;
 			}
 			break;
+
+			/* Upper paths: as their create_*_path functions cost them */
+		case T_AggPath:
+			{
+				AggPath    *ap = (AggPath *) t;
+				Path	   *sub = ap->subpath;
+				double		ng = groups_at(R, sub);
+
+				ap->numGroups = ng;
+				cost_agg(t, root, ap->aggstrategy,
+						 R->upper->has_aggcosts ? &R->upper->aggcosts : NULL,
+						 list_length(ap->groupClause), ng, ap->qual,
+						 sub->startup_cost, sub->total_cost, sub->rows,
+						 sub->pathtarget->width);
+				add_target_cost(t);
+			}
+			break;
+		case T_GroupPath:
+			{
+				GroupPath  *gp = (GroupPath *) t;
+				Path	   *sub = gp->subpath;
+
+				cost_group(t, root, list_length(gp->groupClause),
+						   groups_at(R, sub), gp->qual,
+						   sub->startup_cost, sub->total_cost, sub->rows);
+				add_target_cost(t);
+			}
+			break;
+		case T_UpperUniquePath:
+			{
+				UpperUniquePath *up = (UpperUniquePath *) t;
+				Path	   *sub = up->subpath;
+
+				t->startup_cost = sub->startup_cost;
+				t->total_cost = sub->total_cost +
+					cpu_operator_cost * sub->rows * up->numkeys;
+				t->rows = groups_at(R, sub);
+			}
+			break;
+		case T_WindowAggPath:
+			{
+				WindowAggPath *wp = (WindowAggPath *) t;
+				Path	   *sub = wp->subpath;
+
+				cost_windowagg(t, root, R->upper->window_funcs,
+							   list_length(wp->winclause->partitionClause),
+							   list_length(wp->winclause->orderClause),
+							   sub->startup_cost, sub->total_cost, sub->rows);
+				add_target_cost(t);
+			}
+			break;
+		case T_SetOpPath:
+			{
+				SetOpPath  *sp = (SetOpPath *) t;
+				Path	   *sub = sp->subpath;
+
+				t->startup_cost = sub->startup_cost;
+				t->total_cost = sub->total_cost +
+					cpu_operator_cost * sub->rows * list_length(sp->distinctList);
+				t->rows = R->frozen_groups;
+			}
+			break;
+		case T_LockRowsPath:
+			{
+				Path	   *sub = ((LockRowsPath *) t)->subpath;
+
+				t->rows = sub->rows;
+				t->startup_cost = sub->startup_cost;
+				t->total_cost = sub->total_cost + cpu_tuple_cost * sub->rows;
+			}
+			break;
+		case T_ModifyTablePath:
+			{
+				ModifyTablePath *mp = (ModifyTablePath *) t;
+				Path	   *sub = mp->subpath;
+
+				t->startup_cost = sub->startup_cost;
+				t->total_cost = sub->total_cost;
+				t->rows = mp->returningLists != NIL ? sub->rows : 0;
+			}
+			break;
+		case T_LimitPath:
+			{
+				Path	   *sub = ((LimitPath *) t)->subpath;
+
+				t->rows = sub->rows;
+				t->startup_cost = sub->startup_cost;
+				t->total_cost = sub->total_cost;
+				adjust_limit_rows_costs(&t->rows, &t->startup_cost,
+										&t->total_cost, R->upper->offset_est,
+										R->upper->count_est);
+			}
+			break;
 		default:
 			elog(ERROR, "RobDP: no replay for path node %d", (int) nodeTag(t));
 	}
@@ -1847,6 +2215,173 @@ vec_or_null(RobustVec *v, double scalar)
 	return NULL;
 }
 
+/* Is rel the upper relation of the kind? */
+static bool
+is_upper_rel(PlannerInfo *root, RelOptInfo *rel, UpperRelationKind kind)
+{
+	ListCell   *lc;
+
+	foreach(lc, root->upper_rels[kind])
+	{
+		if (lfirst(lc) == rel)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The grouping expressions of clauses (SortGroupClauses), as the input's
+ * target has them; false if one is missing.
+ */
+static bool
+group_exprs(List *clauses, PathTarget *target, List **exprs)
+{
+	ListCell   *lc;
+
+	*exprs = NIL;
+	foreach(lc, clauses)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		Expr	   *e = NULL;
+		ListCell   *lc2;
+
+		if (target->sortgrouprefs == NULL)
+			return false;
+		foreach(lc2, target->exprs)
+		{
+			if (target->sortgrouprefs[foreach_current_index(lc2)] ==
+				sgc->tleSortGroupRef)
+			{
+				e = (Expr *) lfirst(lc2);
+				break;
+			}
+		}
+		if (e == NULL)
+			return false;
+		*exprs = lappend(*exprs, e);
+	}
+	return true;
+}
+
+/*
+ * Can estimate_num_groups take the expressions?  Their Vars must belong to
+ * relations of this query level (those of a set operation's output do not).
+ */
+static bool
+exprs_estimable(PlannerInfo *root, List *exprs)
+{
+	List	   *vars = pull_var_clause((Node *) exprs,
+									   PVC_RECURSE_AGGREGATES |
+									   PVC_RECURSE_WINDOWFUNCS |
+									   PVC_RECURSE_PLACEHOLDERS);
+	ListCell   *lc;
+
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (!IsA(v, Var) || v->varno < 1 ||
+			v->varno >= root->simple_rel_array_size ||
+			root->simple_rel_array[v->varno] == NULL)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * The relation a grouping reads: down from its input path through the
+ * paths of upper relations (a Sort, the Gather of a partial aggregation and
+ * the partial aggregation itself) to the first path of another relation.
+ */
+static RelOptInfo *
+grouping_input_rel(Path *path)
+{
+	while (path->parent->reloptkind == RELOPT_UPPER_REL ||
+		   path->parent->reloptkind == RELOPT_OTHER_UPPER_REL)
+	{
+		List	   *children = path_children(path);
+
+		if (list_length(children) != 1)
+			return NULL;
+		path = (Path *) linitial(children);
+	}
+	return path->parent;
+}
+
+/* What a grouping path's number of groups can be got from */
+static void
+groups_setup(Replay *R, Path *path)
+{
+	PlannerInfo *root = R->root;
+	Path	   *sub = (Path *) linitial(path_children(path));
+	List	   *clauses = NIL;
+	bool		exprs = false;
+
+	switch (nodeTag(path))
+	{
+		case T_AggPath:
+			clauses = ((AggPath *) path)->groupClause;
+			exprs = true;
+			R->frozen_groups = ((AggPath *) path)->numGroups;
+			R->have_frozen = true;
+			break;
+		case T_GroupPath:
+			clauses = ((GroupPath *) path)->groupClause;
+			exprs = true;
+			/* with a HAVING qual, the groups are not the rows */
+			if (((GroupPath *) path)->qual == NIL)
+			{
+				R->frozen_groups = path->rows;
+				R->have_frozen = true;
+			}
+			break;
+		case T_UpperUniquePath:
+			/* a DISTINCT's (a set operation's has its input rows) */
+			if (is_upper_rel(root, path->parent, UPPERREL_DISTINCT) ||
+				is_upper_rel(root, path->parent, UPPERREL_PARTIAL_DISTINCT))
+			{
+				clauses = root->processed_distinctClause;
+				exprs = true;
+			}
+			R->frozen_groups = path->rows;
+			R->have_frozen = true;
+			break;
+		case T_SetOpPath:
+			/* rows from the inputs' groups, estimated by prepunion.c */
+			R->frozen_groups = path->rows;
+			R->have_frozen = true;
+			R->groups = ROBUST_GROUPS_FROZEN;
+			return;
+		default:
+			return;
+	}
+	if (exprs)
+		R->have_exprs = group_exprs(clauses, sub->pathtarget, &R->group_exprs) &&
+			exprs_estimable(root, R->group_exprs);
+	R->input_rel = grouping_input_rel(sub);
+}
+
+static bool
+groups_available(Replay *R, RobustGroups g)
+{
+	switch (g)
+	{
+		case ROBUST_GROUPS_EST_SUB:
+			return R->have_exprs;
+		case ROBUST_GROUPS_EST_INPUT:
+			return R->have_exprs && R->input_rel != NULL;
+		case ROBUST_GROUPS_SUB_ROWS:
+			return true;
+		case ROBUST_GROUPS_INPUT_ROWS:
+			return R->input_rel != NULL;
+		case ROBUST_GROUPS_FROZEN:
+			return R->have_frozen;
+		case ROBUST_GROUPS_NONE:
+			break;
+	}
+	return false;
+}
+
 static void
 replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 {
@@ -1868,9 +2403,14 @@ replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 	R.size = path_size(path);
 	R.limit_tuples = -1.0;
 
-	/* The inputs first */
+	/*
+	 * The inputs first (those of a partial path, or of a Gather, are partial:
+	 * they matter when an input was put in its pathlist without add_path)
+	 */
 	foreach(lc, children)
-		varies |= cost_varies(compute(root, (Path *) lfirst(lc), false));
+		varies |= cost_varies(compute(root, (Path *) lfirst(lc),
+									  rc->partial || IsA(path, GatherPath) ||
+									  IsA(path, GatherMergePath)));
 	if (IsA(path, SubqueryScanPath))
 		varies |= cost_varies(((SubqueryScanPath *) path)->subpath->robust);
 
@@ -1927,6 +2467,20 @@ replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 	else if (IsA(path, BitmapHeapPath))
 		tree_mults(&R, ((BitmapHeapPath *) path)->bitmapqual);
 
+	/* Upper paths: what their constructors were given */
+	if (IsA(path, AggPath) || IsA(path, WindowAggPath) || IsA(path, LimitPath))
+	{
+		R.upper = upper_info(path, false);
+		if (R.upper == NULL)
+		{
+			rc->status = ROBUST_COST_NOCONTEXT;
+			return;
+		}
+	}
+	if (IsA(path, AggPath) || IsA(path, GroupPath) ||
+		IsA(path, UpperUniquePath) || IsA(path, SetOpPath))
+		groups_setup(&R, path);
+
 	/* The inputs set per scenario */
 	add_base_rels(&R.slots, root);
 	add_rel(&R.slots, path->parent);
@@ -1937,6 +2491,8 @@ replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 		add_path_slots(&R.slots, (Path *) lfirst(lc));
 	if (IsA(path, SubqueryScanPath))
 		add_path_slots(&R.slots, ((SubqueryScanPath *) path)->subpath);
+	if (R.input_rel != NULL)
+		add_rel(&R.slots, R.input_rel);
 	if (IsA(path, NestPath) && IsA(((JoinPath *) path)->innerjoinpath, MemoizePath))
 	{
 		/* cost_memoize_rescan reads the Memoize's input and calls */
@@ -1964,16 +2520,43 @@ replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 
 	/* The point first, trying the variants the path does not record */
 	{
-		bool		ok = reproduces(&R);
+		bool		ok;
+
+		if (R.groups == ROBUST_GROUPS_NONE &&
+			(IsA(path, AggPath) || IsA(path, GroupPath) ||
+			 IsA(path, UpperUniquePath)))
+		{
+			/* the first source of the groups that gives the point */
+			ok = false;
+			for (int g = ROBUST_GROUPS_EST_SUB; g <= ROBUST_GROUPS_FROZEN && !ok; g++)
+			{
+				if (!groups_available(&R, (RobustGroups) g))
+					continue;
+				R.groups = (RobustGroups) g;
+				ok = reproduces(&R);
+			}
+		}
+		else
+			ok = reproduces(&R);
+		rc->groups = ok ? R.groups : ROBUST_GROUPS_NONE;
 
 		if (!ok && (IsA(path, SortPath) || IsA(path, IncrementalSortPath)))
 		{
 			R.limit_tuples = root->limit_tuples;
 			ok = reproduces(&R);
+			if (!ok && is_upper_rel(root, path->parent, UPPERREL_ORDERED) &&
+				ordered_limit(root, &R.limit_tuples))
+				ok = reproduces(&R);
 		}
 		if (!ok && IsA(path, SubqueryScanPath))
 		{
 			R.trivial = true;
+			ok = reproduces(&R);
+		}
+		if (!ok && (IsA(path, GatherPath) || IsA(path, GatherMergePath)))
+		{
+			/* generate_gather_paths(override_rows), gather_grouping_paths */
+			R.gather_rows = true;
 			ok = reproduces(&R);
 		}
 		if (!ok && IsA(path, BitmapHeapPath) &&
@@ -2132,6 +2715,28 @@ path_type_name(Path *path)
 			return "Sort";
 		case T_IncrementalSortPath:
 			return "IncrementalSort";
+		case T_AggPath:
+			return "Agg";
+		case T_GroupPath:
+			return "Group";
+		case T_UpperUniquePath:
+			return "UpperUnique";
+		case T_WindowAggPath:
+			return "WindowAgg";
+		case T_SetOpPath:
+			return "SetOp";
+		case T_LockRowsPath:
+			return "LockRows";
+		case T_ModifyTablePath:
+			return "ModifyTable";
+		case T_LimitPath:
+			return "Limit";
+		case T_GroupingSetsPath:
+			return "GroupingSets";
+		case T_RecursiveUnionPath:
+			return "RecursiveUnion";
+		case T_MinMaxAggPath:
+			return "MinMaxAgg";
 		default:
 			return psprintf("Other(tag %d, pathtype %d)", (int) nodeTag(path), (int) path->pathtype);
 	}
@@ -2250,12 +2855,66 @@ path_detail(Path *path)
 		case T_GatherMergePath:
 			appendStringInfo(&buf, "%d", ((GatherMergePath *) path)->num_workers);
 			break;
+		case T_AggPath:
+			{
+				static const char *const strategy[] = {"plain", "sorted", "hashed", "mixed"};
+				AggPath    *ap = (AggPath *) path;
+
+				appendStringInfo(&buf, "%s/%s", strategy[ap->aggstrategy],
+								 ap->aggsplit == AGGSPLIT_SIMPLE ? "simple" :
+								 ap->aggsplit == AGGSPLIT_INITIAL_SERIAL ? "partial" :
+								 ap->aggsplit == AGGSPLIT_FINAL_DESERIAL ? "final" :
+								 "other");
+			}
+			break;
+		case T_UpperUniquePath:
+			appendStringInfo(&buf, "%d", ((UpperUniquePath *) path)->numkeys);
+			break;
 		default:
 			break;
 	}
 	if (path->parallel_workers > 0)
 		appendStringInfo(&buf, "%sw%d", buf.len > 0 ? "/" : "", path->parallel_workers);
 	return buf.data;
+}
+
+static const char *
+groups_name(RobustGroups g)
+{
+	switch (g)
+	{
+		case ROBUST_GROUPS_EST_SUB:
+			return "est_sub";
+		case ROBUST_GROUPS_EST_INPUT:
+			return "est_input";
+		case ROBUST_GROUPS_SUB_ROWS:
+			return "sub_rows";
+		case ROBUST_GROUPS_INPUT_ROWS:
+			return "input_rows";
+		case ROBUST_GROUPS_FROZEN:
+			return "frozen";
+		case ROBUST_GROUPS_NONE:
+			break;
+	}
+	return NULL;
+}
+
+/* The kind of an upper relation, as named in the dump */
+static const char *
+upper_kind_name(PlannerInfo *root, RelOptInfo *rel)
+{
+	static const char *const names[] = {"setop", "partial_grouping",
+		"grouping", "window", "partial_distinct", "distinct", "ordered",
+	"final"};
+
+	StaticAssertStmt(lengthof(names) == UPPERREL_FINAL + 1,
+					 "upper relation names");
+	for (int k = 0; k <= UPPERREL_FINAL; k++)
+	{
+		if (is_upper_rel(root, rel, (UpperRelationKind) k))
+			return names[k];
+	}
+	return "other";
 }
 
 static void
@@ -2272,6 +2931,8 @@ dump_path(PlannerInfo *root, Path *path, RobustPathCost *rc)
 	robust_dump_begin(&d, "path");
 	robust_dump_str(&d, "pass", robust_pass_name(root->robust_pass));
 	robust_dump_relids(&d, "rels", root, path->parent->relids);
+	if (IS_UPPER_REL(path->parent))
+		robust_dump_str(&d, "upper", upper_kind_name(root, path->parent));
 	robust_dump_int(&d, "id", rc->id);
 	robust_dump_str(&d, "type", path_type_name(path));
 	initStringInfo(&buf);
@@ -2298,6 +2959,8 @@ dump_path(PlannerInfo *root, Path *path, RobustPathCost *rc)
 	robust_dump_str(&d, "detail", path_detail(path));
 	if (rc->semi_frozen)
 		robust_dump_bool(&d, "semi_frozen", true);
+	if (rc->groups != ROBUST_GROUPS_NONE)
+		robust_dump_str(&d, "groups", groups_name(rc->groups));
 	if (rc->status == ROBUST_COST_MISMATCH)
 	{
 		robust_dump_double(&d, "replayed_rows", rc->replayed[0]);
@@ -2347,17 +3010,16 @@ compute(PlannerInfo *root, Path *path, bool partial)
 /*
  * robust_cost_add_path
  *		Called by add_path() and add_partial_path() for every path offered to
- *		a relation of the join tree: computes the path's vectors (and those
- *		of its inputs not computed yet).  The paths of upper relations are
- *		not costed per scenario here.
+ *		a relation, of the join tree or above it: computes the path's vectors
+ *		(and those of its inputs not computed yet).  Also for a path put in a
+ *		pathlist without add_path, when it is compared to another.
  */
 void
 robust_cost_add_path(Path *path, bool partial)
 {
 	PlannerInfo *root = st ? st->root : NULL;
 
-	if (root == NULL || path->parent == NULL ||
-		path->parent->reloptkind == RELOPT_UPPER_REL)
+	if (root == NULL || path->parent == NULL)
 		return;
 	if (scratch_cxt == NULL)
 		scratch_cxt = AllocSetContextCreate(TopMemoryContext,

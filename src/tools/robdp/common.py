@@ -52,7 +52,9 @@ def start(install):
                        check=True, capture_output=True)
     subprocess.run([os.path.join(b, 'pg_ctl'), '-D', DATA, '-w',
                     '-l', os.path.join(DATA, 'server.log'),
-                    '-o', '-p %d -c shared_buffers=256MB -c max_connections=20' % PORT,
+                    # log_min_messages: the dump lines (LOG) stay out of server.log
+                    '-o', '-p %d -c shared_buffers=256MB -c max_connections=20 '
+                          '-c log_min_messages=fatal' % PORT,
                     'start'], check=True, capture_output=True)
     with open(os.path.join(DATA, 'robdp_install'), 'w') as f:
         f.write(install)

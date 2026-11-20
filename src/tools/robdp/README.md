@@ -26,6 +26,7 @@ All builds share the bench cluster. They are all 16.2 with the same catalog, so 
 | `check_s6.py` | S6 gate: replayed path costs equal the points with trivial profiles (serial and parallel), wiring of path rows to rel/ppi vectors, one-point profiles equal to stock PostgreSQL costs of the scaled query; plans unchanged; S5 gates; planning time. |
 | `check_s7.py` | S7 gate: join search with envelope and main passes. Trivial profiles: plans and envelope equal stock; the envelope pass leaves the main pass unchanged; one-point profiles: envelope equal to stock PostgreSQL's cheapest cost of the scaled query; envelope vs kept paths; no kept path dominated; S6 gates; planning time. |
 | `check_s8.py` | S8 gate: selection by the objectives. Trivial profiles with selection reduced to sorting: plans equal stock; every selection recomputed in Python from the vectors and the envelope (scores, kept paths, why); pathlists, Gather on kept partial paths, child join rels; settings; retained vs native pairing; S7 gates; planning time. |
+| `check_s9.py` | S9 gate: above the join search. Identity settings: plans equal stock, upper paths at their point; upper paths replayed against stock PostgreSQL on scaled queries; no upper replay fails; every final pick and every scan/join relation scoring recomputed in Python; final relation keeping 4 paths; S8 gates; planning time. |
 | `robdp_dump.py [DUMP.json]` | Parser for the planner's `ROBDP {json}` lines; without arguments it runs its self-test. The format is in `ROBDP_DUMP_SPEC.md`. |
 
 ## Typical gate

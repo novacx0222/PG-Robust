@@ -45,6 +45,27 @@
  * inputs keep, where PostgreSQL uses only a few of them (the cheapest
  * total path, ...): the paper's P(U1) x P(U2) x J (see joinpath.c).
  *
+ * Above the join search (S9):
+ *
+ *	- the scan/join relation, once planner.c has applied the final target to
+ *	  its paths and built the top Gather paths (apply_scanjoin_target_to_
+ *	  paths), has all its paths scored by the main objective against the
+ *	  cheapest of them in each scenario, without pruning
+ *	  (robust_select_score_rel): the projections of the paths the selection
+ *	  kept and the Gather paths on its kept partial paths, or every path of
+ *	  the only relation of a query without joins;
+ *	- the upper relations (grouping, window, distinct, ordered, final) keep
+ *	  the paths no other dominates in every scenario (add_path in the upper
+ *	  pass), costed per scenario by replay (optimizer/robustcost.h);
+ *	- the plan of each query level is made from the path of its final
+ *	  relation that is the best by the main objective of F(s), the cost of
+ *	  fetching the fraction of its rows the caller asks for
+ *	  (get_cheapest_fractional_path; 0, all of them, for a query's top
+ *	  level, whose LIMIT is a Limit path costed for the rows it fetches),
+ *	  with Penalty(s) against the cheapest F(s) of the final relation's
+ *	  paths (robust_select_final).  When none of them has vectors,
+ *	  PostgreSQL's choice stands.
+ *
  * src/include/optimizer/robustselect.h
  *
  *-------------------------------------------------------------------------
@@ -62,5 +83,8 @@ extern void robust_select_paths(PlannerInfo *root, RelOptInfo *rel,
 								const double *envelope);
 extern int	robust_select_compare(Path *path1, Path *path2,
 								  CostSelector criterion);
+extern void robust_select_score_rel(PlannerInfo *root, RelOptInfo *rel);
+extern Path *robust_select_final(RelOptInfo *rel, double tuple_fraction,
+								 Path *pg);
 
 #endif							/* ROBUSTSELECT_H */

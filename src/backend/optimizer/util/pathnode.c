@@ -608,8 +608,16 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 		PathCostComparison costcmp;
 		PathKeysComparison keyscmp;
 		BMS_Comparison outercmp;
-		bool		vec = new_robust || (robust && robust_has_vectors(old_path));
+		bool		vec;
 		int			rowscmp = 0;
+
+		/*
+		 * RobDP: a path put in the list without add_path (a projection that
+		 * replaced a path in place) gets its vectors now.
+		 */
+		if (robust && old_path->robust == NULL)
+			robust_cost_add_path(old_path, false);
+		vec = new_robust || (robust && robust_has_vectors(old_path));
 
 		/*
 		 * Do a fuzzy cost comparison with standard fuzziness limit.
@@ -970,6 +978,10 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 		Path	   *old_path = (Path *) lfirst(p1);
 		bool		remove_old = false; /* unless new proves superior */
 		PathKeysComparison keyscmp;
+
+		/* RobDP: as in add_path */
+		if (robust && old_path->robust == NULL)
+			robust_cost_add_path(old_path, true);
 
 		/* Compare pathkeys. */
 		keyscmp = compare_pathkeys(new_path->pathkeys, old_path->pathkeys);
@@ -3408,6 +3420,10 @@ create_agg_path(PlannerInfo *root,
 	pathnode->path.total_cost += target->cost.startup +
 		target->cost.per_tuple * pathnode->path.rows;
 
+	/* RobDP: what the replay needs and the path does not keep */
+	if (enable_rows_dist)
+		robust_cost_agg_costs(pathnode, aggcosts);
+
 	return pathnode;
 }
 
@@ -3711,6 +3727,10 @@ create_windowagg_path(PlannerInfo *root,
 	pathnode->path.startup_cost += target->cost.startup;
 	pathnode->path.total_cost += target->cost.startup +
 		target->cost.per_tuple * pathnode->path.rows;
+
+	/* RobDP: what the replay needs and the path does not keep */
+	if (enable_rows_dist)
+		robust_cost_window_funcs(pathnode, windowFuncs);
 
 	return pathnode;
 }
@@ -4033,6 +4053,10 @@ create_limit_path(PlannerInfo *root, RelOptInfo *rel,
 							&pathnode->path.startup_cost,
 							&pathnode->path.total_cost,
 							offset_est, count_est);
+
+	/* RobDP: what the replay needs and the path does not keep */
+	if (enable_rows_dist)
+		robust_cost_limit_ests(pathnode, offset_est, count_est);
 
 	return pathnode;
 }

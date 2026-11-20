@@ -516,3 +516,300 @@ robust_select_compare(Path *path1, Path *path2, CostSelector criterion)
 		return c;
 	return cmp_key(r1->mean_total, r2->mean_total);
 }
+
+/* -------------------------------------------- above the join search */
+
+/*
+ * The cheapest total cost of paths in each scenario: of the unparameterized
+ * ones if there are any ('complete'), else of all; NULL if there are none.
+ */
+static double *
+own_envelope(List *paths, bool complete)
+{
+	double	   *env;
+	bool		unparam = false;
+	bool		any = false;
+	ListCell   *lc;
+
+	if (complete)
+	{
+		foreach(lc, paths)
+			unparam |= ((Path *) lfirst(lc))->param_info == NULL;
+	}
+	env = palloc(sizeof(double) * error_sample_count);
+	for (int s = 0; s < error_sample_count; s++)
+		env[s] = NAN;
+	foreach(lc, paths)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+		const RobustVec *tv = path->robust ? path->robust->total : NULL;
+
+		if (unparam && path->param_info != NULL)
+			continue;
+		any = true;
+		for (int s = 0; s < error_sample_count; s++)
+		{
+			double		c = at(tv, path->total_cost, s);
+
+			if (isnan(env[s]) || c < env[s])
+				env[s] = c;
+		}
+	}
+	if (!any)
+	{
+		pfree(env);
+		return NULL;
+	}
+	return env;
+}
+
+/*
+ * robust_select_score_rel
+ *		The scan/join relation once its final target is applied (planner.c's
+ *		apply_scanjoin_target_to_paths): its paths are projections of those
+ *		the selection kept, or of the paths of a relation never selected
+ *		(the only relation of a query without joins), and the top Gather
+ *		paths were added.  Score them all by the main objective, against the
+ *		cheapest of them in each scenario, without pruning, so that the
+ *		upper planning starts from the best of them by the objective.
+ */
+void
+robust_select_score_rel(PlannerInfo *root, RelOptInfo *rel)
+{
+	double	   *env;
+	ListCell   *lc;
+
+	if (!enable_rows_dist || !robust_select ||
+		root->robust_pass != ROBUST_PASS_UPPER)
+		return;
+
+	/* every path with its vectors (projections replaced paths in place) */
+	foreach(lc, rel->pathlist)
+	{
+		if (((Path *) lfirst(lc))->robust == NULL)
+			robust_cost_add_path((Path *) lfirst(lc), false);
+	}
+	foreach(lc, rel->partial_pathlist)
+	{
+		if (((Path *) lfirst(lc))->robust == NULL)
+			robust_cost_add_path((Path *) lfirst(lc), true);
+	}
+
+	env = own_envelope(rel->partial_pathlist, false);
+	robust_select_paths(root, rel, true, list_length(rel->partial_pathlist), 0,
+						env);
+	env = own_envelope(rel->pathlist, true);
+	robust_select_paths(root, rel, false, list_length(rel->pathlist), 0, env);
+}
+
+/*
+ * The cost of fetching the fraction of a path's rows in scenario s, as
+ * get_cheapest_fractional_path and compare_fractional_path_costs compute
+ * it: an absolute number of rows (>= 1) is a fraction of the path's rows in
+ * s, and a fraction outside (0, 1) means the total cost.
+ */
+static double
+fractional_at(Path *path, double tuple_fraction, int s)
+{
+	const RobustPathCost *rc = path->robust;
+	double		total = at(rc ? rc->total : NULL, path->total_cost, s);
+	double		startup = at(rc ? rc->startup : NULL, path->startup_cost, s);
+	double		rows = at(rc ? rc->rows : NULL, path->rows, s);
+	double		f = tuple_fraction;
+
+	if (f >= 1.0 && rows > 0)
+		f = f / rows;
+	if (f <= 0.0 || f >= 1.0)
+		return total;
+	return startup + f * (total - startup);
+}
+
+/* likewise at the point (s = -1) */
+static double
+fractional_point(Path *path, double tuple_fraction)
+{
+	double		f = tuple_fraction;
+
+	if (f >= 1.0 && path->rows > 0)
+		f = f / path->rows;
+	if (f <= 0.0 || f >= 1.0)
+		return path->total_cost;
+	return path->startup_cost + f * (path->total_cost - path->startup_cost);
+}
+
+typedef struct FinalCand
+{
+	Path	   *path;
+	int			pos;
+	double		score;
+	double		mean_frac;
+	double		point_frac;
+} FinalCand;
+
+static int
+cmp_final(const void *a, const void *b)
+{
+	const FinalCand *x = (const FinalCand *) a;
+	const FinalCand *y = (const FinalCand *) b;
+	int			c;
+
+	if ((c = cmp_key(x->score, y->score)) != 0)
+		return c;
+	if ((c = cmp_key(x->mean_frac, y->mean_frac)) != 0)
+		return c;
+	if ((c = cmp_key(x->point_frac, y->point_frac)) != 0)
+		return c;
+	if ((c = cmp_key(x->path->startup_cost, y->path->startup_cost)) != 0)
+		return c;
+	return cmp_key(x->pos, y->pos);
+}
+
+static bool
+has_vectors(Path *path)
+{
+	const RobustPathCost *rc = path->robust;
+
+	return rc != NULL && (rc->rows != NULL || rc->startup != NULL ||
+						  rc->total != NULL);
+}
+
+/*
+ * robust_select_final
+ *		get_cheapest_fractional_path() in robust planning: the path of a
+ *		query level's final relation to make the plan of, the best by the
+ *		main objective of the cost of fetching tuple_fraction of its rows
+ *		F(s) (fractional_at) in each scenario.  Penalty(s) is against the
+ *		cheapest F(s) of the candidates, the paths of the final relation.
+ *		Ties go to the lower expected F, then to the lower F at the point,
+ *		the lower startup cost, the earlier path.  'pg' is PostgreSQL's
+ *		choice, which stands (NULL is returned) when no candidate has
+ *		vectors.  The retain strategy plays no part.
+ */
+Path *
+robust_select_final(RelOptInfo *rel, double tuple_fraction, Path *pg)
+{
+	int			n = list_length(rel->pathlist);
+	int			N = error_sample_count;
+	FinalCand  *c;
+	double	   *env;
+	bool		vectors = false;
+	Path	   *chosen = NULL;
+	ListCell   *lc;
+
+	if (n == 0)
+		return NULL;
+	foreach(lc, rel->pathlist)
+		vectors |= has_vectors((Path *) lfirst(lc));
+
+	c = palloc(sizeof(FinalCand) * n);
+	env = palloc(sizeof(double) * N);
+	for (int s = 0; s < N; s++)
+		env[s] = NAN;
+	foreach(lc, rel->pathlist)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+
+		for (int s = 0; s < N; s++)
+		{
+			double		f = fractional_at(path, tuple_fraction, s);
+
+			if (isnan(env[s]) || f < env[s])
+				env[s] = f;
+		}
+	}
+	foreach(lc, rel->pathlist)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+		const RobustPathCost *rc = path->robust;
+		FinalCand  *k = &c[foreach_current_index(lc)];
+		double		m = 0.0;
+		double		sum = 0.0;
+		double		fsum = 0.0;
+
+		k->path = path;
+		k->pos = foreach_current_index(lc);
+		for (int s = 0; s < N; s++)
+		{
+			double		f = fractional_at(path, tuple_fraction, s);
+			double		x = 0.0;
+
+			fsum += f;
+			switch (main_objective_id)
+			{
+				case OBJ_WORST_PENALTY:
+				case OBJ_EXPECTED_PENALTY:
+					x = f > env[s] * (1.0 + robust_penalty_tau) ? f - env[s] : 0.0;
+					break;
+				case OBJ_WORST_TOTAL:
+				case OBJ_EXPECTED_TOTAL:
+					x = f;
+					break;
+				case OBJ_WORST_STARTUP:
+				case OBJ_EXPECTED_STARTUP:
+					x = at(rc ? rc->startup : NULL, path->startup_cost, s);
+					break;
+				default:
+					elog(ERROR, "RobDP objective %d is not implemented",
+						 main_objective_id);
+			}
+			sum += x;
+			if (x > m)
+				m = x;
+		}
+		k->score = (main_objective_id == OBJ_WORST_PENALTY ||
+					main_objective_id == OBJ_WORST_TOTAL ||
+					main_objective_id == OBJ_WORST_STARTUP) ? m : sum / N;
+		k->mean_frac = fsum / N;
+		k->point_frac = fractional_point(path, tuple_fraction);
+	}
+
+	if (vectors)
+	{
+		FinalCand  *best = &c[0];
+
+		for (int i = 1; i < n; i++)
+		{
+			if (cmp_final(&c[i], best) < 0)
+				best = &c[i];
+		}
+		chosen = best->path;
+	}
+
+	if (robust_debug_dump)
+	{
+		RobustDump	d;
+		StringInfoData ids;
+		StringInfoData scores;
+
+		initStringInfo(&ids);
+		initStringInfo(&scores);
+		appendStringInfoChar(&ids, '[');
+		appendStringInfoChar(&scores, '[');
+		for (int i = 0; i < n; i++)
+		{
+			if (i > 0)
+			{
+				appendStringInfoChar(&ids, ',');
+				appendStringInfoChar(&scores, ',');
+			}
+			appendStringInfo(&ids, "%d", c[i].path->robust ? c[i].path->robust->id : -1);
+			robust_json_number(&scores, c[i].score);
+		}
+		appendStringInfoChar(&ids, ']');
+		appendStringInfoChar(&scores, ']');
+		robust_dump_begin(&d, "final");
+		robust_dump_double(&d, "fraction", tuple_fraction);
+		robust_dump_int(&d, "objective", main_objective_id);
+		robust_dump_bool(&d, "vectors", vectors);
+		robust_dump_raw(&d, "cands", ids.data);
+		robust_dump_raw(&d, "scores", scores.data);
+		robust_dump_int(&d, "chosen", chosen && chosen->robust ? chosen->robust->id : -1);
+		robust_dump_int(&d, "pg", pg && pg->robust ? pg->robust->id : -1);
+		robust_dump_end(&d);
+		pfree(ids.data);
+		pfree(scores.data);
+	}
+	pfree(c);
+	pfree(env);
+	return chosen;
+}

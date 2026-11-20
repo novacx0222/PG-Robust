@@ -56,6 +56,7 @@
 #include "optimizer/prep.h"
 #include "optimizer/robust.h"
 #include "optimizer/robustcost.h"
+#include "optimizer/robustselect.h"
 #include "optimizer/subselect.h"
 #include "optimizer/tlist.h"
 #include "parser/analyze.h"
@@ -1364,6 +1365,8 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 		 * special work for recursive unions is the responsibility of
 		 * plan_set_operations.
 		 */
+		/* RobDP: the paths built from here on belong to this query level */
+		robust_cost_set_root(root);
 		current_rel = plan_set_operations(root);
 
 		/*
@@ -1730,6 +1733,8 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 	 */
 	if (parse->sortClause)
 	{
+		robust_cost_ordered_limit(root, have_postponed_srfs ? -1.0 :
+								  limit_tuples);
 		current_rel = create_ordered_paths(root,
 										   current_rel,
 										   final_target,
@@ -6307,8 +6312,8 @@ make_sort_input_target(PlannerInfo *root,
  *
  * We assume set_cheapest() has been run on the given rel.
  */
-Path *
-get_cheapest_fractional_path(RelOptInfo *rel, double tuple_fraction)
+static Path *
+cheapest_fractional_path(RelOptInfo *rel, double tuple_fraction)
 {
 	Path	   *best_path = rel->cheapest_total_path;
 	ListCell   *l;
@@ -6332,6 +6337,25 @@ get_cheapest_fractional_path(RelOptInfo *rel, double tuple_fraction)
 		best_path = path;
 	}
 
+	return best_path;
+}
+
+Path *
+get_cheapest_fractional_path(RelOptInfo *rel, double tuple_fraction)
+{
+	Path	   *best_path = cheapest_fractional_path(rel, tuple_fraction);
+
+	/*
+	 * RobDP: the best by the main objective in the error scenarios (see
+	 * robust_select_final), when the paths have vectors.
+	 */
+	if (enable_rows_dist && robust_search && robust_select)
+	{
+		Path	   *robust = robust_select_final(rel, tuple_fraction, best_path);
+
+		if (robust != NULL)
+			return robust;
+	}
 	return best_path;
 }
 
@@ -7725,6 +7749,12 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 	 */
 	if (rel->consider_parallel && !IS_OTHER_REL(rel))
 		generate_useful_gather_paths(root, rel, false);
+
+	/*
+	 * RobDP: score the paths by the objective, the Gather paths just added
+	 * included (robust_select_score_rel).
+	 */
+	robust_select_score_rel(root, rel);
 
 	/*
 	 * Reassess which paths are the cheapest, now that we've potentially added

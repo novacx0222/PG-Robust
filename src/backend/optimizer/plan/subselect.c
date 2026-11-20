@@ -31,6 +31,7 @@
 #include "optimizer/planmain.h"
 #include "optimizer/planner.h"
 #include "optimizer/prep.h"
+#include "optimizer/robustcost.h"
 #include "optimizer/subselect.h"
 #include "parser/parse_relation.h"
 #include "rewrite/rewriteManip.h"
@@ -2163,6 +2164,7 @@ SS_charge_for_initplans(PlannerInfo *root, RelOptInfo *final_rel)
 		path->total_cost += initplan_cost;
 		path->parallel_safe = false;
 	}
+	robust_cost_charge(root, final_rel, initplan_cost);
 
 	/*
 	 * Forget about any partial paths and clear consider_parallel, too;
