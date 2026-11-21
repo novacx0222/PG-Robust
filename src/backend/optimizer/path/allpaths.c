@@ -3402,7 +3402,23 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		if (join_search_hook)
 			return (*join_search_hook) (root, levels_needed, initial_rels);
 		else if (enable_geqo && levels_needed >= geqo_threshold)
+		{
+			/*
+			 * RobDP: GEQO does not call standard_join_search, so neither the
+			 * envelope pass nor the main pass runs; the join relations keep
+			 * only the paths add_path()'s per-scenario dominance keeps, and
+			 * the objectives choose among the top relation's paths alone.
+			 */
+			if (root->robust_pass == ROBUST_PASS_BASE)
+				ereport(NOTICE,
+						(errmsg("RobDP: GEQO plans this join of %d relations without RobDP's join search",
+								levels_needed),
+						 errdetail("The join search reaches geqo_threshold (%d), so the objectives do not select the join relations' paths.",
+								   geqo_threshold),
+						 errhint("Set geqo to off, or raise geqo_threshold above %d, for RobDP's join search.",
+								 levels_needed)));
 			return geqo(root, levels_needed, initial_rels);
+		}
 		else
 			return standard_join_search(root, levels_needed, initial_rels);
 	}

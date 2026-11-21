@@ -396,14 +396,19 @@ same_candidate(Path *a, Path *b)
 /*
  * robust_select_offer
  *		add_path() / add_partial_path() in the main pass of a selecting
- *		search: append the candidate, unless the list has its twin.  Returns
- *		whether it was appended.
+ *		search: append the candidate, unless the list has its twin (with
+ *		robust_select_dedup on).  Returns whether it was appended.
  */
 bool
 robust_select_offer(List **pathlist, Path *path)
 {
 	ListCell   *lc;
 
+	if (!robust_select_dedup)
+	{
+		*pathlist = lappend(*pathlist, path);
+		return true;
+	}
 	foreach(lc, *pathlist)
 	{
 		if (same_candidate((Path *) lfirst(lc), path))
@@ -906,8 +911,8 @@ dump_ids_scores(RobustDump *d, const char *key, Cand *c, int n, bool ids,
 
 static void
 dump_keep(PlannerInfo *root, RelOptInfo *rel, bool partial, int limit,
-		  int retain, const double *envelope, Cand *c, int n, Cand **kept,
-		  int nkept)
+		  int retain, bool had_envelope, int filled, Cand *c, int n,
+		  Cand **kept, int nkept)
 {
 	RobustDump	d;
 	StringInfoData buf;
@@ -920,7 +925,8 @@ dump_keep(PlannerInfo *root, RelOptInfo *rel, bool partial, int limit,
 	robust_dump_int(&d, "retain", retain);
 	robust_dump_int(&d, "objective", main_objective_id);
 	robust_dump_int(&d, "strategy", retain_strategy_id);
-	robust_dump_bool(&d, "envelope", envelope != NULL);
+	robust_dump_bool(&d, "envelope", had_envelope);
+	robust_dump_int(&d, "filled", filled);
 	dump_ids_scores(&d, "cands", c, n, true, false);
 	dump_ids_scores(&d, "main", c, n, false, false);
 	if (retain > 0)
@@ -963,6 +969,59 @@ dump_keep(PlannerInfo *root, RelOptInfo *rel, bool partial, int limit,
 	robust_dump_end(&d);
 }
 
+static double *own_envelope(List *paths, bool complete);
+
+/*
+ * The envelope a selection compares to: the relation's, with every scenario
+ * it lacks taken from the candidates themselves (the cheapest of them in
+ * that scenario, of the unparameterized ones for complete paths if there are
+ * any, as own_envelope).  A scenario lacks its value when no path of the
+ * relation was left in that envelope round: add_partial_path_precheck drops
+ * every partial path that costs more than the cheapest complete one, and the
+ * main pass, without the precheck, still has candidates.  The relation lacks
+ * an envelope when the envelope rounds never built it.  Without an objective
+ * that compares to the envelope there is none to fill.  *filled is the
+ * number of scenarios taken from the candidates.
+ */
+static const double *
+selection_envelope(List *list, bool partial, int retain,
+				   const double *envelope, int *filled)
+{
+	double	   *own;
+	double	   *env;
+
+	*filled = 0;
+	if (envelope == NULL &&
+		!robust_objective_needs_envelope(main_objective_id) &&
+		!(retain > 0 && robust_objective_needs_envelope(retain_strategy_id)))
+		return NULL;
+	if (envelope != NULL)
+	{
+		bool		lacks = false;
+
+		for (int s = 0; s < error_sample_count; s++)
+			lacks |= isnan(envelope[s]);
+		if (!lacks)
+			return envelope;
+	}
+	own = own_envelope(list, !partial);
+	if (own == NULL)
+		return envelope;
+	env = palloc(sizeof(double) * error_sample_count);
+	for (int s = 0; s < error_sample_count; s++)
+	{
+		if (envelope != NULL && !isnan(envelope[s]))
+			env[s] = envelope[s];
+		else
+		{
+			env[s] = own[s];
+			(*filled)++;
+		}
+	}
+	pfree(own);
+	return env;
+}
+
 /*
  * robust_select_paths
  *		Keep the paths of rel's pathlist (or partial_pathlist) the objectives
@@ -971,7 +1030,8 @@ dump_keep(PlannerInfo *root, RelOptInfo *rel, bool partial, int limit,
  *		only) the best unparameterized candidate if none was kept.  A limit
  *		of at least the number of candidates keeps them all: the relation is
  *		only scored.  'envelope' is the relation's, for its complete or its
- *		partial paths, or NULL.
+ *		partial paths, or NULL; the scenarios it lacks are taken from the
+ *		candidates (selection_envelope).
  */
 void
 robust_select_paths(PlannerInfo *root, RelOptInfo *rel, bool partial,
@@ -985,9 +1045,12 @@ robust_select_paths(PlannerInfo *root, RelOptInfo *rel, bool partial,
 	int			nkept = 0;
 	List	   *result = NIL;
 	ListCell   *lc;
+	bool		had_envelope = envelope != NULL;
+	int			filled;
 
 	if (n == 0)
 		return;
+	envelope = selection_envelope(list, partial, retain, envelope, &filled);
 	c = palloc(sizeof(Cand) * n);
 	order = palloc(sizeof(Cand *) * n);
 	kept = palloc(sizeof(Cand *) * n);
@@ -1075,8 +1138,10 @@ robust_select_paths(PlannerInfo *root, RelOptInfo *rel, bool partial,
 		result = lappend(result, k->path);
 	}
 	if (robust_dumping(root))
-		dump_keep(root, rel, partial, limit, retain, envelope, c, n, kept,
-				  nkept);
+		dump_keep(root, rel, partial, limit, retain, had_envelope, filled, c,
+				  n, kept, nkept);
+	if (filled > 0)
+		pfree((double *) envelope);
 
 	if (partial)
 		rel->partial_pathlist = result;

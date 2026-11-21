@@ -154,6 +154,7 @@ class Stats:
         self.child_env = 0          # ... against an envelope
         self.child_envs = 0         # child env events
         self.noenv = 0              # selections without an envelope under an envelope objective
+        self.filled = 0             # selections whose envelope lacked scenarios (taken from the candidates)
         self.level1 = 0             # level-1 selections (scored only)
         self.pathlists = 0
         self.dv_picks = 0           # paths a diversification function retained
@@ -209,6 +210,13 @@ def check_keep(name, k, paths, env, cfg, st):
         ev = vec(e['partial'] if k['partial'] else e['cost'], N)
     elif needs_env(cfg['main']) or (retain > 0 and needs_env(cfg['retain'])):
         st.noenv += 1
+    ev, filled = objectives.selection_envelope(
+        cands, k['partial'], ev, needs_env(cfg['main']) or (retain > 0 and needs_env(cfg['retain'])), N)
+    if k.get('filled', 0) != filled:
+        bad.append(('G2', '%s: %s scenarios filled from the candidates, recomputed %d'
+                    % (where, k.get('filled'), filled)))
+        return
+    st.filled += filled > 0
     if is_child(k['rels']) and len(k['rels'].split()) > 1:
         st.child += 1
         st.child_env += k['envelope']
@@ -470,9 +478,11 @@ def main():
     for tag, cfg, _ in configs:
         st, envs = per[tag]
         print('       %s main %d retain %d limit %d+%d final %d tau %g %s: %d selections, %d candidates, '
-              '%d kept (%d parameterized), %d level-1, %d env events, %d without envelope'
+              '%d kept (%d parameterized), %d level-1, %d env events, %d without envelope, '
+              '%d with scenarios filled from the candidates'
               % (tag, cfg['main'], cfg['retain'], cfg['limit'], cfg['rlimit'], cfg['final'], cfg['tau'],
-                 cfg['pairing'], st.keeps, st.cands, st.kept, st.param_kept, st.level1, envs, st.noenv))
+                 cfg['pairing'], st.keeps, st.cands, st.kept, st.param_kept, st.level1, envs, st.noenv,
+                 st.filled))
     g3 = probs('G3')
     allok &= report('G3', not g3 and total.pathlists > 0 and total.unparam > 0,
                     '%d pathlists = the kept paths in order, cheapest total the first unparameterized; '

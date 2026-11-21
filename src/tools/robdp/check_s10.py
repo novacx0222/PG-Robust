@@ -166,6 +166,8 @@ def o4(res, cfg):
                     env[e['rels']] = e
                 elif e['ev'] == 'keep' and e['pass'] == 'main' and e['envelope']:
                     ev = vec(env[e['rels']]['partial' if e['partial'] else 'cost'], N)
+                    ev, _ = objectives.selection_envelope([paths[i] for i in e['cands']], e['partial'], ev,
+                                                          True, N)
                     for i, sc in zip(e['cands'], e['main']):
                         n += 1
                         v = v20_fourth_worst(paths[i], ev, cfg['tau'])

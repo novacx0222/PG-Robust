@@ -92,6 +92,32 @@ def loss_at(how, cost, startup, env, tau):
     return cost
 
 
+def selection_envelope(cands, partial, env, need, N=20):
+    """robustselect.c selection_envelope(): the relation's envelope (a list,
+    or None) with every scenario it lacks (NaN, or no envelope at all under
+    an objective that needs one) taken from the candidates, the cheapest
+    total in that scenario (of the unparameterized ones for complete paths
+    if there are any).  Returns (envelope or None, scenarios filled)."""
+    if env is None and not need:
+        return None, 0
+    if env is not None and not any(math.isnan(e) for e in env):
+        return env, 0
+    pool = cands
+    if not partial and any(p['param'] is None for p in cands):
+        pool = [p for p in cands if p['param'] is None]
+    if not pool:
+        return env, 0
+    own = [min(vec(p['total'], N)[s] for p in pool) for s in range(N)]
+    out, filled = [], 0
+    for s in range(N):
+        if env is not None and not math.isnan(env[s]):
+            out.append(env[s])
+        else:
+            out.append(own[s])
+            filled += 1
+    return out, filled
+
+
 def objective(oid, p, env, tau, lam=1.0, alpha=0.85, N=20):
     """robustselect.c objective(): p a path event, env the envelope or None"""
     how = loss(oid)

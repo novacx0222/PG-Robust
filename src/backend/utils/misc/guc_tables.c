@@ -1057,6 +1057,16 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"robust_select_dedup", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Drops a candidate path of RobDP's main pass that has a twin."),
+			gettext_noop("A twin has the same parameterization, sort order, parallel safety and workers, rows and costs in every scenario."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&robust_select_dedup,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"robust_select", PGC_USERSET, DEVELOPER_OPTIONS,
 			gettext_noop("Keeps, for each join relation of RobDP's main pass, the paths its objectives select."),
 			gettext_noop("When off, the main pass keeps every path no other path "
