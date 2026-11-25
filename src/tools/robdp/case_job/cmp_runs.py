@@ -3,6 +3,11 @@ executions, plan shape, planning time"""
 import json, os, sys, glob, subprocess, statistics
 B = '/Users/xuanchen2026/Projects/RobDP-Backup/'
 PSQL = '/Users/xuanchen2026/RobDP/install/v2-release/bin/psql'
+# workers per Gather; 0 (the default here) turns parallel query off
+PAR = os.environ.get('ROBDP_PAR', '0')
+# more parallel GUCs, ROBDP_PAR_GUCS='max_parallel_workers=16,parallel_setup_cost=100'
+PARSET = "SET max_parallel_workers_per_gather = %s;\n" % PAR + ''.join(
+    "SET %s = '%s';\n" % tuple(kv.split('=', 1)) for kv in os.environ.get('ROBDP_PAR_GUCS', '').split(',') if kv)
 
 def robust(t, main=0, retain=0, rlimit=1, extra=()):
     prof = B + 'imdb-separate-ep-0826-2/%s-0_cardinality/error_profile' % t
@@ -15,7 +20,7 @@ def robust(t, main=0, retain=0, rlimit=1, extra=()):
     return ''.join("SET %s = '%s';\n" % kv for kv in s.items())
 
 def explain(sql, sets, analyze=True):
-    q = sets + "SET max_parallel_workers_per_gather = 0;\nEXPLAIN (%sFORMAT JSON) %s;\n" % (
+    q = sets + PARSET + "EXPLAIN (%sFORMAT JSON) %s;\n" % (
         'ANALYZE, ' if analyze else '', sql.rstrip().rstrip(';'))
     p = subprocess.run([PSQL, '-p', '55501', '-U', 'postgres', '-X', '-q', '-At', '-d', 'imdb'],
                        input=q, capture_output=True, text=True, timeout=900)
@@ -26,7 +31,8 @@ def explain(sql, sets, analyze=True):
 def shape(n):
     kids = [shape(c) for c in n.get('Plans', [])]
     rel = n.get('Alias', '')
-    return n['Node Type'] + (('(' + rel + ')') if rel else '') + (('[' + ', '.join(kids) + ']') if kids else '')
+    par = 'Parallel ' if n.get('Parallel Aware') else ''   # never set without parallel query
+    return par + n['Node Type'] + (('(' + rel + ')') if rel else '') + (('[' + ', '.join(kids) + ']') if kids else '')
 
 def timed(sql, sets, reps=3):
     rs = [explain(sql, sets) for _ in range(reps)]
