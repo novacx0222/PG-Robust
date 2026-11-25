@@ -148,6 +148,7 @@ class Stats:
         self.cands = 0
         self.kept = 0
         self.unparam = 0            # complete selections that needed the rescue
+        self.safe = 0               # ... that kept a parallel-safe path for want of one
         self.param_kept = 0         # parameterized paths among the kept
         self.gathers = 0            # Gather candidates checked
         self.child = 0              # child join rel selections
@@ -269,6 +270,13 @@ def check_keep(name, k, paths, env, cfg, st):
             if cands[i]['param'] is None:
                 by[i] = 'unparam'
                 st.unparam += 1
+                break
+    if not k['partial'] and not any(by[i] != 'no' and cands[i]['param'] is None and cands[i]['parallel_safe']
+                                    for i in range(n)):
+        for i in order:
+            if cands[i]['param'] is None and cands[i]['parallel_safe']:
+                by[i] = 'safe'
+                st.safe += 1
                 break
     kept = [i for i in order if by[i] != 'no']
     if [ids[i] for i in kept] != k['kept'] or [by[i] for i in kept] != k['by']:
@@ -486,8 +494,8 @@ def main():
     g3 = probs('G3')
     allok &= report('G3', not g3 and total.pathlists > 0 and total.unparam > 0,
                     '%d pathlists = the kept paths in order, cheapest total the first unparameterized; '
-                    '%d complete selections kept the best unparameterized path for want of one (P2)'
-                    % (total.pathlists, total.unparam) if not g3 else '%d failures: %s' % (len(g3), '; '.join(g3[:4])))
+                    '%d complete selections kept the best unparameterized path for want of one (P2), '
+                    '%d the best parallel-safe one' % (total.pathlists, total.unparam, total.safe) if not g3 else '%d failures: %s' % (len(g3), '; '.join(g3[:4])))
     g4 = probs('G4')
     child_ok = total.child > 0 and total.child_envs > 0 and per['A'][0].child_env == per['A'][0].child
     allok &= report('G4', not g4 and total.gathers > 0 and child_ok,

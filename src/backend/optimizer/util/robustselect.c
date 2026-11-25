@@ -77,6 +77,7 @@ typedef enum KeptBy
 	KEPT_MAIN,
 	KEPT_RETAIN,
 	KEPT_UNPARAM,
+	KEPT_SAFE,
 } KeptBy;
 
 typedef struct Cand
@@ -881,6 +882,8 @@ kept_by_name(KeptBy by)
 			return "retain";
 		case KEPT_UNPARAM:
 			return "unparam";
+		case KEPT_SAFE:
+			return "safe";
 		default:
 			return "no";
 	}
@@ -1027,7 +1030,8 @@ selection_envelope(List *list, bool partial, int retain,
  *		Keep the paths of rel's pathlist (or partial_pathlist) the objectives
  *		select, scored, in the order of the main objective: 'limit' by the
  *		main objective, then 'retain' by the retain strategy, then (pathlist
- *		only) the best unparameterized candidate if none was kept.  A limit
+ *		only) the best unparameterized candidate if none was kept, and the
+ *		best parallel-safe unparameterized one if none was kept.  A limit
  *		of at least the number of candidates keeps them all: the relation is
  *		only scored.  'envelope' is the relation's, for its complete or its
  *		partial paths, or NULL; the scenarios it lacks are taken from the
@@ -1114,6 +1118,31 @@ robust_select_paths(PlannerInfo *root, RelOptInfo *rel, bool partial,
 			if (order[i]->path->param_info == NULL)
 			{
 				order[i]->by = KEPT_UNPARAM;
+				have = true;
+			}
+		}
+
+		/*
+		 * And the best parallel-safe unparameterized path if none is kept:
+		 * the join builders take a partial join's inner path from the
+		 * pathlist's parallel-safe unparameterized paths
+		 * (get_cheapest_parallel_safe_total_inner), and a Gather path, which
+		 * is never parallel-safe, may win here.  add_path never lets a path
+		 * that is not parallel-safe dominate one that is.
+		 */
+		have = false;
+		for (int i = 0; i < n; i++)
+		{
+			if (c[i].by != KEPT_NOT && c[i].path->param_info == NULL &&
+				c[i].path->parallel_safe)
+				have = true;
+		}
+		for (int i = 0; i < n && !have; i++)
+		{
+			if (order[i]->path->param_info == NULL &&
+				order[i]->path->parallel_safe)
+			{
+				order[i]->by = KEPT_SAFE;
 				have = true;
 			}
 		}
