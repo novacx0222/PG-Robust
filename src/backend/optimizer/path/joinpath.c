@@ -833,6 +833,15 @@ try_nestloop_path(PlannerInfo *root,
 	/* If we got past that, we shouldn't have any unsafe outer-join refs */
 	Assert(!have_unsafe_outer_join_ref(root, outerrelids, inner_paramrels));
 
+	/* RobDP: a candidate the selection could never keep (robustselect.h) */
+	if (!robust_precheck_join(root, joinrel, false, ROBUST_BOUND_NESTLOOP,
+							  outer_path, inner_path, false, false,
+							  required_outer != NULL))
+	{
+		bms_free(required_outer);
+		return;
+	}
+
 	/*
 	 * Do a precheck to quickly eliminate obviously-inferior paths.  We
 	 * calculate a cheap lower bound on the path's cost and then use
@@ -931,6 +940,11 @@ try_partial_nestloop_path(PlannerInfo *root,
 		if (!bms_is_subset(inner_paramrels, outerrelids))
 			return;
 	}
+
+	/* RobDP: see try_nestloop_path */
+	if (!robust_precheck_join(root, joinrel, true, ROBUST_BOUND_NESTLOOP,
+							  outer_path, inner_path, false, false, false))
+		return;
 
 	/*
 	 * Before creating a path, get a quick lower bound on what it is likely to
@@ -1043,6 +1057,15 @@ try_mergejoin_path(PlannerInfo *root,
 		pathkeys_contained_in(innersortkeys, inner_path->pathkeys))
 		innersortkeys = NIL;
 
+	/* RobDP: see try_nestloop_path */
+	if (!robust_precheck_join(root, joinrel, false, ROBUST_BOUND_MERGEJOIN,
+							  outer_path, inner_path, outersortkeys != NIL,
+							  innersortkeys != NIL, required_outer != NULL))
+	{
+		bms_free(required_outer);
+		return;
+	}
+
 	/*
 	 * See comments in try_nestloop_path().
 	 */
@@ -1119,6 +1142,12 @@ try_partial_mergejoin_path(PlannerInfo *root,
 		pathkeys_contained_in(innersortkeys, inner_path->pathkeys))
 		innersortkeys = NIL;
 
+	/* RobDP: see try_nestloop_path */
+	if (!robust_precheck_join(root, joinrel, true, ROBUST_BOUND_MERGEJOIN,
+							  outer_path, inner_path, outersortkeys != NIL,
+							  innersortkeys != NIL, false))
+		return;
+
 	/*
 	 * See comments in try_partial_nestloop_path().
 	 */
@@ -1189,6 +1218,15 @@ try_hashjoin_path(PlannerInfo *root,
 		return;
 	}
 
+	/* RobDP: see try_nestloop_path */
+	if (!robust_precheck_join(root, joinrel, false, ROBUST_BOUND_HASHJOIN,
+							  outer_path, inner_path, false, false,
+							  required_outer != NULL))
+	{
+		bms_free(required_outer);
+		return;
+	}
+
 	/*
 	 * See comments in try_nestloop_path().  Also note that hashjoin paths
 	 * never have any output pathkeys, per comments in create_hashjoin_path.
@@ -1255,6 +1293,11 @@ try_partial_hashjoin_path(PlannerInfo *root,
 		if (!bms_is_empty(inner_paramrels))
 			return;
 	}
+
+	/* RobDP: see try_nestloop_path */
+	if (!robust_precheck_join(root, joinrel, true, ROBUST_BOUND_HASHJOIN,
+							  outer_path, inner_path, false, false, false))
+		return;
 
 	/*
 	 * Before creating a path, get a quick lower bound on what it is likely to

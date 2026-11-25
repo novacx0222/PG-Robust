@@ -29,7 +29,8 @@
  *	3	expected total cost 	E[Cost] (ranks as the paper's E[Gap])
  *	4	worst startup cost		max_s startup(s)
  *	5	expected startup cost	E[startup]
- *	6	penalty probability 	E[Penalty(s) > 0] = 1 - ProbNoPenalty
+ *	6	penalty count			#{s : Penalty(s) > 0} = N (1 - ProbNoPenalty),
+ *							0 to N (v20's coverage count reversed)
  *	8	point total cost		PostgreSQL's estimate
  *	10	worst penalty + lambda Stdev[Penalty]
  *	11	E[Penalty] + lambda Stdev[Penalty]
@@ -75,6 +76,30 @@
  * inputs keep, where PostgreSQL uses only a few of them (the cheapest
  * total path, ...): the paper's P(U1) x P(U2) x J (see joinpath.c).
  *
+ * With robust_select_precheck on, the join builders ask
+ * robust_precheck_join() before they build and cost a join path
+ * candidate, in place of add_path_precheck(), which the main pass turns
+ * off.  It drops a candidate the selection could never keep: from its
+ * input paths' costs in each scenario a lower bound of its total (and
+ * startup) cost in each scenario follows (nested loop: the outer path's
+ * total plus the inner's startup; hash join: both totals; merge join: each
+ * side's startup, its total when it is sorted), and from those, as every
+ * objective but 10 and 11 is monotone in them, a lower bound L of its
+ * score.  The candidate is dropped when, among the candidates offered so
+ * far, at least K have a main score below L (K = add_path_limit, or
+ * add_path_limit + retain_path_limit when the retain strategy is the main
+ * objective; robust_final_path_limit if larger), at least
+ * add_path_limit + retain_path_limit a retain score below its bound
+ * (another objective as the retain strategy), and, for a complete
+ * unparameterized candidate, one unparameterized candidate a main score
+ * below L (one parallel-safe one too, for a parallel-safe candidate).  The
+ * selection then keeps exactly what it would have kept.  Not with a
+ * diversification function as the retain strategy, objectives 10 and 11,
+ * child relations of partitionwise joins, or when an objective needs the
+ * envelope and the relation's lacks a scenario (the selection would fill
+ * it from the candidates).  The bounds are lowered by a relative 1e-9 for
+ * the rounding of the cost functions' sums.
+ *
  * Above the join search (S9):
  *
  *	- the scan/join relation, once planner.c has applied the final target to
@@ -109,6 +134,20 @@
 extern bool robust_objective_needs_envelope(int objective);
 extern bool robust_select_retained(PlannerInfo *root);
 extern bool robust_select_offer(List **pathlist, Path *path);
+
+/* The join method of a candidate robust_precheck_join() bounds */
+typedef enum RobustJoinBound
+{
+	ROBUST_BOUND_NESTLOOP,
+	ROBUST_BOUND_HASHJOIN,
+	ROBUST_BOUND_MERGEJOIN,
+} RobustJoinBound;
+
+extern bool robust_precheck_join(PlannerInfo *root, RelOptInfo *joinrel,
+								 bool partial, RobustJoinBound method,
+								 Path *outer_path, Path *inner_path,
+								 bool outer_sorted, bool inner_sorted,
+								 bool parameterized);
 extern void robust_select_paths(PlannerInfo *root, RelOptInfo *rel,
 								bool partial, int limit, int retain,
 								const double *envelope);

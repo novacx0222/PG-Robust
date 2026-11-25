@@ -1067,6 +1067,17 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"robust_select_precheck", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Drops a join path candidate of RobDP's main pass that the selection could never keep, before costing it."),
+			gettext_noop("A lower bound of the candidate's score, from its input paths' costs in each scenario, must be worse "
+						 "than the scores of as many candidates as the selection keeps (optimizer/robustselect.h)."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&robust_select_precheck,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"robust_gather_all", PGC_USERSET, DEVELOPER_OPTIONS,
 			gettext_noop("Offers a Gather on every partial path candidate of a join relation of RobDP's main pass."),
 			gettext_noop("When off, as in PostgreSQL, a plain Gather is built on the first kept partial path only. "

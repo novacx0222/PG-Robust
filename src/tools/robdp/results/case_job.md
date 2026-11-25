@@ -1251,3 +1251,154 @@ v20 同设置下的结果（第 21 节）：E[Cost]×1 1.18，×8 1.17；E[Pen]�
   - 执行几何平均仍是 v2 高于 v20。
   - 执行总和仍是 v20 低于 stock，v2 高于 stock（T3、T23）。
   - v2 和 v20 的计划相同的只有 27/130。
+
+## 24. 规划时间：v2 比 v20 慢在哪里
+
+### 24.1 设置
+
+- **查询**：每个模板取 1 条，共 13 条。取的是 `case_job_pmax_v2_safe.json` 里 E[Cost]×1 规划时间居中的那条。
+- **测法**：同一会话连续 EXPLAIN 4 次，取第 2–4 次的中位数（热缓存）。
+- **配置**：c1 = E[Cost]×1；p8 = E[Pen]×8（retain 8，strategy E[Pen]）。设置分两组：最大并行（与第 21 节相同）和关并行。
+- **v2 的消融项**：
+  - native pairing，即 PG 原生的连接构造，v20 也用这个；
+  - 场景数 N=1。
+- **v20 的场景数**：v20 的 `error_sample_count` 最小是 4，所以小 N 用 N=4。
+- **服务器**：v20 的做法和第 10 节一样，先停 v2，再用 v20 的二进制启动同一个数据目录。
+- **脚本和数据**：
+  - 脚本：`case_job/plantime.py`、`plantime_report.py`、`pairing_plans.py`；
+  - 数据：`results/plantime_{v2,v20}.json`、`results/pairing_plans.json`。
+
+### 24.2 结果（13 条查询的中位数，单位 ms）
+
+| | stock | v20 | v2 默认（retained） | v2 native | v2/v20 几何平均 | v2 native/v20 |
+|---|---|---|---|---|---|---|
+| c1，最大并行 | 1.2 | 5.8 | 30.2 | 13.4 | 4.9× | 2.2× |
+| p8，最大并行 | | 48.7 | 498 | 82.9 | 7.9× | 1.65× |
+| c1，关并行 | 0.7 | 2.7 | 9.1 | 6.4 | 3.2× | 2.3× |
+| p8，关并行 | | 27.3 | 281 | 51.9 | 8.2× | 1.95× |
+
+按影响从大到小：
+
+1. **retained pairing（v2 独有）。p8 的差距几乎全来自这一项，c1 的差距有一半来自它。**
+   - 路径数（T11 的 11-0_testing_7，main pass 计算的路径数）：
+     - c1：retained 28.5k，native 12.7k；关并行时是 8.9k 和 6.0k。
+     - p8：retained 256k，native 39.6k。
+   - **twin 去重本身很贵**：`robust_select_offer` 对每个候选都线性扫描一遍已有的候选，所以是 O(候选数²)。
+     - 在 T22 上，p8 规划时间有 53% 花在它的 self time 上。
+     - 关掉 `robust_select_dedup` 后，T22 的 p8 从 7.8 s 降到 3.7 s，T21 从 2.1 s 降到 1.1 s。130 条查询里只有 2 条计划变了，都在 T21，是平局顺序的差别。
+   - **对计划的影响**（130 条查询，最大并行）：
+     - c1：native 与 retained 的计划 130/130 相同，规划中位数从 34 ms 降到 16 ms。
+     - p8：110/130 相同，规划中位数从 511 ms 降到 89 ms。
+   - 与 v20 计划相同的条数，native 和 retained 一样：c1 都是 32，p8 都是 27。
+2. **每个场景的代价计算：v2 每个场景的开销约是 v20 的 2–3 倍。**
+   - **斜率**：用 N 大和 N 小两点之差估计，即每多 1 个场景多花的时间。
+     - T22，c1 native：v2 5.2 ms，v20 1.6 ms。
+     - T22，p8 native：v2 32 ms，v20 18 ms。
+   - **截距**：N→0 的部分。p8 两边接近（123 对 127 ms），说明 native 下两边候选数相近；c1 是 31 对 23 ms。
+   - **profile**（macOS `sample`，T22，c1 native，最大并行）：
+     - 77% 在 `compute`，即 replay；
+     - 其中真正的 PG 代价函数（`cost_copy`）占 44%；
+     - replay 本身的开销（memcpy、投影、内存上下文重置）约 17%；
+     - hash bucket 和 Memoize ngroups 两张侧表的 hash 查找约 12%；
+     - 选择（`robust_select_paths`）约 12%。
+   - **v20 为什么便宜**：
+     - v20 的 2p 函数只在样本上做算术循环；
+     - index 选择率、`approx_tuple_count` 都只按点估计算一次。
+     - 这是第 6 节（S6）的设计选择：v2 让乘子进入代价函数里的选择率。
+   - **v2 每条路径的额外调用**：除了 N 次 replay，还要先做一次点检查（`reproduces`）。envelope 的每一轮里，每条路径要调用 3 次代价函数（原生 1 次、点检查 1 次、本轮 1 次），v20 只调用 1 次。
+3. **并行放大了前两项。**
+   - c1 最大并行比关并行慢：v2 3.3 倍，v20 2.1 倍。
+   - 原因有两个：
+     - retained 把所有 partial 路径都两两配对；
+     - 第 22 节的 parallel-safe 规则让每个 rel 多留一条路径。
+4. **其他，影响较小**：
+   - level-1 关系不剪枝，base pass 又按场景做支配比较，所以 level-1 路径比 v20 多（T11 有 46 条 complete、16 条 partial）；
+   - 选择的开销：v2 约 12%，v20 的 prune 约 9%。
+
+### 24.3 可以怎么改（都还没做）
+
+| 改动 | 计划是否变化 | 预期收益 |
+|---|---|---|
+| twin 去重改用 hash（按 total、startup、rows 做键），语义不变 | 不变 | 大查询上 p8 约快 2 倍 |
+| 没有 retain 时（K=1）用 native pairing | c1 130/130 不变 | c1 约快 2 倍 |
+| p8 也用 native pairing | 20/130 变化，需要看执行时间 | p8 约快 6 倍 |
+| replay 减负：release 下点检查只做一次或抽查；N 个场景共用投影和侧表查找 | 不变 | 每个场景的开销向 v20 靠拢，c1 最多约快 2 倍 |
+
+## 25. 精确 precheck：先用下界剪掉不可能被保留的连接候选
+
+### 25.1 做法
+
+- **GUC**：`robust_select_precheck`，默认 on。
+- **问题**：m2 的 main pass 关掉了 PG 原有的 `add_path_precheck`。原因是 PG 的标量代价比较和 m2 的目标不是一回事。结果是每个连接候选都要先算 N+1 次代价（replay 加点检查），然后才进选择。retained pairing 下这类候选很多（第 24 节）。
+- **下界**：`try_*_path`（6 个入口：nestloop、mergejoin、hashjoin 及各自的 partial 版本）在 `initial_cost_*` 之前，用两个输入路径已有的向量，算出连接代价在每个场景 s 下的下界：
+  - nestloop：total ≥ outer.total + inner.startup；startup ≥ outer.startup + inner.startup。
+  - hashjoin：total ≥ outer.total + inner.total；startup ≥ outer.startup + inner.total。
+  - mergejoin：每一侧已排序的取 total，未排序的取 startup（排序的启动代价至少是输入的 total），两侧相加后同时作为 total 和 startup 的下界。
+  - 点估计也按同样方式算一个下界。
+  - 所有下界再乘 (1 − 1e-9)，防止浮点误差。
+- **为什么能拿下界当分数的下界**：除了目标 10、11 和 MEAN_STD / MAX_STD 聚合，所有目标都是各场景代价的单调不减函数。所以用下界向量算出的分数，是候选真实分数的下界。不满足单调性的目标会自动关掉 precheck。
+- **剪掉的条件**：下面几条同时成立，就不构造这个候选：
+  1. 下界分数已经严格差于本关系目前第 K 名的 main 分数，其中 K = max(add_path_limit, robust_final_path_limit)。如果 retain strategy 和 main 相同，K 再加上 retain_path_limit。
+  2. retain > 0 且 strategy 与 main 不同时，下界分数也严格差于 retain 分数的第 (add + retain) 名。
+  3. 对于 complete 的非参数化候选：下界分数严格差于已有的最好非参数化候选（对应 `by = unparam` 的保留规则）。如果它两侧输入都是 parallel-safe，还要严格差于已有的最好 parallel-safe 非参数化候选（对应 `by = safe`）。
+- **为什么这样剪是精确的**：
+  - 选择按分数排序，后面的平局规则只在分数相等时才起作用。被剪掉的候选分数严格更差，所以不论怎么比都排不进前 K。
+  - 打分要用的 envelope 是 envelope pass 先算好、固定的。
+  - 分母 C\*(U,s) 不受被剪候选影响，因为 `filled` 只在 envelope 有 NaN 时才从候选里取，而这种情况下 precheck 不启用。
+- **dump**：`keep` 事件新增 `prechecked` 字段，记录被剪掉的候选数（见 ROBDP_DUMP_SPEC.md）。
+
+### 25.2 验证计划不变
+
+- **keepcmp**：逐个比对 main pass 每个 `keep` 事件的 `kept`、分数和 `by`，以及 `final` 事件，precheck on 对 off。
+  - 9 个配置 × 4 条查询（最大并行），加上 4 个配置 × 3 条查询（关并行）。
+  - 0 处差异。每个关系剪掉 35–90% 的候选。
+- **130 条查询**：5 个配置（c1、c1 native、p8、p8 native、p8 nodedup）下，计划形状和代价完全相同。
+- **gate**：check_s8（G1–G6、G8）和 check_s10（O1–O5、O8）在 release 和 debug 下都通过。
+- **make check**：release（robust 关）215/215 通过。
+- **robust 开启的 debug make check**：join.sql 有一条半连接查询，on 和 off 下的计划不同。查明原因与 precheck 无关：
+  - 在并行测试组里，`vacuum analyze j3` 能不能把 j3 标成 all-visible，取决于同组其他测试的快照。
+  - j3 的 relallvisible 是 0 时，计划是 Hash Join；是 5 时，计划是 Nested Loop。
+  - precheck 改变了同组测试的耗时，所以 on/off 恰好稳定落在两边。
+  - 在同一 make check 会话里，对同一份统计连续 EXPLAIN，off 和 on 选的都是同一个 Hash Join，代价完全相同。
+  - 把 onek、j3 的 relallvisible 扫 36 种组合（并行 0 和 4），on 与 off 的 EXPLAIN (verbose) 逐字节相同。
+
+### 25.3 规划时间（13 条查询，同第 24 节的测法）
+
+- **数据**：`results/plantime_v2_precheck.json`。
+- **基线**：off 用第 24 节的旧数据（`plantime_v2.json`）。另外用 off 把 c1、p8 及其 native 版本复测了一遍，中位数和旧数据相差都在 3% 以内（例如 p8 498 对 484 ms），所以两次测量可以直接比。
+
+13 条的中位数（ms）；"提速"是逐条 off/on 比值的几何平均：
+
+| 配置 | off（旧） | on | 提速 | v20 | on/v20 几何平均 |
+|---|---|---|---|---|---|
+| c1，最大并行 | 30.2 | 12.6 | 1.89× | 5.8 | 2.59× |
+| p8，最大并行 | 498 | 127 | 2.86× | 48.7 | 2.77× |
+| c1 native，最大并行 | 13.4 | 7.0 | 1.60× | 5.8 | 1.38× |
+| p8 native，最大并行 | 82.9 | 67.3 | 1.14× | 48.7 | 1.45× |
+| c1，关并行 | 9.1 | 5.0 | 1.50× | 2.7 | 2.09× |
+| p8，关并行 | 281 | 80.6 | 2.55× | 27.3 | 3.22× |
+| c1 native，关并行 | 6.4 | 3.8 | 1.45× | 2.7 | 1.58× |
+| p8 native，关并行 | 51.9 | 42.6 | 1.13× | 27.3 | 1.72× |
+| p8 N1，最大并行 | 241 | 37.6 | 4.65× | 15.3（N=4） | 2.14× |
+
+大查询（最大并行，ms）：
+
+| 查询 | p8 off → on | p8 native off → on | c1 off → on | c1 native off → on | v20 c1 / p8 |
+|---|---|---|---|---|---|
+| T21 21-0_testing_20 | 2158 → 377 | 262 → 189 | 93.6 → 33.8 | 43.6 → 18.7 | 19.1 / 202 |
+| T22 22-0_testing_2 | 7901 → 1408 | 811 → 640 | 296 → 125 | 136 → 66 | 55.5 / 492 |
+| T23 23-0_testing_16 | 7727 → 1193 | 757 → 566 | 255 → 95 | 118 → 48 | 52.9 / 477 |
+
+**解读**：
+
+- **retained 的 p8 收益最大**：大查询快 5.6–6.5 倍，13 条的几何平均快 2.9 倍。原因有两个：
+  - retained pairing 生成的候选，绝大多数一看输入就知道进不了前 K + retain；
+  - 被剪的候选不再进入 O(候选数²) 的 twin 去重。
+- **native 的 p8 收益小**（1.1–1.3 倍）：native 下 PG 的构造器本来就按 pathkeys、参数化把候选数控制住了，剩下的候选更难靠下界排除。
+- **和 v20 比**：
+  - N 小时（N1 配置：m2 是 N=1，v20 是 N=4，最小值），m2 native 已经比 v20 快：c1 native N1 是 v20 的 0.85 倍，p8 native N1 是 0.60 倍。
+  - N=20 时，c1 native 是 v20 的 1.4 倍，p8 native 是 1.45 倍。剩下的差距主要来自每个场景的 replay 开销（第 24.2 节第 2 点）。
+  - retained 的 p8 仍是 v20 的 2.8 倍。
+- **第 24.3 节的改动还都能叠加**：
+  - twin 去重改 hash：p8 retained 上 precheck 已经剪掉大部分候选，这一项的收益会变小，需要重测。
+  - 每个场景的 replay 减负，以及 envelope 每轮少调两次代价函数：这两项和 precheck 正交。

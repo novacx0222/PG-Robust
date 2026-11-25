@@ -432,6 +432,23 @@ envelope_of(RobustSearch *rs, RelOptInfo *rel, bool partial)
 	return partial ? e->partial : e->cost;
 }
 
+/*
+ * robust_search_envelope
+ *		The envelope of rel (C*(U, s) of its complete or of its partial
+ *		paths) the selection will compare to, as robust_search_finish_rel
+ *		passes it, or NULL: none recorded, or no search running.  NaN in
+ *		the scenarios that lack one.
+ */
+const double *
+robust_search_envelope(PlannerInfo *root, RelOptInfo *rel, bool partial)
+{
+	RobustSearch *rs = root->robust_search;
+
+	if (rs == NULL || rs->envelope == NULL)
+		return NULL;
+	return envelope_of(rs, rel, partial);
+}
+
 static void
 dump_envelope(RobustSearch *rs)
 {

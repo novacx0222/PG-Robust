@@ -56,6 +56,8 @@ extern void robust_search_finish_rel(RobustSearch *rs, RelOptInfo *rel,
 									 bool top);
 extern void robust_search_child_rel(RobustSearch *rs, RelOptInfo *child);
 extern void robust_dump_pathlist(PlannerInfo *root, RelOptInfo *rel);
+extern const double *robust_search_envelope(PlannerInfo *root,
+											 RelOptInfo *rel, bool partial);
 extern void robust_search_end(RobustSearch *rs);
 
 #endif							/* ROBUSTSEARCH_H */

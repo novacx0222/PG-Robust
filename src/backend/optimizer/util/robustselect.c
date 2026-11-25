@@ -22,9 +22,11 @@
 #include "optimizer/paths.h"
 #include "optimizer/robust.h"
 #include "optimizer/robustcost.h"
+#include "optimizer/robustsearch.h"
 #include "optimizer/robustselect.h"
 #include "utils/guc.h"
 #include "utils/json.h"
+#include "utils/memutils.h"
 
 /*
  * The objectives and diversification functions, in v20's numbering (see
@@ -422,6 +424,290 @@ robust_select_offer(List **pathlist, Path *path)
 	}
 	*pathlist = lappend(*pathlist, path);
 	return true;
+}
+
+/* ---------------------------------------------------------- precheck */
+
+/*
+ * The precheck's state for the complete or the partial candidates of a
+ * join relation (optimizer/robustselect.h): the smallest main scores (and
+ * retain scores) of the candidates offered so far, ascending.
+ */
+typedef struct PrecheckKind
+{
+	bool		init;
+	bool		active;			/* the precheck applies */
+	const double *envelope;		/* NULL if no objective in use needs it */
+	int			nscored;		/* candidates of the list scored so far */
+	int			kmain;
+	int			nmain;
+	double	   *main;
+	int			kretain;		/* 0: no separate retain bound */
+	int			nretain;
+	double	   *retain;
+	double		best_unparam;	/* complete: best main score, unparameterized */
+	double		best_safe;		/* ... and parallel-safe */
+	int			dropped;
+} PrecheckKind;
+
+typedef struct RobustPrecheck
+{
+	PrecheckKind kind[2];		/* complete, partial */
+} RobustPrecheck;
+
+/* Relative margin of the lower bounds, for the rounding of the cost sums */
+#define PRECHECK_MARGIN (1.0 - 1e-9)
+
+/* Is the objective monotone in each scenario's total and startup cost? */
+static bool
+precheck_supports(int id)
+{
+	return is_objective(id) &&
+		objective_agg(id) != AGG_MEAN_STD &&
+		objective_agg(id) != AGG_MAX_STD;
+}
+
+/* Insert x into the ascending k smallest a[0 .. *n-1] */
+static void
+smallest_insert(double *a, int *n, int k, double x)
+{
+	int			i;
+
+	if (*n == k)
+	{
+		if (!(x < a[k - 1]))
+			return;
+		(*n)--;
+	}
+	for (i = *n; i > 0 && a[i - 1] > x; i--)
+		a[i] = a[i - 1];
+	a[i] = x;
+	(*n)++;
+}
+
+static void
+precheck_init(PlannerInfo *root, RelOptInfo *rel, bool partial,
+			  PrecheckKind *k)
+{
+	MemoryContext cxt = GetMemoryChunkContext(rel);
+	bool		retain = retain_path_limit > 0;
+	bool		uses_envelope;
+	const double *envelope;
+
+	memset(k, 0, sizeof(PrecheckKind));
+	k->init = true;
+	k->best_unparam = k->best_safe = INFINITY;
+	if (!precheck_supports(main_objective_id) ||
+		(retain && !precheck_supports(retain_strategy_id)))
+		return;
+
+	/* The envelope as the selection's, unless it would fill it */
+	uses_envelope = robust_objective_needs_envelope(main_objective_id) ||
+		(retain && robust_objective_needs_envelope(retain_strategy_id));
+	if (uses_envelope)
+	{
+		envelope = robust_search_envelope(root, rel, partial);
+		if (envelope == NULL)
+			return;
+		for (int s = 0; s < error_sample_count; s++)
+		{
+			if (isnan(envelope[s]))
+				return;
+		}
+		k->envelope = envelope;
+	}
+
+	/* As many as any selection of the relation keeps (top or not) */
+	if (retain && retain_strategy_id == main_objective_id)
+		k->kmain = Max(add_path_limit + retain_path_limit,
+					   robust_final_path_limit);
+	else
+	{
+		k->kmain = Max(add_path_limit, robust_final_path_limit);
+		if (retain)
+			k->kretain = add_path_limit + retain_path_limit;
+	}
+	k->main = MemoryContextAlloc(cxt, sizeof(double) * k->kmain);
+	if (k->kretain > 0)
+		k->retain = MemoryContextAlloc(cxt, sizeof(double) * k->kretain);
+	k->active = true;
+}
+
+/* Score the candidates offered since the last call */
+static void
+precheck_catch_up(PrecheckKind *k, List *list)
+{
+	for (int i = k->nscored; i < list_length(list); i++)
+	{
+		Path	   *path = (Path *) list_nth(list, i);
+		double		m = objective(main_objective_id, path, k->envelope);
+
+		smallest_insert(k->main, &k->nmain, k->kmain, m);
+		if (k->kretain > 0)
+			smallest_insert(k->retain, &k->nretain, k->kretain,
+							objective(retain_strategy_id, path, k->envelope));
+		if (path->param_info == NULL)
+		{
+			k->best_unparam = Min(k->best_unparam, m);
+			if (path->parallel_safe)
+				k->best_safe = Min(k->best_safe, m);
+		}
+	}
+	k->nscored = list_length(list);
+}
+
+/* An input path's total or startup cost in scenario s; 0 if not costed yet */
+static inline double
+input_cost(Path *path, bool total, int s)
+{
+	const RobustPathCost *rc = path->robust;
+
+	if (rc == NULL)
+		return 0.0;
+	return total ? at(rc->total, path->total_cost, s) :
+		at(rc->startup, path->startup_cost, s);
+}
+
+/* An objective's score of the cost vectors total[], startup[] */
+static double
+objective_of(int id, const double *total, const double *startup,
+			 double point, const double *envelope)
+{
+	Loss		loss = objective_loss(id);
+	double		x[ROBUST_MAX_SAMPLES];
+
+	if (loss == LOSS_POINT)
+		return point;
+	for (int s = 0; s < error_sample_count; s++)
+		x[s] = loss_at(loss, total[s], startup[s],
+					   envelope ? envelope[s] : NAN);
+	return aggregate(objective_agg(id), x, error_sample_count);
+}
+
+/*
+ * robust_precheck_join
+ *		May the join builders build and cost this join path candidate of
+ *		joinrel, by 'method' from outer_path and inner_path (a merge join:
+ *		'outer_sorted' / 'inner_sorted' if it sorts that side)?  False when
+ *		the selection could never keep it (optimizer/robustselect.h).
+ *		'parameterized': the candidate will be.
+ */
+bool
+robust_precheck_join(PlannerInfo *root, RelOptInfo *joinrel, bool partial,
+					 RobustJoinBound method, Path *outer_path,
+					 Path *inner_path, bool outer_sorted, bool inner_sorted,
+					 bool parameterized)
+{
+	PrecheckKind *k;
+	List	   *list = partial ? joinrel->partial_pathlist : joinrel->pathlist;
+	double		total[ROBUST_MAX_SAMPLES];
+	double		startup[ROBUST_MAX_SAMPLES];
+	double		point;
+	double		bound;
+
+	if (!enable_rows_dist || !robust_select_precheck || !robust_cost_collect() ||
+		root->robust_search == NULL || IS_OTHER_REL(joinrel))
+		return true;
+	if (joinrel->robust_precheck == NULL)
+		joinrel->robust_precheck =
+			MemoryContextAllocZero(GetMemoryChunkContext(joinrel),
+								   sizeof(RobustPrecheck));
+	k = &joinrel->robust_precheck->kind[partial ? 1 : 0];
+	if (k->init && list_length(list) < k->nscored)
+		k->init = false;		/* the list was replaced (a dummy relation) */
+	if (!k->init)
+		precheck_init(root, joinrel, partial, k);
+	if (!k->active)
+		return true;
+	precheck_catch_up(k, list);
+	if (k->nmain < k->kmain || k->nretain < k->kretain)
+		return true;
+
+	/* Lower bounds of the candidate's costs in each scenario */
+	for (int s = 0; s < error_sample_count; s++)
+	{
+		double		o_total = input_cost(outer_path, true, s);
+		double		o_startup = input_cost(outer_path, false, s);
+		double		i_total = input_cost(inner_path, true, s);
+		double		i_startup = input_cost(inner_path, false, s);
+		double		t,
+					u;
+
+		switch (method)
+		{
+			case ROBUST_BOUND_NESTLOOP:
+				t = o_total + i_startup;
+				u = o_startup + i_startup;
+				break;
+			case ROBUST_BOUND_HASHJOIN:
+				t = o_total + i_total;
+				u = o_startup + i_total;
+				break;
+			default:
+				t = (outer_sorted ? o_total : o_startup) +
+					(inner_sorted ? i_total : i_startup);
+				u = t;
+				break;
+		}
+		total[s] = t * PRECHECK_MARGIN;
+		startup[s] = u * PRECHECK_MARGIN;
+	}
+	switch (method)
+	{
+		case ROBUST_BOUND_NESTLOOP:
+			point = outer_path->total_cost + inner_path->startup_cost;
+			break;
+		case ROBUST_BOUND_HASHJOIN:
+			point = outer_path->total_cost + inner_path->total_cost;
+			break;
+		default:
+			point = (outer_sorted ? outer_path->total_cost :
+					 outer_path->startup_cost) +
+				(inner_sorted ? inner_path->total_cost :
+				 inner_path->startup_cost);
+			break;
+	}
+	point *= PRECHECK_MARGIN;
+
+	/* K candidates better by the main objective */
+	bound = objective_of(main_objective_id, total, startup, point, k->envelope);
+	if (!(k->main[k->kmain - 1] < bound))
+		return true;
+	/* add_path_limit + retain_path_limit by the retain strategy */
+	if (k->kretain > 0 &&
+		!(k->retain[k->kretain - 1] <
+		  objective_of(retain_strategy_id, total, startup, point, k->envelope)))
+		return true;
+	/* not the best unparameterized (parallel-safe) candidate */
+	if (!partial && !parameterized)
+	{
+		if (!(k->best_unparam < bound))
+			return true;
+		if (joinrel->consider_parallel && outer_path->parallel_safe &&
+			inner_path->parallel_safe && !(k->best_safe < bound))
+			return true;
+	}
+	k->dropped++;
+	return false;
+}
+
+/* How many candidates the precheck dropped; forget its state */
+static int
+precheck_done(RelOptInfo *rel, bool partial)
+{
+	PrecheckKind *k;
+	int			dropped;
+
+	if (rel->robust_precheck == NULL)
+		return 0;
+	k = &rel->robust_precheck->kind[partial ? 1 : 0];
+	dropped = k->dropped;
+	if (k->main)
+		pfree(k->main);
+	if (k->retain)
+		pfree(k->retain);
+	memset(k, 0, sizeof(PrecheckKind));
+	return dropped;
 }
 
 /* --------------------------------------------------------- selection */
@@ -919,8 +1205,8 @@ dump_ids_scores(RobustDump *d, const char *key, Cand *c, int n, bool ids,
 
 static void
 dump_keep(PlannerInfo *root, RelOptInfo *rel, bool partial, int limit,
-		  int retain, bool had_envelope, int filled, Cand *c, int n,
-		  Cand **kept, int nkept)
+		  int retain, bool had_envelope, int filled, int prechecked, Cand *c,
+		  int n, Cand **kept, int nkept)
 {
 	RobustDump	d;
 	StringInfoData buf;
@@ -935,6 +1221,7 @@ dump_keep(PlannerInfo *root, RelOptInfo *rel, bool partial, int limit,
 	robust_dump_int(&d, "strategy", retain_strategy_id);
 	robust_dump_bool(&d, "envelope", had_envelope);
 	robust_dump_int(&d, "filled", filled);
+	robust_dump_int(&d, "prechecked", prechecked);
 	dump_ids_scores(&d, "cands", c, n, true, false);
 	dump_ids_scores(&d, "main", c, n, false, false);
 	if (retain > 0)
@@ -1056,6 +1343,7 @@ robust_select_paths(PlannerInfo *root, RelOptInfo *rel, bool partial,
 	ListCell   *lc;
 	bool		had_envelope = envelope != NULL;
 	int			filled;
+	int			prechecked = precheck_done(rel, partial);
 
 	if (n == 0)
 		return;
@@ -1172,8 +1460,8 @@ robust_select_paths(PlannerInfo *root, RelOptInfo *rel, bool partial,
 		result = lappend(result, k->path);
 	}
 	if (robust_dumping(root))
-		dump_keep(root, rel, partial, limit, retain, had_envelope, filled, c,
-				  n, kept, nkept);
+		dump_keep(root, rel, partial, limit, retain, had_envelope, filled,
+				  prechecked, c, n, kept, nkept);
 	if (filled > 0)
 		pfree((double *) envelope);
 

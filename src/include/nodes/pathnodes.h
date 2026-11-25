@@ -1059,6 +1059,12 @@ typedef struct RelOptInfo
 	 */
 	struct RobustVec *robust_rows pg_node_attr(read_write_ignore);
 	List	   *robust_querylets pg_node_attr(read_write_ignore);
+
+	/*
+	 * RobDP (optimizer/robustselect.h): the main pass's precheck of the
+	 * join path candidates, NULL until the first one
+	 */
+	struct RobustPrecheck *robust_precheck pg_node_attr(read_write_ignore);
 } RelOptInfo;
 
 /*
