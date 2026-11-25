@@ -1402,3 +1402,59 @@ v20 同设置下的结果（第 21 节）：E[Cost]×1 1.18，×8 1.17；E[Pen]�
 - **第 24.3 节的改动还都能叠加**：
   - twin 去重改 hash：p8 retained 上 precheck 已经剪掉大部分候选，这一项的收益会变小，需要重测。
   - 每个场景的 replay 减负，以及 envelope 每轮少调两次代价函数：这两项和 precheck 正交。
+
+## 26. envelope 轮里的 semi-join 因子只算本轮场景
+
+### 26.1 问题在哪
+
+- **原先的设想（第 24 节）**：semi-join 因子（`compute_semifactors`）和 `join_path_querylets` 只取决于 (outer, inner, jointype) 和场景，但每条路径都会重算一遍，所以想按连接对缓存。
+- **读代码后的结论：这个设想不对。**
+  - 两者早就按连接上下文缓存了。连接上下文就是一次 `add_paths_to_joinrel(outer, inner, jointype)`，即 `jcx`。semi-join 因子在一个上下文里只算一次。querylets 在一个上下文里按 (oreq, ireq, req) 缓存。
+  - 真正的浪费在 envelope 轮里：每一轮都重建所有连接上下文，而 `compute_semifactors` 每次都把 N 个场景和点估计全算一遍（N+1 次 `compute_semi_anti_join_factors`），可本轮的 replay 只读 `sf[s]`。所以 N 轮合计每个上下文算了 N(N+1) 次，其实 2N 次就够（每轮算本轮场景，外加一次点检查）。
+- **profile**（T22，release）：
+  - E[Pen]×8 native，655 ms：`compute_semifactors` 占 12.4%，约 81 ms。
+  - E[Cost]×1 native，没有 envelope，70 ms：只占 4.7%，约 3.3 ms。
+  - 两个配置的 main pass 完全一样，所以 E[Pen]×8 多出的约 78 ms 几乎全在 20 轮 envelope 里。
+- **querylets 不做跨轮缓存，因为做不到精确**：
+  - 每轮开始会重置 RestrictInfo 里缓存的选择率（`reset_rinfos`）；
+  - querylet 抽哪个 bin，取决于它自己的选择率估计；
+  - 所以从别的 pass 搬来的 querylets 不能保证和本轮重新算的逐位相同。
+  - 而在一轮之内，不同上下文的 (num, den) 关系集各不相同，没有可以复用的。
+
+### 26.2 改动
+
+- 在 envelope 轮里，`compute_semifactors` 只算点估计（用于点检查）和本轮场景 s，`sf` 的其他项保留 PG 的值，本轮不会读到它们。
+- **为什么精确**：每个场景的估计是独立的：
+  - 每次都用新拷贝的子句；
+  - 行数投影之后会恢复；
+  - hook 的字段只由 replay 自己设置。
+
+  所以单独算出的 `sf[s]`，和全部场景一起算时得到的值相同。
+- **重构**：每个场景的计算抽成 `semifactors_at()`。
+- **debug 自检**：assert 版本里，每个上下文先单独算本轮场景，再把其他场景都算一遍，然后重算本轮场景，用 Assert 要求两次逐位相同。
+
+### 26.3 验证
+
+- **新旧二进制逐行比对 dump**（`robust_debug_dump` 的全部事件，包括 env/envstat/final，以及 EXPLAIN 计划）：
+  - 最大并行：130 条查询 × {E[Pen]×8 retained, E[Pen]×8 native}，260 次规划全部相同，共 24,986,171 行。
+  - 关并行：13 条查询 × {E[Pen]×8 retained, E[Pen]×8 native, E[Pen]×1 native}，39 次全部相同。
+  - 第一次跑最大并行时有 108 次规划是空的或被截断，原因是同时在跑的 gate 脚本重启了 bench 服务器。重跑后全部相同。比对脚本现在会把空的规划当成错误。
+- **debug make check**（robust 开，lognormal，E[Pen]，retain 8，并行 4）：失败集合和改动前一样，同样 18 个，都只是计划形状不同；没有 assertion 失败，新加的自检也在其中。
+- **gate**（release）：check_s7 的 K1–K6、K8，check_s8 --light 的 G1–G6、G8，check_s10 --light 的 O1–O5、O8，全部通过。
+
+### 26.4 规划时间
+
+13 条查询的中位数（ms），"提速"是逐条比值的几何平均；基线是第 25 节的 `plantime_v2_precheck.json`，新数据在 `plantime_v2_semi.json`：
+
+| 配置 | 改前 | 改后 | 提速 | v20 | 改后/v20 |
+|---|---|---|---|---|---|
+| p8 native，最大并行 | 67.3 | 61.4 | 1.13× | 48.7 | 1.28× |
+| p8 native，关并行 | 42.6 | 35.7 | 1.22× | 27.3 | 1.42× |
+| p8（retained），最大并行 | 127 | 120 | 1.05× | 48.7 | 2.65× |
+| p8（retained），关并行 | 80.6 | 73.2 | 1.11× | 27.3 | 2.90× |
+| c1、c1 native、N1 各配置 | | | 0.96–1.02× | | |
+
+大查询：T22 的 p8 native 从 640 降到 558 ms，p8 从 1408 降到 1357 ms；T23 的 p8 native 从 566 降到 509 ms。
+
+- c1（E[Cost]）不用 envelope，N=1 时每轮本来就只有一个场景，所以这两类本来就没有可省的，差别都在 ±4% 的噪声以内。
+- 这一步之后，m2 native 的 p8 降到 v20 的 1.28 倍（最大并行）。剩下的差距主要在每个场景的 replay 开销，以及 envelope 每轮的三次代价函数调用（第 25 节之后的讨论）。

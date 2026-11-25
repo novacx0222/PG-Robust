@@ -1346,6 +1346,46 @@ join_path_querylets(PlannerInfo *root, JoinPath *jp, SpecialJoinInfo *sjinfo)
 /* -------------------------------------------------- semi-join factors */
 
 /*
+ * The semi-join factors of the join context in scenario s (-1: the point),
+ * into *out: PostgreSQL's estimate on fresh copies of the clauses, with the
+ * rows of the relations in sl projected onto s and the selectivities scaled
+ * by m[s].  Leaves nothing changed behind.
+ */
+static void
+semifactors_at(Slots *sl, const RobustVec *m, int s, SemiAntiJoinFactors *out)
+{
+	List	   *copies = NIL;
+	MemoryContext oldcxt;
+	ListCell   *lc;
+
+	oldcxt = MemoryContextSwitchTo(scratch_cxt);
+	foreach(lc, jcx.restrictlist)
+	{
+		RestrictInfo *c = makeNode(RestrictInfo);
+
+		memcpy(c, lfirst_node(RestrictInfo, lc), sizeof(RestrictInfo));
+		c->norm_selec = -1;
+		c->outer_selec = -1;
+		copies = lappend(copies, c);
+	}
+	if (s >= 0)
+		slots_project(sl, s);
+	hooks.index_mult = 1.0;
+	hooks.quals = NIL;
+	hooks.qual_mult = 1.0;
+	hooks.semi_mult = s < 0 ? 1.0 : m->v[s];
+	robust_replay = &hooks;
+	compute_semi_anti_join_factors(jcx.root, jcx.joinrel, jcx.outerrel,
+								   jcx.innerrel, jcx.jointype, jcx.sjinfo,
+								   copies, out);
+	robust_replay = NULL;
+	if (s >= 0)
+		slots_restore(sl);
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextReset(scratch_cxt);
+}
+
+/*
  * The semi-join factors of the join context in every scenario: PostgreSQL's
  * computation replayed with the rows of the scenario, on fresh copies of
  * the clauses (so the cached selectivities are neither used nor changed),
@@ -1353,19 +1393,29 @@ join_path_querylets(PlannerInfo *root, JoinPath *jp, SpecialJoinInfo *sjinfo)
  * the replay with nothing changed does not give PostgreSQL's factors (whose
  * cached selectivities may come from another pair), they are kept at
  * PostgreSQL's in every scenario.
+ *
+ * In an envelope round only the round's scenario is computed (and the point,
+ * for the check): the round's replays read no other, and each scenario's
+ * estimate is independent of the others' (fresh clause copies, the rows
+ * projected and restored), so its value is the same as when all are.  The
+ * other entries keep PostgreSQL's factors.  The join contexts of each round
+ * are new, so computing every scenario there cost N (N + 1) estimates per
+ * context instead of 2 N.  (Assert-enabled builds check that the round's
+ * scenario comes out the same after all the others.)
  */
 static void
 compute_semifactors(void)
 {
 	PlannerInfo *root = jcx.root;
 	int			N = error_sample_count;
+	int			only = root->robust_pass == ROBUST_PASS_ENVELOPE ?
+		root->robust_round : -1;
 	Relids		num = jcx.joinrel->relids;
 	Relids		den[2] = {jcx.outerrel->relids, jcx.innerrel->relids};
 	List	   *qs;
 	RobustVec  *m;
 	Slots		sl = {0};
 	SemiAntiJoinFactors pt;
-	MemoryContext oldcxt;
 	ListCell   *lc;
 
 	jcx.sf = palloc(sizeof(SemiAntiJoinFactors) * N);
@@ -1394,36 +1444,11 @@ compute_semifactors(void)
 	if (sl.n == 0 && qs == NIL)
 		return;
 
-	hooks.index_mult = 1.0;
-	hooks.quals = NIL;
-	hooks.qual_mult = 1.0;
 	for (int s = -1; s < N; s++)
 	{
-		List	   *copies = NIL;
-		SemiAntiJoinFactors *out = s < 0 ? &pt : &jcx.sf[s];
-
-		oldcxt = MemoryContextSwitchTo(scratch_cxt);
-		foreach(lc, jcx.restrictlist)
-		{
-			RestrictInfo *c = makeNode(RestrictInfo);
-
-			memcpy(c, lfirst_node(RestrictInfo, lc), sizeof(RestrictInfo));
-			c->norm_selec = -1;
-			c->outer_selec = -1;
-			copies = lappend(copies, c);
-		}
-		if (s >= 0)
-			slots_project(&sl, s);
-		hooks.semi_mult = s < 0 ? 1.0 : m->v[s];
-		robust_replay = &hooks;
-		compute_semi_anti_join_factors(root, jcx.joinrel, jcx.outerrel,
-									   jcx.innerrel, jcx.jointype, jcx.sjinfo,
-									   copies, out);
-		robust_replay = NULL;
-		if (s >= 0)
-			slots_restore(&sl);
-		MemoryContextSwitchTo(oldcxt);
-		MemoryContextReset(scratch_cxt);
+		if (only >= 0 && s >= 0 && s != only)
+			continue;
+		semifactors_at(&sl, m, s, s < 0 ? &pt : &jcx.sf[s]);
 
 		if (s < 0 &&
 			(pt.outer_match_frac != jcx.semifactors.outer_match_frac ||
@@ -1432,9 +1457,24 @@ compute_semifactors(void)
 			jcx.sf_frozen = true;
 			for (int t = 0; t < N; t++)
 				jcx.sf[t] = jcx.semifactors;
-			break;
+			return;
 		}
 	}
+
+#ifdef USE_ASSERT_CHECKING
+	/* The round's scenario is the same after all the others are computed */
+	if (only >= 0)
+	{
+		SemiAntiJoinFactors other;
+
+		for (int s = 0; s < N; s++)
+			if (s != only)
+				semifactors_at(&sl, m, s, &other);
+		semifactors_at(&sl, m, only, &other);
+		Assert(other.outer_match_frac == jcx.sf[only].outer_match_frac &&
+			   other.match_count == jcx.sf[only].match_count);
+	}
+#endif
 }
 
 /* ------------------------------------------------------------ replay */
