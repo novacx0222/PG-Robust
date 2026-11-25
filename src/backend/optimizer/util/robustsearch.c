@@ -632,22 +632,54 @@ robust_main_begin(RobustSearch *rs)
 }
 
 /*
+ * With robust_gather_all on: a plain Gather on each partial path candidate
+ * of 'partials' (the partial pathlist before the selection) but the first
+ * kept one, which generate_useful_gather_paths has gathered already.  They
+ * compete with the relation's complete paths in its complete selection.
+ */
+static void
+gather_all_partials(PlannerInfo *root, RelOptInfo *rel, List *partials)
+{
+	Path	   *first = rel->partial_pathlist != NIL ?
+		(Path *) linitial(rel->partial_pathlist) : NULL;
+	ListCell   *lc;
+
+	foreach(lc, partials)
+	{
+		Path	   *subpath = (Path *) lfirst(lc);
+
+		if (subpath == first)
+			continue;
+		add_path(rel, (Path *) create_gather_path(root, rel, subpath,
+												  rel->reltarget, NULL, NULL));
+	}
+}
+
+/*
  * Select the partial paths of a relation of the main pass, build the Gather
- * paths on those kept (if 'gather'), select the complete paths, and set its
- * cheapest paths.  At the last level of the search ('top') the main
- * objective keeps robust_final_path_limit paths of each kind (1, as in v20)
- * and the retain strategy none.
+ * paths on those kept (if 'gather'; with robust_gather_all a plain Gather on
+ * every partial candidate), select the complete paths, and set its cheapest
+ * paths.  At the last level of the search ('top') the main objective keeps
+ * robust_final_path_limit paths of each kind (1, as in v20) and the retain
+ * strategy none.
  */
 static void
 select_rel(RobustSearch *rs, RelOptInfo *rel, bool top, bool gather)
 {
 	int			limit = top ? robust_final_path_limit : add_path_limit;
 	int			retain = top ? 0 : retain_path_limit;
+	List	   *partials = NIL;
 
+	if (gather && robust_gather_all)
+		partials = list_copy(rel->partial_pathlist);
 	robust_select_paths(rs->root, rel, true, limit, retain,
 						envelope_of(rs, rel, true));
 	if (gather)
+	{
 		generate_useful_gather_paths(rs->root, rel, false);
+		gather_all_partials(rs->root, rel, partials);
+		list_free(partials);
+	}
 	robust_select_paths(rs->root, rel, false, limit, retain,
 						envelope_of(rs, rel, false));
 	set_cheapest(rel);

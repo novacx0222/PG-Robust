@@ -30,6 +30,7 @@ extern PGDLLIMPORT bool robust_debug_dump;
 extern PGDLLIMPORT bool robust_search;
 extern PGDLLIMPORT bool robust_envelope;
 extern PGDLLIMPORT bool robust_select_dedup;
+extern PGDLLIMPORT bool robust_gather_all;
 extern PGDLLIMPORT bool robust_select;
 extern PGDLLIMPORT bool robust_dominance;
 extern PGDLLIMPORT int robust_join_pairing;

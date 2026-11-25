@@ -28,6 +28,7 @@ bool		robust_debug_dump = false;
 bool		robust_search = true;
 bool		robust_envelope = true;
 bool		robust_select_dedup = true;
+bool		robust_gather_all = false;
 bool		robust_select = true;
 bool		robust_dominance = false;
 int			robust_join_pairing = ROBUST_PAIRING_RETAINED;

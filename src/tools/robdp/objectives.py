@@ -11,7 +11,7 @@ Objectives (lower is better), v20's numbering, x(s) the loss in scenario s:
     3  E[Cost]              17  Quant_alpha[total]
     4  max startup          18  Quant_alpha[startup]
     5  E[startup]
-    6  1 - ProbNoPenalty  (E of the indicator Penalty(s) > 0)
+    6  penalty count, the scenarios with Penalty(s) > 0, 0 to N = N (1 - ProbNoPenalty)
     8  PostgreSQL's point estimate of the total cost
 
 Diversification functions (retain strategy only): 7 Rand, 13 Similarity,
@@ -23,13 +23,13 @@ OBJECTIVES = (0, 1, 2, 3, 4, 5, 6, 8, 10, 11, 12, 17, 18)
 DIVERSIFIERS = (7, 13, 14, 15, 16)
 MIX = (3, 1, 11, 12, 6, 13, 16)
 NAMES = {0: 'max Penalty', 1: 'E[Penalty]', 2: 'max Cost', 3: 'E[Cost]', 4: 'max startup', 5: 'E[startup]',
-         6: '1-ProbNoPenalty', 7: 'Rand', 8: 'point cost', 10: 'max Penalty+Stdev', 11: 'E[Penalty]+Stdev',
+         6: 'penalty count', 7: 'Rand', 8: 'point cost', 10: 'max Penalty+Stdev', 11: 'E[Penalty]+Stdev',
          12: 'Quant[Penalty]', 13: 'Similarity', 14: 'Mix', 15: 'E[Penalty]-Join', 16: 'E[Cost]-Join',
          17: 'Quant[Cost]', 18: 'Quant[startup]'}
 
 _LOSS = {6: 'excess', 2: 'total', 3: 'total', 17: 'total', 4: 'startup', 5: 'startup', 18: 'startup',
          8: 'point'}
-_AGG = {0: 'max', 2: 'max', 4: 'max', 10: 'max_std', 11: 'mean_std', 12: 'quantile', 17: 'quantile',
+_AGG = {6: 'sum', 0: 'max', 2: 'max', 4: 'max', 10: 'max_std', 11: 'mean_std', 12: 'quantile', 17: 'quantile',
         18: 'quantile'}
 
 
@@ -72,6 +72,8 @@ def aggregate(how, x, lam=1.0, alpha=0.85):
         return m
     if how == 'mean':
         return mu
+    if how == 'sum':
+        return s
     if how in ('mean_std', 'max_std'):
         ss = 0.0
         for v in x:

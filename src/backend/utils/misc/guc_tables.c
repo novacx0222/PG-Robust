@@ -1067,6 +1067,18 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"robust_gather_all", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Offers a Gather on every partial path candidate of a join relation of RobDP's main pass."),
+			gettext_noop("When off, as in PostgreSQL, a plain Gather is built on the first kept partial path only. "
+						 "A Gather adds the same cost to every partial path of a relation, so this cannot change "
+						 "what E[Cost] keeps, but it can for objectives that are not linear in the cost."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&robust_gather_all,
+		false,
+		NULL, NULL, NULL
+	},
+	{
 		{"robust_select", PGC_USERSET, DEVELOPER_OPTIONS,
 			gettext_noop("Keeps, for each join relation of RobDP's main pass, the paths its objectives select."),
 			gettext_noop("When off, the main pass keeps every path no other path "
@@ -3652,7 +3664,7 @@ struct config_int ConfigureNamesInt[] =
 			gettext_noop("Sets the objective RobDP keeps join paths and picks the plan by (v20 numbering)."),
 			gettext_noop("0 worst penalty, 1 expected penalty, 2 worst total cost, "
 						 "3 expected total cost, 4 worst startup cost, 5 expected startup cost, "
-						 "6 penalty probability (1 - ProbNoPenalty), 8 point estimate, "
+						 "6 penalty count (scenarios with a penalty, N (1 - ProbNoPenalty)), 8 point estimate, "
 						 "10 worst penalty + lambda stdev, 11 expected penalty + lambda stdev, "
 						 "12 alpha-quantile penalty, 17 alpha-quantile total cost, "
 						 "18 alpha-quantile startup cost."),

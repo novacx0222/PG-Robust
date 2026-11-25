@@ -37,7 +37,7 @@
 #define OBJ_EXPECTED_TOTAL		3
 #define OBJ_WORST_STARTUP		4
 #define OBJ_EXPECTED_STARTUP	5
-#define OBJ_PENALTY_PROB		6	/* 1 - ProbNoPenalty */
+#define OBJ_PENALTY_COUNT		6	/* N (1 - ProbNoPenalty) */
 #define DV_RANDOM				7
 #define OBJ_POINT_TOTAL			8
 #define OBJ_WORST_PENALTY_STD	10
@@ -65,6 +65,7 @@ typedef enum Agg
 {
 	AGG_MAX,					/* the largest (from 0, as v20) */
 	AGG_MEAN,
+	AGG_SUM,					/* the sum: a count, for 0/1 losses */
 	AGG_MEAN_STD,				/* mean + lambda * standard deviation */
 	AGG_MAX_STD,				/* max + lambda * standard deviation */
 	AGG_QUANTILE,				/* the alpha-quantile */
@@ -107,7 +108,7 @@ is_objective(int id)
 		case OBJ_EXPECTED_TOTAL:
 		case OBJ_WORST_STARTUP:
 		case OBJ_EXPECTED_STARTUP:
-		case OBJ_PENALTY_PROB:
+		case OBJ_PENALTY_COUNT:
 		case OBJ_POINT_TOTAL:
 		case OBJ_WORST_PENALTY_STD:
 		case OBJ_EXPECTED_PENALTY_STD:
@@ -162,7 +163,7 @@ objective_loss(int id)
 {
 	switch (id)
 	{
-		case OBJ_PENALTY_PROB:
+		case OBJ_PENALTY_COUNT:
 			return LOSS_EXCESS;
 		case OBJ_WORST_TOTAL:
 		case OBJ_EXPECTED_TOTAL:
@@ -183,6 +184,8 @@ objective_agg(int id)
 {
 	switch (id)
 	{
+		case OBJ_PENALTY_COUNT:
+			return AGG_SUM;
 		case OBJ_WORST_PENALTY:
 		case OBJ_WORST_TOTAL:
 		case OBJ_WORST_STARTUP:
@@ -287,6 +290,8 @@ aggregate(Agg agg, double *x, int N)
 			return m;
 		case AGG_MEAN:
 			return mean;
+		case AGG_SUM:
+			return sum;
 		case AGG_MEAN_STD:
 		case AGG_MAX_STD:
 			for (int s = 0; s < N; s++)
@@ -822,7 +827,7 @@ dv_next(Dv *dv)
  */
 static const int mix_members[] = {
 	OBJ_EXPECTED_TOTAL, OBJ_EXPECTED_PENALTY, OBJ_EXPECTED_PENALTY_STD,
-	OBJ_QUANTILE_PENALTY, OBJ_PENALTY_PROB, DV_SIMILARITY, DV_COST_JOIN,
+	OBJ_QUANTILE_PENALTY, OBJ_PENALTY_COUNT, DV_SIMILARITY, DV_COST_JOIN,
 };
 
 /*
