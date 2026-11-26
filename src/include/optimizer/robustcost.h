@@ -62,6 +62,20 @@
  * round's scenario s already: the round's paths are replayed in s only and
  * the result goes into their scalar fields, with no vectors.
  *
+ * Join paths (nested loop, merge and hash joins, with the rescan of a
+ * nested loop's inner side, Memoize included) are not replayed scenario by
+ * scenario but costed by vector versions of their cost functions
+ * (robust_vector_cost, see vector_join in robustcost.c): what does not
+ * depend on the scenario is computed once per path, and the rest is
+ * PostgreSQL's arithmetic on the scenario's inputs, written so that it
+ * gives the replay's results bit for bit.  Like a replay they start at the
+ * point, and a path whose point is not its scalars is replayed.  With
+ * robust_debug_check_costs on (the default in assert-enabled builds), every
+ * path costed so is replayed too, and any difference is an error; so is an
+ * estimate found in one of the caches of estimates in a scenario (hash
+ * bucket statistics, numbers of groups) that is not what the estimator
+ * gives anew.
+ *
  * src/include/optimizer/robustcost.h
  *
  *-------------------------------------------------------------------------

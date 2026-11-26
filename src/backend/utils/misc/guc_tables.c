@@ -1078,6 +1078,29 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"robust_vector_cost", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Costs join paths in RobDP's error scenarios with vector versions of PostgreSQL's join cost functions."),
+			gettext_noop("When off, the join cost functions are replayed in every scenario (optimizer/robustcost.h). "
+						 "Both give the same costs, bit for bit."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&robust_vector_cost,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"robust_debug_check_costs", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Checks RobDP's vector costing of join paths against the replay of PostgreSQL's cost functions."),
+			gettext_noop("Every join path costed by the vector functions is replayed as well, and a difference in any "
+						 "scenario is an error; so is a cached estimate that differs from the estimator's anew.  "
+						 "On by default in assert-enabled builds; planning becomes slower."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&robust_debug_check_costs,
+		DEFAULT_ROBUST_CHECK_COSTS,
+		NULL, NULL, NULL
+	},
+	{
 		{"robust_gather_all", PGC_USERSET, DEVELOPER_OPTIONS,
 			gettext_noop("Offers a Gather on every partial path candidate of a join relation of RobDP's main pass."),
 			gettext_noop("When off, as in PostgreSQL, a plain Gather is built on the first kept partial path only. "

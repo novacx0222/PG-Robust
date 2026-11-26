@@ -223,6 +223,13 @@ extern double robust_calc_joinrel_size(PlannerInfo *root,
 									   SpecialJoinInfo *sjinfo,
 									   List *restrictlist,
 									   RobustJoinSel *sel);
+/* costsize.c's helpers, for the vector join costing (robustcost.c) */
+extern double robust_cost_parallel_divisor(Path *path);
+extern bool robust_cost_indexed_join_quals(NestPath *path);
+extern int32 robust_cost_expr_width(PlannerInfo *root, const Node *expr);
+extern MergeScanSelCache *robust_cost_scansel(PlannerInfo *root,
+											  RestrictInfo *rinfo,
+											  PathKey *pathkey);
 extern void set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 									   RelOptInfo *outer_rel,
 									   RelOptInfo *inner_rel,

@@ -31,6 +31,8 @@ extern PGDLLIMPORT bool robust_search;
 extern PGDLLIMPORT bool robust_envelope;
 extern PGDLLIMPORT bool robust_select_dedup;
 extern PGDLLIMPORT bool robust_select_precheck;
+extern PGDLLIMPORT bool robust_vector_cost;
+extern PGDLLIMPORT bool robust_debug_check_costs;
 extern PGDLLIMPORT bool robust_gather_all;
 extern PGDLLIMPORT bool robust_select;
 extern PGDLLIMPORT bool robust_dominance;
@@ -43,6 +45,13 @@ extern PGDLLIMPORT int retain_strategy_id;
 extern PGDLLIMPORT double robust_penalty_tau;
 extern PGDLLIMPORT double robust_penalty_lambda;
 extern PGDLLIMPORT double robust_quantile_alpha;
+
+/* robust_debug_check_costs is on by default in assert-enabled builds */
+#ifdef USE_ASSERT_CHECKING
+#define DEFAULT_ROBUST_CHECK_COSTS true
+#else
+#define DEFAULT_ROBUST_CHECK_COSTS false
+#endif
 
 /* robust_join_pairing (see optimizer/robustselect.h) */
 typedef enum RobustPairing

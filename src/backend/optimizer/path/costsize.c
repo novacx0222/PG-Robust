@@ -6278,6 +6278,34 @@ get_parallel_divisor(Path *path)
 }
 
 /*
+ * RobDP: helpers of the join cost functions above, for their vector
+ * versions (robustcost.c), which must compute exactly what these do.
+ */
+double
+robust_cost_parallel_divisor(Path *path)
+{
+	return get_parallel_divisor(path);
+}
+
+bool
+robust_cost_indexed_join_quals(NestPath *path)
+{
+	return has_indexed_join_quals(path);
+}
+
+int32
+robust_cost_expr_width(PlannerInfo *root, const Node *expr)
+{
+	return get_expr_width(root, expr);
+}
+
+MergeScanSelCache *
+robust_cost_scansel(PlannerInfo *root, RestrictInfo *rinfo, PathKey *pathkey)
+{
+	return cached_scansel(root, rinfo, pathkey);
+}
+
+/*
  * compute_bitmap_pages
  *
  * compute number of pages fetched from heap in bitmap heap scan.

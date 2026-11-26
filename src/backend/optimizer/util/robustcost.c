@@ -12,6 +12,10 @@
  * afterwards.  Everything a cost function allocates goes to a scratch
  * context, reset after each scenario.
  *
+ * Join paths are costed by vector versions of the join cost functions
+ * instead, which give the same results bit for bit (see "vector join
+ * costing" below); the replay checks them in assert-enabled builds.
+ *
  * src/backend/optimizer/util/robustcost.c
  *
  *-------------------------------------------------------------------------
@@ -20,7 +24,10 @@
 
 #include <math.h>
 
+#include "access/htup_details.h"
 #include "common/hashfn.h"
+#include "executor/nodeHash.h"
+#include "executor/nodeMemoize.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
@@ -42,7 +49,14 @@ RobustReplayHooks *robust_replay = NULL;
 static RobustReplayHooks hooks;
 static const Path *replay_path = NULL;	/* the path a replay is for */
 static int	replay_s = -1;		/* and its scenario, -1 for the point */
-static MemoryContext scratch_cxt = NULL;
+
+/* The vector costing of join paths (see vector_join) */
+struct Replay;
+static struct Replay *vec_R = NULL; /* the path being costed so, if any */
+static double scenario_rel_rows(const RelOptInfo *rel);
+static bool scenario_enter(void);
+static void scenario_leave(bool entered);
+static const char *path_type_name(Path *path);
 
 /*
  * The join add_paths_to_joinrel() is building paths for: what the cost
@@ -79,8 +93,9 @@ typedef struct PairQuerylets
 
 /*
  * The state of the planning of one query (standard_planner).  A planning
- * started while another runs (a function evaluated during planning) gets
- * its own, and the outer one's is restored when it ends.
+ * started while another runs (a function evaluated during planning, maybe
+ * by an estimator inside a replay) gets its own, and the outer one's is
+ * restored when it ends, with the replay's globals above.
  */
 typedef struct CostState
 {
@@ -88,6 +103,12 @@ typedef struct CostState
 	int			next_path_id;
 	JoinContext jcx;
 	MemoryContext cxt;			/* the planning's memory context */
+	MemoryContext scratch;		/* a replay's, reset after it (or NULL) */
+	RobustReplayHooks *outer_replay;	/* the globals of the planning this */
+	RobustReplayHooks outer_hooks;	/* one is nested in */
+	const Path *outer_replay_path;
+	int			outer_replay_s;
+	struct Replay *outer_vec_R;
 	RelOptInfo *prows_rel;		/* add_paths_to_append_rel's partial_rows */
 	Path	   *prows_path;		/* came from this path of prows_rel */
 	List	   *append_paths;	/* Appends given their rows, and */
@@ -190,16 +211,63 @@ robust_cost_begin_query(void)
 {
 	CostState  *saved = st;
 
-	robust_replay = NULL;
+	Assert(saved != NULL || (robust_replay == NULL && vec_R == NULL));
 	st = palloc0(sizeof(CostState));
 	st->cxt = CurrentMemoryContext;
+	st->outer_replay = robust_replay;
+	st->outer_hooks = hooks;
+	st->outer_replay_path = replay_path;
+	st->outer_replay_s = replay_s;
+	st->outer_vec_R = vec_R;
+	robust_replay = NULL;
+	replay_path = NULL;
+	replay_s = -1;
+	vec_R = NULL;
 	return saved;
 }
 
+/*
+ * robust_cost_end_query
+ *		The planning ends, normally or by an error: restores the state of the
+ *		planning it is nested in.
+ */
 void
 robust_cost_end_query(void *saved)
 {
+	CostState  *cur = st;
+
+	if (cur != NULL)
+	{
+		robust_replay = cur->outer_replay;
+		hooks = cur->outer_hooks;
+		replay_path = cur->outer_replay_path;
+		replay_s = cur->outer_replay_s;
+		vec_R = cur->outer_vec_R;
+		if (cur->scratch != NULL)
+		{
+			/* (after an error inside a replay, we may still be in it) */
+			for (MemoryContext c = CurrentMemoryContext; c != NULL; c = c->parent)
+			{
+				if (c == cur->scratch)
+				{
+					MemoryContextSwitchTo(cur->cxt);
+					break;
+				}
+			}
+			MemoryContextDelete(cur->scratch);
+		}
+	}
 	st = (CostState *) saved;
+}
+
+/* The scratch memory of a replay (reset with MemoryContextReset(st->scratch)) */
+static MemoryContext
+scratch_context(void)
+{
+	if (st->scratch == NULL)
+		st->scratch = AllocSetContextCreate(st->cxt, "RobDP replay",
+											ALLOCSET_DEFAULT_SIZES);
+	return st->scratch;
 }
 
 /* The query level whose paths are being built (query_planner) */
@@ -432,6 +500,21 @@ dbits(double d)
 
 	memcpy(&u, &d, sizeof(u));
 	return u;
+}
+
+static inline bool
+same_bits(double a, double b)
+{
+	return memcmp(&a, &b, sizeof(double)) == 0;
+}
+
+/* A base relation's rows in scenario s (-1: the point) */
+static inline double
+rel_rows_at(const RelOptInfo *rel, int s)
+{
+	if (s >= 0 && rel->robust_rows != NULL)
+		return robust_vec_at(rel->robust_rows, s);
+	return rel->rows;
 }
 
 /*
@@ -917,7 +1000,10 @@ robust_replay_bucket_stats(PlannerInfo *root, RestrictInfo *rinfo, bool right,
 		relid >= root->simple_rel_array_size ||
 		root->simple_rel_array[relid] == NULL)
 	{
+		bool		entered = scenario_enter();
+
 		estimate_hash_bucket_stats(root, key, vb, mcvfreq, bucketsize);
+		scenario_leave(entered);
 		return;
 	}
 	if (st->bucket_cache == NULL)
@@ -934,29 +1020,49 @@ robust_replay_bucket_stats(PlannerInfo *root, RestrictInfo *rinfo, bool right,
 	memset(&k, 0, sizeof(k));
 	k.rinfo = rinfo;
 	k.vb = vb;
-	k.rows = root->simple_rel_array[relid]->rows;
+	k.rows = scenario_rel_rows(root->simple_rel_array[relid]);
 	k.right = right;
 	e = (BucketEntry *) hash_search(st->bucket_cache, &k, HASH_ENTER, &found);
 	if (!found)
+	{
+		bool		entered = scenario_enter();
+
 		estimate_hash_bucket_stats(root, key, vb, &e->mcvfreq, &e->bucketsize);
+		scenario_leave(entered);
+	}
+	else if (robust_debug_check_costs)
+	{
+		/* the key is all the estimate depends on */
+		bool		entered = scenario_enter();
+		Selectivity m,
+					b;
+
+		estimate_hash_bucket_stats(root, key, vb, &m, &b);
+		scenario_leave(entered);
+		if (!same_bits(m, e->mcvfreq) || !same_bits(b, e->bucketsize))
+			elog(ERROR, "RobDP: cached estimate_hash_bucket_stats differs: mcvfreq %.17g vs %.17g, bucketsize %.17g vs %.17g",
+				 e->mcvfreq, m, e->bucketsize, b);
+	}
 	*mcvfreq = e->mcvfreq;
 	*bucketsize = e->bucketsize;
 }
 
 /*
- * estimate_num_groups of a Memoize's parameters in a replay.  When they
- * are plain Vars, the estimate depends on the scenario only through the
- * input rows and the rows of the Vars' relations, so it is cached under
- * those.
+ * estimate_num_groups of a Memoize's parameters or an aggregation's
+ * grouping expressions in a replay.  When they are plain Vars, the estimate
+ * depends on the scenario only through the input rows and the rows of the
+ * Vars' relations, so it is cached under those.  A Var is known by its
+ * relation, not its varno: the cache is the planning's, of every query
+ * level, and varnos are a level's.
  */
 #define GROUPS_MAXVARS 8
 
 typedef struct GroupsKey
 {
 	int			nvars;
-	int			varno[GROUPS_MAXVARS];
+	const RelOptInfo *rel[GROUPS_MAXVARS];
 	int			attno[GROUPS_MAXVARS];
-	double		rows[GROUPS_MAXVARS];	/* of varno[i]'s relation */
+	double		rows[GROUPS_MAXVARS];	/* of rel[i] */
 	double		input_rows;
 } GroupsKey;
 
@@ -976,25 +1082,26 @@ groups_hash(const void *key, Size keysize)
 
 	for (int i = 0; i < k->nvars; i++)
 	{
-		h = hash_combine64(h, mix64(((uint64) (uint32) k->varno[i] << 32) |
+		h = hash_combine64(h, mix64((uint64) (uintptr_t) k->rel[i] +
 									(uint32) k->attno[i]));
 		h = hash_combine64(h, mix64(dbits(k->rows[i])));
 	}
 	return (uint32) (h ^ (h >> 32));
 }
 
-double
-robust_replay_num_groups(PlannerInfo *root, List *exprs, double input_rows,
-						 EstimationInfo *estinfo)
+/*
+ * The relations and attributes of exprs, if robust_replay_num_groups caches
+ * their estimates: their number, or -1.
+ */
+static int
+groups_vars(PlannerInfo *root, List *exprs, const RelOptInfo **rel,
+			int *attno)
 {
-	GroupsKey	k;
+	int			nvars = 0;
 	ListCell   *lc;
-	GroupsEntry *e;
-	bool		found;
 
 	if (st == NULL || list_length(exprs) > GROUPS_MAXVARS)
-		return estimate_num_groups(root, exprs, input_rows, NULL, estinfo);
-	memset(&k, 0, sizeof(k));
+		return -1;
 	foreach(lc, exprs)
 	{
 		Node	   *n = (Node *) lfirst(lc);
@@ -1003,17 +1110,45 @@ robust_replay_num_groups(PlannerInfo *root, List *exprs, double input_rows,
 		while (IsA(n, RelabelType))
 			n = (Node *) ((RelabelType *) n)->arg;
 		if (!IsA(n, Var))
-			return estimate_num_groups(root, exprs, input_rows, NULL, estinfo);
+			return -1;
 		v = (Var *) n;
 		if (v->varlevelsup != 0 || v->varnullingrels != NULL ||
 			v->varno >= root->simple_rel_array_size ||
 			root->simple_rel_array[v->varno] == NULL)
-			return estimate_num_groups(root, exprs, input_rows, NULL, estinfo);
-		k.varno[k.nvars] = v->varno;
-		k.attno[k.nvars] = v->varattno;
-		k.rows[k.nvars] = root->simple_rel_array[v->varno]->rows;
-		k.nvars++;
+			return -1;
+		rel[nvars] = root->simple_rel_array[v->varno];
+		attno[nvars] = v->varattno;
+		nvars++;
 	}
+	return nvars;
+}
+
+/* estimate_num_groups, in the scenario being costed */
+static double
+num_groups_now(PlannerInfo *root, List *exprs, double input_rows,
+			   EstimationInfo *estinfo)
+{
+	bool		entered = scenario_enter();
+	double		n = estimate_num_groups(root, exprs, input_rows, NULL, estinfo);
+
+	scenario_leave(entered);
+	return n;
+}
+
+double
+robust_replay_num_groups(PlannerInfo *root, List *exprs, double input_rows,
+						 EstimationInfo *estinfo)
+{
+	GroupsKey	k;
+	GroupsEntry *e;
+	bool		found;
+
+	memset(&k, 0, sizeof(k));
+	k.nvars = groups_vars(root, exprs, k.rel, k.attno);
+	if (k.nvars < 0)
+		return num_groups_now(root, exprs, input_rows, estinfo);
+	for (int i = 0; i < k.nvars; i++)
+		k.rows[i] = scenario_rel_rows(k.rel[i]);
 	k.input_rows = input_rows;
 
 	if (st->groups_cache == NULL)
@@ -1033,8 +1168,20 @@ robust_replay_num_groups(PlannerInfo *root, List *exprs, double input_rows,
 		EstimationInfo info;
 
 		memset(&info, 0, sizeof(info));
-		e->ngroups = estimate_num_groups(root, exprs, input_rows, NULL, &info);
+		e->ngroups = num_groups_now(root, exprs, input_rows, &info);
 		e->flags = info.flags;
+	}
+	else if (robust_debug_check_costs)
+	{
+		/* the key is all the estimate depends on */
+		EstimationInfo info;
+		double		n;
+
+		memset(&info, 0, sizeof(info));
+		n = num_groups_now(root, exprs, input_rows, &info);
+		if (!same_bits(n, e->ngroups) || info.flags != e->flags)
+			elog(ERROR, "RobDP: cached estimate_num_groups differs: %.17g (flags %u) vs %.17g (flags %u)",
+				 e->ngroups, e->flags, n, info.flags);
 	}
 	if (estinfo)
 		estinfo->flags = e->flags;
@@ -1358,7 +1505,7 @@ semifactors_at(Slots *sl, const RobustVec *m, int s, SemiAntiJoinFactors *out)
 	MemoryContext oldcxt;
 	ListCell   *lc;
 
-	oldcxt = MemoryContextSwitchTo(scratch_cxt);
+	oldcxt = MemoryContextSwitchTo(scratch_context());
 	foreach(lc, jcx.restrictlist)
 	{
 		RestrictInfo *c = makeNode(RestrictInfo);
@@ -1382,7 +1529,7 @@ semifactors_at(Slots *sl, const RobustVec *m, int s, SemiAntiJoinFactors *out)
 	if (s >= 0)
 		slots_restore(sl);
 	MemoryContextSwitchTo(oldcxt);
-	MemoryContextReset(scratch_cxt);
+	MemoryContextReset(st->scratch);
 }
 
 /*
@@ -1489,9 +1636,13 @@ typedef struct Replay
 {
 	PlannerInfo *root;
 	Path	   *path;
+	MemoryContext cxt;			/* replay()'s, for what outlives a scenario */
+	List	   *children;		/* path_children() */
 	Size		size;			/* of the path's node type */
-	Path	   *buf;			/* the copy the cost functions work on */
-	Slots		slots;
+	Path	   *buf;			/* the copy the cost functions work on, or
+								 * NULL until needed */
+	Slots		slots;			/* the inputs set per scenario */
+	bool		have_slots;		/* (built when first needed) */
 	RobustVec  *index_mult;		/* IndexPath */
 	List	   *tree;			/* BitmapHeapPath: TreeMults */
 	List	   *quals;			/* MergePath/HashPath: approx_tuple_count's */
@@ -2266,14 +2417,71 @@ cost_copy(Replay *R, Path *t, int s)
 	}
 }
 
+/*
+ * The inputs a replay sets per scenario: the rows of every base relation
+ * with a row vector, of the path's relation and ParamPathInfo, the rows and
+ * costs of its input paths (those of a Memoize inner's subpath too, and the
+ * Memoize's calls, which are its outer side's rows).
+ */
+static void
+replay_slots(Replay *R)
+{
+	PlannerInfo *root = R->root;
+	Path	   *path = R->path;
+	MemoryContext oldcxt;
+	ListCell   *lc;
+
+	if (R->have_slots)
+		return;
+	R->have_slots = true;
+	oldcxt = MemoryContextSwitchTo(R->cxt);
+	add_base_rels(&R->slots, root);
+	add_rel(&R->slots, path->parent);
+	if (path->param_info != NULL)
+		slot_add(&R->slots, &path->param_info->ppi_rows,
+				 path->param_info->ppi_robust_rows);
+	foreach(lc, R->children)
+		add_path_slots(&R->slots, (Path *) lfirst(lc));
+	if (IsA(path, SubqueryScanPath))
+		add_path_slots(&R->slots, ((SubqueryScanPath *) path)->subpath);
+	if (R->input_rel != NULL)
+		add_rel(&R->slots, R->input_rel);
+	if (R->memo != NULL)
+	{
+		/* cost_memoize_rescan reads the Memoize's input and calls */
+		JoinPath   *jp = (JoinPath *) path;
+		MemoizePath *mp = R->memo;
+		RobustPathCost *orc = jp->outerjoinpath->robust;
+
+		add_path_slots(&R->slots, mp->subpath);
+		if (orc != NULL && orc->rows != NULL &&
+			mp->calls == clamp_row_est(jp->outerjoinpath->rows))
+		{
+			int			N = error_sample_count;
+			RobustVec  *calls = robust_vec_make(N);
+
+			for (int s = 0; s < N; s++)
+				calls->v[s] = clamp_row_est(robust_vec_at(orc->rows, s));
+			slot_add(&R->slots, &mp->calls, calls);
+		}
+	}
+	MemoryContextSwitchTo(oldcxt);
+}
+
 /* Replay once, in scenario s (-1: the point, nothing set) */
 static void
 replay_once(Replay *R, int s, double *rows, double *startup, double *total,
 			int *nbatches)
 {
-	Path	   *t = R->buf;
-	MemoryContext oldcxt = MemoryContextSwitchTo(scratch_cxt);
+	Path	   *t;
+	MemoryContext oldcxt;
 
+	if (R->buf == NULL)
+		R->buf = MemoryContextAlloc(R->cxt, R->size);
+	if (s >= 0)
+		replay_slots(R);
+	t = R->buf;
+	oldcxt = MemoryContextSwitchTo(scratch_context());
 	memcpy(t, R->path, R->size);
 	replay_path = R->path;
 	replay_s = s;
@@ -2291,7 +2499,7 @@ replay_once(Replay *R, int s, double *rows, double *startup, double *total,
 	if (s >= 0)
 		slots_restore(&R->slots);
 	MemoryContextSwitchTo(oldcxt);
-	MemoryContextReset(scratch_cxt);
+	MemoryContextReset(st->scratch);
 
 	*rows = t->rows;
 	*startup = t->startup_cost;
@@ -2496,6 +2704,1218 @@ groups_available(Replay *R, RobustGroups g)
 	return false;
 }
 
+/* ------------------------------------------------- vector join costing */
+
+/*
+ * The cost functions of a join path -- initial_ and final_cost_nestloop,
+ * _mergejoin and _hashjoin, with cost_rescan and cost_memoize_rescan for a
+ * nested loop's inner side -- rewritten to cost the path in every scenario
+ * in one go, instead of replaying them once per scenario.
+ *
+ * What these functions compute that is the same in every scenario is
+ * computed once per path (JoinVec): the evaluation costs of the clauses,
+ * the merge scan fractions, the parallel divisors, the widths, the method's
+ * enable_ setting, and the selectivity of the merge or hash clauses that
+ * approx_tuple_count multiplies (a replay scales it by the querylets'
+ * multiplier of the scenario and clamps it, robust_replay_qual_selec: so
+ * does the vector costing, from the point's selectivity).  The rest is
+ * computed per scenario from the scenario's inputs (JoinIn: what a replay
+ * sets, replay_slots) by the same arithmetic as PostgreSQL's, statement by
+ * statement and with the same shape of every expression, so that the
+ * compiler evaluates it the same way (a multiply-add may be fused within an
+ * expression, never across two) and the results are bitwise the replay's.
+ * The estimates that depend on the scenario -- a hash clause's bucket size
+ * and MCV frequency, a Memoize's distinct calls -- go through the replay's
+ * caches (robust_replay_bucket_stats, robust_replay_num_groups), which read
+ * a base relation's rows in the scenario from its vector, and on a miss set
+ * the replay's inputs before calling the estimator (scenario_enter).
+ *
+ * Like a replay, the vector costing first computes the point: if it is not
+ * the path's scalar fields, the path is replayed (and gets the replay's
+ * status).  With robust_debug_check_costs on, a path costed so is replayed
+ * as well, at the point and in every scenario computed, and any difference
+ * in any bit of the rows, startup cost, total cost or a hash join's batches
+ * is an error.
+ */
+
+/* An input's value in a scenario: its vector's, or the scalar's */
+typedef struct VecSrc
+{
+	const RobustVec *v;			/* NULL: the scalar in every scenario */
+	double		x;
+} VecSrc;
+
+static inline double
+src_at(const VecSrc *a, int s)
+{
+	return (a->v != NULL && s >= 0) ? robust_vec_at(a->v, s) : a->x;
+}
+
+static inline void
+src_set(VecSrc *a, const RobustVec *v, double x)
+{
+	a->v = v;
+	a->x = x;
+}
+
+/* The inputs of a join path's cost functions in one scenario */
+typedef struct JoinIn
+{
+	double		rows;			/* of the path's relation or ParamPathInfo */
+	double		orows;			/* the outer path's rows and costs */
+	double		ostartup;
+	double		ototal;
+	double		irows;			/* the inner path's */
+	double		istartup;
+	double		itotal;
+	int			inbatches;		/* an inner HashPath's batches */
+	double		srows;			/* an inner Memoize's subpath's */
+	double		sstartup;
+	double		stotal;
+	double		calls;			/* an inner Memoize's calls */
+	double		qual_mult;		/* scales approx_tuple_count's selectivity */
+	SemiAntiJoinFactors sf;
+} JoinIn;
+
+typedef struct JoinOut
+{
+	double		rows;
+	double		startup;
+	double		total;
+	int			nbatches;		/* HashPath */
+} JoinOut;
+
+typedef struct JoinVec
+{
+	Replay	   *R;
+	PlannerInfo *root;
+	JoinPath   *jp;
+
+	/* where the inputs come from */
+	VecSrc		rows;
+	VecSrc		orows;
+	VecSrc		ostartup;
+	VecSrc		ototal;
+	VecSrc		irows;
+	VecSrc		istartup;
+	VecSrc		itotal;
+	const int  *inb;			/* an inner HashPath's batches, or NULL */
+	int			inb_x;
+	VecSrc		srows;			/* an inner Memoize's subpath */
+	VecSrc		sstartup;
+	VecSrc		stotal;
+	const RobustVec *calls;		/* the outer rows giving the Memoize's
+								 * calls, or NULL: calls_x */
+	double		calls_x;
+
+	/* the same in every scenario: all joins */
+	bool		early_stop;		/* SEMI or ANTI join or inner_unique: the
+								 * executor stops at the first match */
+	bool		parallel;		/* a partial path: its rows / divisor */
+	double		divisor;
+	bool		disabled;		/* enable_<method> is off */
+	QualCost	tlist;			/* the path's target's evaluation */
+	int			owidth;			/* the inputs' widths */
+	int			iwidth;
+	Cost		cpu_per_tuple;	/* cpu_tuple_cost + the per-tuple cost of
+								 * the clauses evaluated per joined tuple */
+	Selectivity selec;			/* approx_tuple_count's, at the point */
+
+	/* nested loop */
+	QualCost	restrict_cost;	/* of the join clauses */
+	bool		indexed;		/* has_indexed_join_quals (early stop) */
+	NodeTag		rescan;			/* the inner's pathtype, for cost_rescan */
+	int			swidth;			/* Memoize: its subpath's width */
+	int			nkeys;			/* Memoize: the widths of its cache keys */
+	int32	   *key_widths;
+	List	   *keys;			/* Memoize: the cache keys (costed ones) */
+	double		hash_mem;		/* Memoize: get_hash_memory_limit() */
+
+	/* merge and hash joins */
+	QualCost	jq_cost;		/* of the merge or hash clauses */
+	QualCost	qp_cost;		/* of the other join clauses */
+
+	/* merge join */
+	Selectivity outerstartsel;	/* the scan fractions, before rounding */
+	Selectivity outerendsel;
+	Selectivity innerstartsel;
+	Selectivity innerendsel;
+	List	   *outersortkeys;
+	List	   *innersortkeys;
+	bool		skip_mark_restore;
+	bool		outer_unique;	/* IsA(outer, UniquePath) */
+	bool		materialize_inner;	/* the point's choice, kept */
+
+	/* hash join */
+	double		build_per_row;	/* cpu_operator_cost * num_hashclauses +
+								 * cpu_tuple_cost */
+	double		probe_per_row;	/* cpu_operator_cost * num_hashclauses */
+	bool		parallel_hash;
+	double		inner_divisor;	/* of the inner path, for a parallel hash */
+	int			outer_workers;
+	bool		inner_unique_path;	/* IsA(inner, UniquePath) */
+	int			nclauses;
+	RestrictInfo **clauses;
+	bool	   *right;			/* is the clause's right side the inner? */
+	double		hash_mem_limit; /* get_hash_memory_limit() */
+	bool		have_size;		/* ExecChooseHashTableSize's last result */
+	double		size_ntuples;
+	int			size_buckets;
+	int			size_batches;
+} JoinVec;
+
+/*
+ * A base relation's rows in the scenario being costed.  A replay projects
+ * them onto the scenario; the vector costing does not, they are read from
+ * the relation's vector.
+ */
+static double
+scenario_rel_rows(const RelOptInfo *rel)
+{
+	return rel_rows_at(rel, vec_R != NULL ? replay_s : -1);
+}
+
+/*
+ * An estimator is called during the vector costing of a scenario: set what
+ * a replay of the scenario sets.  Returns whether anything was set, for
+ * scenario_leave.
+ */
+static bool
+scenario_enter(void)
+{
+	if (vec_R == NULL || replay_s < 0)
+		return false;
+	replay_slots(vec_R);
+	slots_project(&vec_R->slots, replay_s);
+	return true;
+}
+
+static void
+scenario_leave(bool entered)
+{
+	if (entered)
+		slots_restore(&vec_R->slots);
+}
+
+/* As costsize.c's (a function, not a macro: see above) */
+static inline double
+vec_relation_byte_size(double tuples, int width)
+{
+	return tuples * (MAXALIGN(width) + MAXALIGN(SizeofHeapTupleHeader));
+}
+
+static inline double
+vec_page_size(double tuples, int width)
+{
+	return ceil(vec_relation_byte_size(tuples, width) / BLCKSZ);
+}
+
+/* approx_tuple_count's selectivity of quals, at the point */
+static Selectivity
+join_selec(PlannerInfo *root, JoinPath *path, List *quals)
+{
+	SpecialJoinInfo sjinfo;
+	Selectivity selec = 1.0;
+	ListCell   *l;
+
+	/* as approx_tuple_count makes it up */
+	sjinfo.type = T_SpecialJoinInfo;
+	sjinfo.min_lefthand = path->outerjoinpath->parent->relids;
+	sjinfo.min_righthand = path->innerjoinpath->parent->relids;
+	sjinfo.syn_lefthand = path->outerjoinpath->parent->relids;
+	sjinfo.syn_righthand = path->innerjoinpath->parent->relids;
+	sjinfo.jointype = JOIN_INNER;
+	sjinfo.ojrelid = 0;
+	sjinfo.commute_above_l = NULL;
+	sjinfo.commute_above_r = NULL;
+	sjinfo.commute_below_l = NULL;
+	sjinfo.commute_below_r = NULL;
+	sjinfo.lhs_strict = false;
+	sjinfo.semi_can_btree = false;
+	sjinfo.semi_can_hash = false;
+	sjinfo.semi_operators = NIL;
+	sjinfo.semi_rhs_exprs = NIL;
+
+	foreach(l, quals)
+	{
+		Node	   *qual = (Node *) lfirst(l);
+
+		selec *= clause_selectivity(root, qual, 0, JOIN_INNER, &sjinfo);
+	}
+	return selec;
+}
+
+/* What the join path's cost functions read that no scenario changes */
+static void
+join_vec_setup(Replay *R, JoinVec *J)
+{
+	PlannerInfo *root = R->root;
+	JoinPath   *jp = (JoinPath *) R->path;
+	Path	   *path = &jp->path;
+	Path	   *outer = jp->outerjoinpath;
+	Path	   *inner = jp->innerjoinpath;
+	RobustPathCost *orc = outer->robust;
+	RobustPathCost *irc = inner->robust;
+	ListCell   *lc;
+
+	memset(J, 0, sizeof(JoinVec));
+	J->R = R;
+	J->root = root;
+	J->jp = jp;
+
+	/* the inputs, as replay_slots sets them */
+	if (path->param_info != NULL)
+		src_set(&J->rows, path->param_info->ppi_robust_rows,
+				path->param_info->ppi_rows);
+	else
+		src_set(&J->rows, path->parent->robust_rows, path->parent->rows);
+	src_set(&J->orows, orc ? orc->rows : NULL, outer->rows);
+	src_set(&J->ostartup, orc ? orc->startup : NULL, outer->startup_cost);
+	src_set(&J->ototal, orc ? orc->total : NULL, outer->total_cost);
+	src_set(&J->irows, irc ? irc->rows : NULL, inner->rows);
+	src_set(&J->istartup, irc ? irc->startup : NULL, inner->startup_cost);
+	src_set(&J->itotal, irc ? irc->total : NULL, inner->total_cost);
+	if (IsA(inner, HashPath))
+	{
+		J->inb = irc ? irc->nbatches : NULL;
+		J->inb_x = ((HashPath *) inner)->num_batches;
+	}
+
+	/* all joins */
+	J->early_stop = jp->jointype == JOIN_SEMI || jp->jointype == JOIN_ANTI ||
+		jcx.inner_unique;
+	J->parallel = path->parallel_workers > 0;
+	if (J->parallel)
+		J->divisor = robust_cost_parallel_divisor(path);
+	J->tlist = path->pathtarget->cost;
+	J->owidth = outer->pathtarget->width;
+	J->iwidth = inner->pathtarget->width;
+
+	switch (nodeTag(path))
+	{
+		case T_NestPath:
+			J->disabled = !enable_nestloop;
+			cost_qual_eval(&J->restrict_cost, jp->joinrestrictinfo, root);
+			J->cpu_per_tuple = cpu_tuple_cost + J->restrict_cost.per_tuple;
+			if (J->early_stop)
+				J->indexed = robust_cost_indexed_join_quals((NestPath *) jp);
+			J->rescan = inner->pathtype;
+			if (J->rescan == T_Memoize)
+			{
+				MemoizePath *mp = (MemoizePath *) inner;
+				Path	   *sub = mp->subpath;
+				RobustPathCost *src = sub->robust;
+				int			i = 0;
+
+				Assert(R->memo == mp);
+				src_set(&J->srows, src ? src->rows : NULL, sub->rows);
+				src_set(&J->sstartup, src ? src->startup : NULL,
+						sub->startup_cost);
+				src_set(&J->stotal, src ? src->total : NULL, sub->total_cost);
+				if (orc != NULL && orc->rows != NULL &&
+					mp->calls == clamp_row_est(outer->rows))
+					J->calls = orc->rows;
+				J->calls_x = mp->calls;
+				J->swidth = sub->pathtarget->width;
+				J->keys = mp->param_exprs;	/* replay() set the costed ones */
+				J->nkeys = list_length(J->keys);
+				J->key_widths = palloc(sizeof(int32) * Max(J->nkeys, 1));
+				foreach(lc, J->keys)
+					J->key_widths[i++] = robust_cost_expr_width(root,
+																(Node *) lfirst(lc));
+				J->hash_mem = get_hash_memory_limit();
+			}
+			break;
+
+		case T_MergePath:
+			{
+				MergePath  *mp = (MergePath *) jp;
+				List	   *mergeclauses = mp->path_mergeclauses;
+
+				J->disabled = !enable_mergejoin;
+
+				/* initial_cost_mergejoin's scan fractions */
+				if (mergeclauses && jp->jointype != JOIN_FULL)
+				{
+					RestrictInfo *firstclause = (RestrictInfo *) linitial(mergeclauses);
+					List	   *opathkeys;
+					PathKey    *opathkey;
+					MergeScanSelCache *cache;
+
+					opathkeys = mp->outersortkeys ? mp->outersortkeys :
+						outer->pathkeys;
+					opathkey = (PathKey *) linitial(opathkeys);
+					cache = robust_cost_scansel(root, firstclause, opathkey);
+					if (bms_is_subset(firstclause->left_relids,
+									  outer->parent->relids))
+					{
+						J->outerstartsel = cache->leftstartsel;
+						J->outerendsel = cache->leftendsel;
+						J->innerstartsel = cache->rightstartsel;
+						J->innerendsel = cache->rightendsel;
+					}
+					else
+					{
+						J->outerstartsel = cache->rightstartsel;
+						J->outerendsel = cache->rightendsel;
+						J->innerstartsel = cache->leftstartsel;
+						J->innerendsel = cache->leftendsel;
+					}
+					if (jp->jointype == JOIN_LEFT ||
+						jp->jointype == JOIN_ANTI)
+					{
+						J->outerstartsel = 0.0;
+						J->outerendsel = 1.0;
+					}
+					else if (jp->jointype == JOIN_RIGHT ||
+							 jp->jointype == JOIN_RIGHT_ANTI)
+					{
+						J->innerstartsel = 0.0;
+						J->innerendsel = 1.0;
+					}
+				}
+				else
+				{
+					J->outerstartsel = J->innerstartsel = 0.0;
+					J->outerendsel = J->innerendsel = 1.0;
+				}
+				J->outersortkeys = mp->outersortkeys;
+				J->innersortkeys = mp->innersortkeys;
+
+				/* final_cost_mergejoin's */
+				cost_qual_eval(&J->jq_cost, mergeclauses, root);
+				cost_qual_eval(&J->qp_cost, jp->joinrestrictinfo, root);
+				J->qp_cost.startup -= J->jq_cost.startup;
+				J->qp_cost.per_tuple -= J->jq_cost.per_tuple;
+				J->skip_mark_restore = J->early_stop &&
+					(list_length(jp->joinrestrictinfo) ==
+					 list_length(mp->path_mergeclauses));
+				J->outer_unique = IsA(outer, UniquePath);
+				J->materialize_inner = mp->materialize_inner;
+				J->cpu_per_tuple = cpu_tuple_cost + J->qp_cost.per_tuple;
+				J->selec = join_selec(root, jp, mergeclauses);
+			}
+			break;
+
+		case T_HashPath:
+			{
+				HashPath   *hp = (HashPath *) jp;
+				List	   *hashclauses = hp->path_hashclauses;
+				int			num_hashclauses = list_length(hashclauses);
+
+				J->disabled = !enable_hashjoin;
+
+				/* initial_cost_hashjoin's */
+				J->build_per_row = (cpu_operator_cost * num_hashclauses + cpu_tuple_cost);
+				J->probe_per_row = cpu_operator_cost * num_hashclauses;
+				J->parallel_hash = path->parallel_aware;
+				if (J->parallel_hash)
+					J->inner_divisor = robust_cost_parallel_divisor(inner);
+				J->outer_workers = outer->parallel_workers;
+
+				/* final_cost_hashjoin's */
+				J->inner_unique_path = IsA(inner, UniquePath);
+				if (!J->inner_unique_path)
+				{
+					int			i = 0;
+
+					J->nclauses = num_hashclauses;
+					J->clauses = palloc(sizeof(RestrictInfo *) * Max(num_hashclauses, 1));
+					J->right = palloc(sizeof(bool) * Max(num_hashclauses, 1));
+					foreach(lc, hashclauses)
+					{
+						RestrictInfo *restrictinfo = lfirst_node(RestrictInfo, lc);
+
+						J->clauses[i] = restrictinfo;
+						J->right[i] = bms_is_subset(restrictinfo->right_relids,
+													inner->parent->relids);
+						Assert(J->right[i] ||
+							   bms_is_subset(restrictinfo->left_relids,
+											 inner->parent->relids));
+						i++;
+					}
+				}
+				J->hash_mem_limit = get_hash_memory_limit();
+				cost_qual_eval(&J->jq_cost, hashclauses, root);
+				cost_qual_eval(&J->qp_cost, jp->joinrestrictinfo, root);
+				J->qp_cost.startup -= J->jq_cost.startup;
+				J->qp_cost.per_tuple -= J->jq_cost.per_tuple;
+				J->cpu_per_tuple = cpu_tuple_cost + J->qp_cost.per_tuple;
+				/* (approx_tuple_count is not called for an early stop) */
+				if (!J->early_stop)
+					J->selec = join_selec(root, jp, hashclauses);
+			}
+			break;
+
+		default:
+			elog(ERROR, "RobDP: unexpected join path type: %d",
+				 (int) nodeTag(path));
+	}
+}
+
+/* The inputs in scenario s (-1: the point) */
+static void
+join_in(const JoinVec *J, int s, JoinIn *in)
+{
+	in->rows = src_at(&J->rows, s);
+	in->orows = src_at(&J->orows, s);
+	in->ostartup = src_at(&J->ostartup, s);
+	in->ototal = src_at(&J->ototal, s);
+	in->irows = src_at(&J->irows, s);
+	in->istartup = src_at(&J->istartup, s);
+	in->itotal = src_at(&J->itotal, s);
+	in->inbatches = (J->inb != NULL && s >= 0) ? J->inb[s] : J->inb_x;
+	in->srows = src_at(&J->srows, s);
+	in->sstartup = src_at(&J->sstartup, s);
+	in->stotal = src_at(&J->stotal, s);
+	in->calls = (J->calls != NULL && s >= 0) ?
+		clamp_row_est(robust_vec_at(J->calls, s)) : J->calls_x;
+	in->qual_mult = (J->R->qual_mult != NULL && s >= 0) ?
+		robust_vec_at(J->R->qual_mult, s) : 1.0;
+	if (jcx.has_semi)
+		in->sf = (s >= 0 && jcx.sf != NULL) ? jcx.sf[s] : jcx.semifactors;
+	else
+		memset(&in->sf, 0, sizeof(in->sf));
+}
+
+/* approx_tuple_count, as replayed */
+static double
+vec_approx_tuple_count(const JoinVec *J, const JoinIn *in)
+{
+	double		tuples;
+	double		outer_tuples = in->orows;
+	double		inner_tuples = in->irows;
+	Selectivity selec = J->selec;
+	double		p;
+
+	/* robust_replay_qual_selec */
+	p = selec * in->qual_mult;
+	CLAMP_PROBABILITY(p);
+	selec = p;
+
+	tuples = selec * outer_tuples * inner_tuples;
+
+	return clamp_row_est(tuples);
+}
+
+/* cost_memoize_rescan */
+static void
+vec_memoize_rescan(JoinVec *J, const JoinIn *in,
+				   Cost *rescan_startup_cost, Cost *rescan_total_cost)
+{
+	EstimationInfo estinfo;
+	Cost		input_startup_cost = in->sstartup;
+	Cost		input_total_cost = in->stotal;
+	double		tuples = in->srows;
+	double		calls = in->calls;
+	int			width = J->swidth;
+
+	double		hash_mem_bytes;
+	double		est_entry_bytes;
+	double		est_cache_entries;
+	double		ndistinct;
+	double		evict_ratio;
+	double		hit_ratio;
+	Cost		startup_cost;
+	Cost		total_cost;
+
+	hash_mem_bytes = J->hash_mem;
+
+	est_entry_bytes = vec_relation_byte_size(tuples, width) +
+		ExecEstimateCacheEntryOverheadBytes(tuples);
+
+	for (int i = 0; i < J->nkeys; i++)
+		est_entry_bytes += J->key_widths[i];
+
+	est_cache_entries = floor(hash_mem_bytes / est_entry_bytes);
+
+	ndistinct = robust_replay_num_groups(J->root, J->keys, calls, &estinfo);
+
+	if ((estinfo.flags & SELFLAG_USED_DEFAULT) != 0)
+		ndistinct = calls;
+
+	/* (the Memoize's est_entries, an output, is not touched) */
+
+	evict_ratio = 1.0 - Min(est_cache_entries, ndistinct) / ndistinct;
+
+	hit_ratio = ((calls - ndistinct) / calls) *
+		(est_cache_entries / Max(ndistinct, est_cache_entries));
+
+	Assert(hit_ratio >= 0 && hit_ratio <= 1.0);
+
+	total_cost = input_total_cost * (1.0 - hit_ratio) + cpu_operator_cost;
+
+	total_cost += cpu_tuple_cost * evict_ratio;
+
+	total_cost += cpu_operator_cost / 10.0 * evict_ratio * tuples;
+
+	total_cost += cpu_tuple_cost + cpu_operator_cost * tuples;
+
+	startup_cost = input_startup_cost * (1.0 - hit_ratio);
+
+	startup_cost += cpu_tuple_cost;
+
+	*rescan_startup_cost = startup_cost;
+	*rescan_total_cost = total_cost;
+}
+
+/* cost_rescan of the inner path */
+static void
+vec_rescan(JoinVec *J, const JoinIn *in,
+		   Cost *rescan_startup_cost, Cost *rescan_total_cost)
+{
+	switch (J->rescan)
+	{
+		case T_FunctionScan:
+			*rescan_startup_cost = 0;
+			*rescan_total_cost = in->itotal - in->istartup;
+			break;
+		case T_HashJoin:
+			if (in->inbatches == 1)
+			{
+				*rescan_startup_cost = 0;
+				*rescan_total_cost = in->itotal - in->istartup;
+			}
+			else
+			{
+				*rescan_startup_cost = in->istartup;
+				*rescan_total_cost = in->itotal;
+			}
+			break;
+		case T_CteScan:
+		case T_WorkTableScan:
+			{
+				Cost		run_cost = cpu_tuple_cost * in->irows;
+				double		nbytes = vec_relation_byte_size(in->irows,
+															J->iwidth);
+				long		work_mem_bytes = work_mem * 1024L;
+
+				if (nbytes > work_mem_bytes)
+				{
+					double		npages = ceil(nbytes / BLCKSZ);
+
+					run_cost += seq_page_cost * npages;
+				}
+				*rescan_startup_cost = 0;
+				*rescan_total_cost = run_cost;
+			}
+			break;
+		case T_Material:
+		case T_Sort:
+			{
+				Cost		run_cost = cpu_operator_cost * in->irows;
+				double		nbytes = vec_relation_byte_size(in->irows,
+															J->iwidth);
+				long		work_mem_bytes = work_mem * 1024L;
+
+				if (nbytes > work_mem_bytes)
+				{
+					double		npages = ceil(nbytes / BLCKSZ);
+
+					run_cost += seq_page_cost * npages;
+				}
+				*rescan_startup_cost = 0;
+				*rescan_total_cost = run_cost;
+			}
+			break;
+		case T_Memoize:
+			vec_memoize_rescan(J, in, rescan_startup_cost, rescan_total_cost);
+			break;
+		default:
+			*rescan_startup_cost = in->istartup;
+			*rescan_total_cost = in->itotal;
+			break;
+	}
+}
+
+/* initial_cost_nestloop and final_cost_nestloop */
+static void
+vec_nestloop(JoinVec *J, const JoinIn *in, JoinOut *out)
+{
+	Cost		startup_cost = 0;
+	Cost		run_cost = 0;
+	double		outer_path_rows = in->orows;
+	double		inner_path_rows;
+	Cost		inner_rescan_start_cost;
+	Cost		inner_rescan_total_cost;
+	Cost		inner_run_cost;
+	Cost		inner_rescan_run_cost;
+	Cost		cpu_per_tuple;
+	double		ntuples;
+	double		rows;
+
+	/* initial_cost_nestloop */
+	vec_rescan(J, in, &inner_rescan_start_cost, &inner_rescan_total_cost);
+
+	startup_cost += in->ostartup + in->istartup;
+	run_cost += in->ototal - in->ostartup;
+	if (outer_path_rows > 1)
+		run_cost += (outer_path_rows - 1) * inner_rescan_start_cost;
+
+	inner_run_cost = in->itotal - in->istartup;
+	inner_rescan_run_cost = inner_rescan_total_cost - inner_rescan_start_cost;
+
+	if (!J->early_stop)
+	{
+		run_cost += inner_run_cost;
+		if (outer_path_rows > 1)
+			run_cost += (outer_path_rows - 1) * inner_rescan_run_cost;
+	}
+
+	/* final_cost_nestloop */
+	outer_path_rows = in->orows;
+	inner_path_rows = in->irows;
+
+	if (outer_path_rows <= 0)
+		outer_path_rows = 1;
+	if (inner_path_rows <= 0)
+		inner_path_rows = 1;
+	rows = in->rows;
+
+	if (J->parallel)
+	{
+		double		parallel_divisor = J->divisor;
+
+		rows =
+			clamp_row_est(rows / parallel_divisor);
+	}
+
+	if (J->disabled)
+		startup_cost += disable_cost;
+
+	if (J->early_stop)
+	{
+		double		outer_matched_rows;
+		double		outer_unmatched_rows;
+		Selectivity inner_scan_frac;
+
+		outer_matched_rows = rint(outer_path_rows * in->sf.outer_match_frac);
+		outer_unmatched_rows = outer_path_rows - outer_matched_rows;
+		inner_scan_frac = 2.0 / (in->sf.match_count + 1.0);
+
+		ntuples = outer_matched_rows * inner_path_rows * inner_scan_frac;
+
+		if (J->indexed)
+		{
+			run_cost += inner_run_cost * inner_scan_frac;
+			if (outer_matched_rows > 1)
+				run_cost += (outer_matched_rows - 1) * inner_rescan_run_cost * inner_scan_frac;
+
+			run_cost += outer_unmatched_rows *
+				inner_rescan_run_cost / inner_path_rows;
+		}
+		else
+		{
+			ntuples += outer_unmatched_rows * inner_path_rows;
+
+			run_cost += inner_run_cost;
+			if (outer_unmatched_rows >= 1)
+				outer_unmatched_rows -= 1;
+			else
+				outer_matched_rows -= 1;
+
+			if (outer_matched_rows > 0)
+				run_cost += outer_matched_rows * inner_rescan_run_cost * inner_scan_frac;
+
+			if (outer_unmatched_rows > 0)
+				run_cost += outer_unmatched_rows * inner_rescan_run_cost;
+		}
+	}
+	else
+	{
+		ntuples = outer_path_rows * inner_path_rows;
+	}
+
+	startup_cost += J->restrict_cost.startup;
+	cpu_per_tuple = J->cpu_per_tuple;
+	run_cost += cpu_per_tuple * ntuples;
+
+	startup_cost += J->tlist.startup;
+	run_cost += J->tlist.per_tuple * rows;
+
+	out->rows = rows;
+	out->startup = startup_cost;
+	out->total = startup_cost + run_cost;
+	out->nbatches = 0;
+}
+
+/* initial_cost_mergejoin and final_cost_mergejoin */
+static void
+vec_mergejoin(JoinVec *J, const JoinIn *in, JoinOut *out)
+{
+	Cost		startup_cost = 0;
+	Cost		run_cost = 0;
+	double		outer_path_rows = in->orows;
+	double		inner_path_rows = in->irows;
+	Cost		inner_run_cost;
+	double		outer_rows,
+				inner_rows,
+				outer_skip_rows,
+				inner_skip_rows;
+	Selectivity outerstartsel = J->outerstartsel,
+				outerendsel = J->outerendsel,
+				innerstartsel = J->innerstartsel,
+				innerendsel = J->innerendsel;
+	Path		sort_path;		/* dummy for result of cost_sort */
+	Cost		cpu_per_tuple,
+				bare_inner_cost,
+				mat_inner_cost;
+	double		mergejointuples,
+				rescannedtuples;
+	double		rescanratio;
+	double		rows;
+
+	/* initial_cost_mergejoin */
+	if (outer_path_rows <= 0)
+		outer_path_rows = 1;
+	if (inner_path_rows <= 0)
+		inner_path_rows = 1;
+
+	outer_skip_rows = rint(outer_path_rows * outerstartsel);
+	inner_skip_rows = rint(inner_path_rows * innerstartsel);
+	outer_rows = clamp_row_est(outer_path_rows * outerendsel);
+	inner_rows = clamp_row_est(inner_path_rows * innerendsel);
+
+	Assert(outer_skip_rows <= outer_rows);
+	Assert(inner_skip_rows <= inner_rows);
+
+	outerstartsel = outer_skip_rows / outer_path_rows;
+	innerstartsel = inner_skip_rows / inner_path_rows;
+	outerendsel = outer_rows / outer_path_rows;
+	innerendsel = inner_rows / inner_path_rows;
+
+	Assert(outerstartsel <= outerendsel);
+	Assert(innerstartsel <= innerendsel);
+
+	if (J->outersortkeys)
+	{
+		cost_sort(&sort_path,
+				  J->root,
+				  J->outersortkeys,
+				  in->ototal,
+				  outer_path_rows,
+				  J->owidth,
+				  0.0,
+				  work_mem,
+				  -1.0);
+		startup_cost += sort_path.startup_cost;
+		startup_cost += (sort_path.total_cost - sort_path.startup_cost)
+			* outerstartsel;
+		run_cost += (sort_path.total_cost - sort_path.startup_cost)
+			* (outerendsel - outerstartsel);
+	}
+	else
+	{
+		startup_cost += in->ostartup;
+		startup_cost += (in->ototal - in->ostartup)
+			* outerstartsel;
+		run_cost += (in->ototal - in->ostartup)
+			* (outerendsel - outerstartsel);
+	}
+
+	if (J->innersortkeys)
+	{
+		cost_sort(&sort_path,
+				  J->root,
+				  J->innersortkeys,
+				  in->itotal,
+				  inner_path_rows,
+				  J->iwidth,
+				  0.0,
+				  work_mem,
+				  -1.0);
+		startup_cost += sort_path.startup_cost;
+		startup_cost += (sort_path.total_cost - sort_path.startup_cost)
+			* innerstartsel;
+		inner_run_cost = (sort_path.total_cost - sort_path.startup_cost)
+			* (innerendsel - innerstartsel);
+	}
+	else
+	{
+		startup_cost += in->istartup;
+		startup_cost += (in->itotal - in->istartup)
+			* innerstartsel;
+		inner_run_cost = (in->itotal - in->istartup)
+			* (innerendsel - innerstartsel);
+	}
+
+	/* final_cost_mergejoin */
+	inner_path_rows = in->irows;
+
+	if (inner_path_rows <= 0)
+		inner_path_rows = 1;
+
+	rows = in->rows;
+
+	if (J->parallel)
+	{
+		double		parallel_divisor = J->divisor;
+
+		rows =
+			clamp_row_est(rows / parallel_divisor);
+	}
+
+	if (J->disabled)
+		startup_cost += disable_cost;
+
+	mergejointuples = vec_approx_tuple_count(J, in);
+
+	if (J->outer_unique || J->skip_mark_restore)
+		rescannedtuples = 0;
+	else
+	{
+		rescannedtuples = mergejointuples - inner_path_rows;
+		if (rescannedtuples < 0)
+			rescannedtuples = 0;
+	}
+
+	rescanratio = 1.0 + (rescannedtuples / inner_rows);
+
+	bare_inner_cost = inner_run_cost * rescanratio;
+
+	mat_inner_cost = inner_run_cost +
+		cpu_operator_cost * inner_rows * rescanratio;
+
+	/* (a replay keeps the point's materialize_inner) */
+	if (J->materialize_inner)
+		run_cost += mat_inner_cost;
+	else
+		run_cost += bare_inner_cost;
+
+	startup_cost += J->jq_cost.startup;
+	startup_cost += J->jq_cost.per_tuple *
+		(outer_skip_rows + inner_skip_rows * rescanratio);
+	run_cost += J->jq_cost.per_tuple *
+		((outer_rows - outer_skip_rows) +
+		 (inner_rows - inner_skip_rows) * rescanratio);
+
+	startup_cost += J->qp_cost.startup;
+	cpu_per_tuple = J->cpu_per_tuple;
+	run_cost += cpu_per_tuple * mergejointuples;
+
+	startup_cost += J->tlist.startup;
+	run_cost += J->tlist.per_tuple * rows;
+
+	out->rows = rows;
+	out->startup = startup_cost;
+	out->total = startup_cost + run_cost;
+	out->nbatches = 0;
+}
+
+/* initial_cost_hashjoin and final_cost_hashjoin */
+static void
+vec_hashjoin(JoinVec *J, const JoinIn *in, JoinOut *out)
+{
+	Cost		startup_cost = 0;
+	Cost		run_cost = 0;
+	double		outer_path_rows = in->orows;
+	double		inner_path_rows = in->irows;
+	double		inner_path_rows_total = inner_path_rows;
+	int			numbuckets;
+	int			numbatches;
+	Cost		cpu_per_tuple;
+	double		hashjointuples;
+	double		virtualbuckets;
+	Selectivity innerbucketsize;
+	Selectivity innermcvfreq;
+	double		rows;
+
+	/* initial_cost_hashjoin */
+	startup_cost += in->ostartup;
+	run_cost += in->ototal - in->ostartup;
+	startup_cost += in->itotal;
+
+	startup_cost += J->build_per_row
+		* inner_path_rows;
+	run_cost += J->probe_per_row * outer_path_rows;
+
+	if (J->parallel_hash)
+		inner_path_rows_total *= J->inner_divisor;
+
+	/* ExecChooseHashTableSize, unless it was just given the same */
+	if (!J->have_size || J->size_ntuples != inner_path_rows_total)
+	{
+		size_t		space_allowed;	/* unused */
+		int			num_skew_mcvs;
+
+		ExecChooseHashTableSize(inner_path_rows_total,
+								J->iwidth,
+								true,	/* useskew */
+								J->parallel_hash,	/* try_combined_hash_mem */
+								J->outer_workers,
+								&space_allowed,
+								&J->size_buckets,
+								&J->size_batches,
+								&num_skew_mcvs);
+		J->have_size = true;
+		J->size_ntuples = inner_path_rows_total;
+	}
+	numbuckets = J->size_buckets;
+	numbatches = J->size_batches;
+
+	if (numbatches > 1)
+	{
+		double		outerpages = vec_page_size(outer_path_rows,
+											   J->owidth);
+		double		innerpages = vec_page_size(inner_path_rows,
+											   J->iwidth);
+
+		startup_cost += seq_page_cost * innerpages;
+		run_cost += seq_page_cost * (innerpages + 2 * outerpages);
+	}
+
+	/* final_cost_hashjoin */
+	rows = in->rows;
+
+	if (J->parallel)
+	{
+		double		parallel_divisor = J->divisor;
+
+		rows =
+			clamp_row_est(rows / parallel_divisor);
+	}
+
+	if (J->disabled)
+		startup_cost += disable_cost;
+
+	virtualbuckets = (double) numbuckets * (double) numbatches;
+
+	if (J->inner_unique_path)
+	{
+		innerbucketsize = 1.0 / virtualbuckets;
+		innermcvfreq = 0.0;
+	}
+	else
+	{
+		innerbucketsize = 1.0;
+		innermcvfreq = 1.0;
+		for (int i = 0; i < J->nclauses; i++)
+		{
+			Selectivity thisbucketsize;
+			Selectivity thismcvfreq;
+
+			robust_replay_bucket_stats(J->root, J->clauses[i], J->right[i],
+									   virtualbuckets,
+									   &thismcvfreq, &thisbucketsize);
+
+			if (innerbucketsize > thisbucketsize)
+				innerbucketsize = thisbucketsize;
+			if (innermcvfreq > thismcvfreq)
+				innermcvfreq = thismcvfreq;
+		}
+	}
+
+	if (vec_relation_byte_size(clamp_row_est(inner_path_rows * innermcvfreq),
+							   J->iwidth) > J->hash_mem_limit)
+		startup_cost += disable_cost;
+
+	if (J->early_stop)
+	{
+		double		outer_matched_rows;
+		Selectivity inner_scan_frac;
+
+		outer_matched_rows = rint(outer_path_rows * in->sf.outer_match_frac);
+		inner_scan_frac = 2.0 / (in->sf.match_count + 1.0);
+
+		startup_cost += J->jq_cost.startup;
+		run_cost += J->jq_cost.per_tuple * outer_matched_rows *
+			clamp_row_est(inner_path_rows * innerbucketsize * inner_scan_frac) * 0.5;
+
+		run_cost += J->jq_cost.per_tuple *
+			(outer_path_rows - outer_matched_rows) *
+			clamp_row_est(inner_path_rows / virtualbuckets) * 0.05;
+
+		if (J->jp->jointype == JOIN_ANTI)
+			hashjointuples = outer_path_rows - outer_matched_rows;
+		else
+			hashjointuples = outer_matched_rows;
+	}
+	else
+	{
+		startup_cost += J->jq_cost.startup;
+		run_cost += J->jq_cost.per_tuple * outer_path_rows *
+			clamp_row_est(inner_path_rows * innerbucketsize) * 0.5;
+
+		hashjointuples = vec_approx_tuple_count(J, in);
+	}
+
+	startup_cost += J->qp_cost.startup;
+	cpu_per_tuple = J->cpu_per_tuple;
+	run_cost += cpu_per_tuple * hashjointuples;
+
+	startup_cost += J->tlist.startup;
+	run_cost += J->tlist.per_tuple * rows;
+
+	out->rows = rows;
+	out->startup = startup_cost;
+	out->total = startup_cost + run_cost;
+	out->nbatches = numbatches;
+}
+
+/*
+ * The join path in scenario s (-1: the point), with the hooks and the
+ * replay's globals set as a replay of s sets them
+ */
+static void
+join_at(JoinVec *J, int s, JoinOut *out)
+{
+	JoinIn		in;
+
+	join_in(J, s, &in);
+	replay_path = &J->jp->path;
+	replay_s = s;
+	hooks.index_mult = 1.0;
+	hooks.quals = J->R->quals;
+	hooks.qual_mult = in.qual_mult;
+	hooks.semi_mult = 1.0;
+	robust_replay = &hooks;
+	switch (nodeTag(J->jp))
+	{
+		case T_NestPath:
+			vec_nestloop(J, &in, out);
+			break;
+		case T_MergePath:
+			vec_mergejoin(J, &in, out);
+			break;
+		case T_HashPath:
+			vec_hashjoin(J, &in, out);
+			break;
+		default:
+			elog(ERROR, "RobDP: unexpected join path type: %d",
+				 (int) nodeTag(J->jp));
+	}
+	robust_replay = NULL;
+	replay_path = NULL;
+	replay_s = -1;
+}
+
+/* robust_debug_check_costs: the replay of scenario s gets o, bit for bit */
+static void
+check_replay(Replay *R, int s, const JoinOut *o)
+{
+	double		rows,
+				startup,
+				total;
+	int			nb;
+	bool		hash = IsA(R->path, HashPath);
+
+	replay_once(R, s, &rows, &startup, &total, &nb);
+	if (!same_bits(rows, o->rows) || !same_bits(startup, o->startup) ||
+		!same_bits(total, o->total) || (hash && nb != o->nbatches))
+		elog(ERROR, "RobDP: the vector costing of a %s differs from its replay in scenario %d: "
+			 "rows %.17g vs %.17g, startup %.17g vs %.17g, total %.17g vs %.17g, batches %d vs %d",
+			 path_type_name(R->path), s, o->rows, rows, o->startup, startup,
+			 o->total, total, hash ? o->nbatches : 0, hash ? nb : 0);
+}
+
+/*
+ * The vector costing of a join path, in replay()'s stead (which has set up
+ * R up to its inputs): false, with nothing set, if its point is not the
+ * path's scalars.
+ */
+static bool
+vector_join(Replay *R, RobustPathCost *rc, bool round)
+{
+	PlannerInfo *root = R->root;
+	Path	   *path = R->path;
+	int			N = error_sample_count;
+	int			only = round ? root->robust_round : -1;
+	MemoryContext pathcxt = GetMemoryChunkContext(path);
+	MemoryContext oldcxt;
+	JoinVec		J;
+	JoinOut		pt;
+	JoinOut		o;
+	RobustVec  *rows = NULL,
+			   *startup = NULL,
+			   *total = NULL;
+	int		   *nb = NULL;
+	bool		ok;
+
+	oldcxt = MemoryContextSwitchTo(scratch_context());
+	join_vec_setup(R, &J);
+	vec_R = R;
+	join_at(&J, -1, &pt);
+	ok = pt.rows == path->rows &&
+		pt.startup == path->startup_cost &&
+		pt.total == path->total_cost &&
+		(!IsA(path, HashPath) || pt.nbatches == ((HashPath *) path)->num_batches);
+	if (ok && round)
+		join_at(&J, only, &o);
+	else if (ok)
+	{
+		rows = MemoryContextAlloc(pathcxt, offsetof(RobustVec, v) + sizeof(double) * N);
+		startup = MemoryContextAlloc(pathcxt, offsetof(RobustVec, v) + sizeof(double) * N);
+		total = MemoryContextAlloc(pathcxt, offsetof(RobustVec, v) + sizeof(double) * N);
+		rows->n = startup->n = total->n = N;
+		if (IsA(path, HashPath))
+			nb = MemoryContextAlloc(pathcxt, sizeof(int) * N);
+		for (int s = 0; s < N; s++)
+		{
+			join_at(&J, s, &o);
+			rows->v[s] = o.rows;
+			startup->v[s] = o.startup;
+			total->v[s] = o.total;
+			if (nb)
+				nb[s] = o.nbatches;
+		}
+	}
+	vec_R = NULL;
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextReset(st->scratch);
+
+	if (robust_debug_check_costs)
+	{
+		check_replay(R, -1, &pt);
+		if (ok && round)
+			check_replay(R, only, &o);
+		else if (ok)
+		{
+			for (int s = 0; s < N; s++)
+			{
+				o.rows = rows->v[s];
+				o.startup = startup->v[s];
+				o.total = total->v[s];
+				o.nbatches = nb ? nb[s] : 0;
+				check_replay(R, s, &o);
+			}
+		}
+	}
+	if (!ok)
+		return false;
+
+	if (R->memo)
+	{
+		R->memo->est_entries = R->memo_entries;
+		R->memo->param_exprs = R->memo_exprs;
+	}
+	rc->status = ROBUST_COST_REPLAY;
+	if (round)
+	{
+		/* An envelope round: the round's scenario only, into the scalars */
+		path->rows = o.rows;
+		path->startup_cost = o.startup;
+		path->total_cost = o.total;
+		if (IsA(path, HashPath))
+			((HashPath *) path)->num_batches = o.nbatches;
+		return true;
+	}
+	rc->rows = vec_or_null(rows, path->rows);
+	rc->startup = vec_or_null(startup, path->startup_cost);
+	rc->total = vec_or_null(total, path->total_cost);
+	if (nb)
+	{
+		for (int s = 0; s < N; s++)
+			if (nb[s] != ((HashPath *) path)->num_batches)
+			{
+				rc->nbatches = nb;
+				break;
+			}
+		if (rc->nbatches == NULL)
+			pfree(nb);
+	}
+	return true;
+}
+
 static void
 replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 {
@@ -2514,6 +3934,8 @@ replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 	memset(&R, 0, sizeof(R));
 	R.root = root;
 	R.path = path;
+	R.cxt = CurrentMemoryContext;
+	R.children = children;
 	R.size = path_size(path);
 	/*
 	 * A sort's bound: the LIMIT's for the sorts of the ordered relation, as
@@ -2602,42 +4024,32 @@ replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 		IsA(path, UpperUniquePath) || IsA(path, SetOpPath))
 		groups_setup(&R, path);
 
-	/* The inputs set per scenario */
-	add_base_rels(&R.slots, root);
-	add_rel(&R.slots, path->parent);
-	if (path->param_info != NULL)
-		slot_add(&R.slots, &path->param_info->ppi_rows,
-				 path->param_info->ppi_robust_rows);
-	foreach(lc, children)
-		add_path_slots(&R.slots, (Path *) lfirst(lc));
-	if (IsA(path, SubqueryScanPath))
-		add_path_slots(&R.slots, ((SubqueryScanPath *) path)->subpath);
-	if (R.input_rel != NULL)
-		add_rel(&R.slots, R.input_rel);
 	if (IsA(path, NestPath) && IsA(((JoinPath *) path)->innerjoinpath, MemoizePath))
 	{
-		/* cost_memoize_rescan reads the Memoize's input and calls */
-		JoinPath   *jp = (JoinPath *) path;
-		MemoizePath *mp = (MemoizePath *) jp->innerjoinpath;
-		RobustPathCost *orc = jp->outerjoinpath->robust;
+		/*
+		 * cost_memoize_rescan overwrites the Memoize's est_entries, and is to
+		 * read the param_exprs it was costed with
+		 */
+		MemoizePath *mp = (MemoizePath *) ((JoinPath *) path)->innerjoinpath;
 
-		add_path_slots(&R.slots, mp->subpath);
-		if (orc != NULL && orc->rows != NULL &&
-			mp->calls == clamp_row_est(jp->outerjoinpath->rows))
-		{
-			RobustVec  *calls = robust_vec_make(N);
-
-			for (int s = 0; s < N; s++)
-				calls->v[s] = clamp_row_est(robust_vec_at(orc->rows, s));
-			slot_add(&R.slots, &mp->calls, calls);
-		}
 		R.memo = mp;
 		R.memo_entries = mp->est_entries;
 		R.memo_exprs = mp->param_exprs;
 		mp->param_exprs = memo_costed_exprs(mp);
 	}
 
-	R.buf = palloc(R.size);
+	/* A join path: its cost functions' vector versions, unless... */
+	if (R.join && robust_vector_cost && vector_join(&R, rc, round))
+	{
+		if (R.buf != NULL)
+			pfree(R.buf);
+		return;
+	}
+
+	/* ...its point is not its scalars: the replay, starting at the point */
+	replay_slots(&R);
+	if (R.buf == NULL)
+		R.buf = palloc(R.size);
 
 	/* The point first, trying the variants the path does not record */
 	{
@@ -3152,9 +4564,5 @@ robust_cost_add_path(Path *path, bool partial)
 
 	if (root == NULL || path->parent == NULL)
 		return;
-	if (scratch_cxt == NULL)
-		scratch_cxt = AllocSetContextCreate(TopMemoryContext,
-											"RobDP replay",
-											ALLOCSET_DEFAULT_SIZES);
 	(void) compute(root, path, partial);
 }

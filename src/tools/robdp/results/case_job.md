@@ -1458,3 +1458,382 @@ v20 同设置下的结果（第 21 节）：E[Cost]×1 1.18，×8 1.17；E[Pen]�
 
 - c1（E[Cost]）不用 envelope，N=1 时每轮本来就只有一个场景，所以这两类本来就没有可省的，差别都在 ±4% 的噪声以内。
 - 这一步之后，m2 native 的 p8 降到 v20 的 1.28 倍（最大并行）。剩下的差距主要在每个场景的 replay 开销，以及 envelope 每轮的三次代价函数调用（第 25 节之后的讨论）。
+
+## 27. 连接代价函数的向量版本
+
+### 27.1 做法
+
+- **GUC**：
+  - `robust_vector_cost`，默认 on。
+  - `robust_debug_check_costs`：assert 版本默认 on，release 默认 off，两种版本都能打开。
+- **原先的问题**（第 24 节）：每条连接路径在每个场景 s 下都要 replay 一遍。一次 replay 要做这些事：
+  - 拷贝路径；
+  - 把输入投影到 s；
+  - 调 PG 的 `initial_cost_*` 和 `final_cost_*`；
+  - 恢复输入。
+
+  PG 的代价函数里有不少与场景无关的工作，每个场景都会重做：
+  - `cost_qual_eval` 遍历子句表达式树；
+  - `cached_scansel` 查找；
+  - `get_parallel_divisor`；
+  - Memoize 缓存键的 `get_expr_width`；
+  - `approx_tuple_count` 对每个子句调 `clause_selectivity`。
+- **改成向量版**：覆盖 nestloop、mergejoin、hashjoin 的 initial 和 final，以及 nestloop 内侧的 `cost_rescan` 和 `cost_memoize_rescan`。
+  - **每条路径只算一次的量**（JoinVec）：
+    - 子句的求值代价：restrictlist、merge 或 hash 子句、其余连接子句、target；
+    - merge 的四个扫描比例，包括选哪一侧，以及 LEFT/ANTI、RIGHT/RIGHT_ANTI、FULL 的处理；
+    - 并行除数、两侧宽度、`enable_<method>`、`has_indexed_join_quals`；
+    - hash 的每行常数：build 是 `cpu_operator_cost * num_hashclauses + cpu_tuple_cost`，probe 是 `cpu_operator_cost * num_hashclauses`；
+    - Memoize 缓存键的宽度和 `hash_mem`；
+    - `approx_tuple_count` 要乘的选择率。
+  - **每个场景读的输入**（JoinIn），就是 replay 设置的那些：
+    - 本关系或 ParamPathInfo 的行数；
+    - 两侧输入的 rows、startup、total；
+    - 内侧 HashPath 的 batches；
+    - Memoize 子路径的代价和 calls；
+    - 子句乘子、semi-join 因子。
+  - **选择率 = 点估计 × 乘子**：
+    - replay 的 hook 是 `p = sel * mult; CLAMP_PROBABILITY(p)`，其中 sel 是 `clause_selectivity` 的乘积。
+    - varRelid = 0 时，`clause_selectivity` 读的是 RestrictInfo 缓存的 `norm_selec`。这个值在点估计时就已算好（PG 自己给路径算代价时），所以每个场景读到的都是同一个值。
+    - 因此向量版每条路径只算一次乘积，每个场景只做一次乘法和一次 clamp，与 replay 逐位相同。
+  - **与场景有关的估计**仍然走 replay 的缓存，缓存以基表的场景行数为键：
+    - hash 子句的 bucketsize 和 MCV 频率：`robust_replay_bucket_stats`；
+    - Memoize 的 distinct calls：`robust_replay_num_groups`。
+
+    未命中时，先把 replay 的输入投影到 s（`scenario_enter`），再调 estimator。
+  - **`ExecChooseHashTableSize`**：内侧行数与上一个场景相同时，直接用上次的结果。
+- **怎么保证逐位一致：表达式形状**
+  - Apple clang 在 PG 的 CFLAGS（-O2，默认 `-ffp-contract=on`）下，会把同一个表达式里的 `a*b + c` 融合成一条 fma，但不会跨语句融合，也不会跨内联的函数调用融合。融合与不融合的结果在最后一位上可能不同。
+  - 所以向量版逐条语句照抄 PG 的算术，每个表达式的形状都与 PG 原文相同。能提到场景循环外的，只有两类：
+    - 整条语句；
+    - PG 原文里本来就单独算出的操作数（例如上面 hash 的两个每行常数）。
+  - `relation_byte_size` 和 `page_size` 照抄成函数而不是宏，保持"跨调用不融合"。
+  - 这条规则在 -O0（debug）和 -O2（release）下都成立。用一个小函数核对过：`r += a * b` 在两种级别下都编成一条 `fmadd`；拆成两条语句后，即使 -O2 也是 `fmul` 加 `fadd`。所以两种版本都必须照抄形状，也都能用校验抓出形状写错的地方（27.3 的变异测试）。
+- **回退与校验**：
+  - **回退**：和 replay 一样先算点。点的 rows、startup、total（hash join 还有 batches）只要有一个和标量不同，这条路径就改走 replay，状态也照 replay 的定。
+  - **校验**：`robust_debug_check_costs` 打开时，每条用向量算的路径会再 replay 一次，在点和每个算过的场景上比较 rows、startup、total 和 batches 的全部位（double 用 memcmp）。有一位不同就报 ERROR。这就是 v20 cost_check 的角色。
+- **envelope 轮**：只算本轮场景，结果写进标量字段，与 replay 相同。
+
+### 27.2 嵌套规划：replay 的状态改成每次规划各自一份
+
+- **问题**：
+  - replay 的全局状态有 `robust_replay`、`hooks`、`replay_path`、`replay_s`、`vec_R`，原先全局只有一份，scratch 内存上下文也是全局一个。
+  - 如果 replay 进行中，estimator 求值了一个函数，函数里又规划了一条查询，内层规划就会：
+    - 在开始时清掉外层 replay 的 hook；
+    - 在自己的 replay 结束时 reset 共用的 scratch，把外层 replay 正在用的内存释放掉。
+  - 能触发的例子：外层查询里有参数化索引扫描 `t1.id = p.id + f()`，f 是 STABLE plpgsql，内部用 EXECUTE 跑一条连接查询。btcostestimate 的选择率估计会在每个场景的 replay 里用 `estimate_expression_value` 求值 f()，于是每次都规划 f 里的查询。
+- **改动**：
+  - `robust_cost_begin_query` 把这些全局保存进新规划的 CostState，然后清空；`robust_cost_end_query`（在 planner.c 的 PG_FINALLY 里，出错时也会执行）再恢复回去。
+  - scratch 改成每次规划一个，挂在规划自己的内存上下文下面，规划结束时删除。如果出错时当前上下文还是 scratch，先切出来再删。
+- **验证**：debug 版本，lognormal，N = 20：
+  - 改前：这条查询让 backend 段错误（signal 11）。
+  - 改后：f 规划了 87 次，都嵌套在外层规划里，其中大部分在 replay 里面。外层规划的 dump（48 行，含路径向量）和用"缓存计划、不再嵌套规划"的同一函数时逐字节相同。内层规划本身含连接，在校验下没有报错。
+- 其他 robust 模块（robustrows、robustsearch、robustselect、robustsample）没有全局状态；robustprofile 只有会话级的 profile 缓存，嵌套时不受影响。
+
+### 27.3 验证
+
+- **新旧二进制逐行比对 dump**：release，向量版对改前的 replay 版。比对内容是 `robust_debug_dump` 的全部事件，加上 EXPLAIN 的计划。
+  - 最大并行：130 条查询 × {p8 native, p8, c1, p1 native}，520 次规划全部相同，共 29,833,900 行。
+  - 关并行：13 条查询 × 同样 4 个配置，52 次全部相同，共 1,993,559 行。
+  - 27.2 的修复之后又比了一遍，仍然全部相同。
+- **整个 JOB 打开校验跑一遍**（每条向量算的连接路径都再 replay，逐位比较）：
+  - release（-O2）：上面 572 次规划，没有任何报错，dump 也与基线相同。为确认校验确实生效：T22 p8 native 的规划时间从约 450 ms 涨到约 650 ms，多出来的就是 replay。
+  - debug（-O0，assert 开，校验默认开）：130 条 × {p8 native, p8} 最大并行，加上 13 条 × 4 个配置的最大并行和关并行，共 364 次规划。没有报错，也没有 assertion 失败。而且这 364 次的 dump 与 release 逐位相同。
+- **debug make check**（robust 开，lognormal，E[Pen]，retain 8，并行 4，校验开）：
+  - 失败集合和改动前一样，同样 18 个，都只是计划形状不同；没有 assertion 失败，也没有校验报错。
+  - `robust_vector_cost` 开和关，regress 的全部结果文件逐字节相同。27.2 的修复前后也相同。
+- **覆盖**：先临时在每个分支加计数器，跑完后删掉。
+  - make check 里：
+    - nestloop 1,580,487 次，mergejoin 926,623 次，hashjoin 697,599 次；
+    - 主 pass 2,500,420 个场景，envelope 轮 289,634 个场景；
+    - estimator 在场景里被调用（要先投影输入）45,341 次；
+    - 点和标量对不上、改走 replay 的：0 次。
+  - nestloop 内侧 rescan 的每一类都覆盖到：FunctionScan、单 batch 和多 batch 的 HashJoin、CTE/WorkTable、Material/Sort（含溢出）、Memoize、其余。
+  - 其余分支也都覆盖到：提前停止的各分支（indexed、非 indexed、无未匹配行）、merge 的四种扫描比例分支和 materialize、hash 的多 batch、parallel hash、unique inner、MCV 超出 hash_mem、三种方法的 partial 版本。
+  - make check 没碰到的分支，另写 SQL 补上，也在校验下跑过：
+    - 溢出 work_mem 的 CTE 内侧（299 次）；
+    - FULL JOIN 下被关掉的 merge（84 次）和 hash（244 次）方法。
+- **校验能不能抓到错**：
+  - **意外的变异**：插计数器时有一处写错，把 Memoize 的 `ndistinct = calls;` 变成了无条件执行。校验当场报了 151 个 ERROR，make check 的失败也从 18 个变成 24 个。
+  - **故意的变异**：把 vec_nestloop 里 PG 原文的 `run_cost += cpu_per_tuple * ntuples;` 拆成两条语句，即先乘再加，不再融合。
+    - release 和 debug 下，4 条测试查询都报错，差异都恰好是 1 ulp。
+    - 其中一条的点刚好相同，差异出现在场景 4。也就是说，如果不开校验，这种错会悄悄留在向量里，点检查的回退发现不了。
+- **gate**（release，所有会话都通过 PGOPTIONS 打开校验）：
+  - check_s6 的 C1–C6（C5 连带跑了 S5…S1）、check_s7 的 K1–K8、check_s8 --light 的 G1–G8、check_s9 --light 的 U1–U8、check_s10 --light 的 O1–O8，全部通过，没有校验报错。
+  - C4 是外部对照：一点 profile 把过滤条件的选择率放大 K 倍，与 stock PG 对真正放大 K 倍的查询算出的代价比较。819 条共同路径在 1e-6 内相同，其中 477 条的代价不等于点估计。
+  - S7、S8、S10 除计时外的输出，与改动前（第 26 节那次）逐行相同，包括 K5 的 kept/C* 分布、K6 的 18,791,890 对支配检查、G2 和 O2 的全部重算。
+  - 计时项（C6、K8、G8、U8、O8）因为开了校验会偏高，只作参考。
+- **嵌套规划**：见 27.2。
+
+### 27.4 规划时间（13 条查询，同第 24–26 节的测法）
+
+- **数据**：
+  - `results/plantime_v2_vecoff.json`：`VECTOR=off`，即改前的 replay；
+  - `results/plantime_v2_vec.json`：`VECTOR=on`。
+- **测法**：两次在同一时段、同一台空闲机器上先后跑。`VECTOR=off` 与第 26 节的 `plantime_v2_semi.json` 逐条之比在 0.95–1.02 之间，说明测量可以复现。
+
+13 条的中位数（ms）；"提速"是逐条 off/on 比值的几何平均；"开/v20"也是逐条比值的几何平均：
+
+| 配置 | 向量关 | 向量开 | 提速 | v20 | 开/v20 |
+|---|---|---|---|---|---|
+| p8 native，最大并行 | 58.9 | 52.2 | 1.13× | 48.7 | 1.12× |
+| p8 native，关并行 | 35.5 | 30.7 | 1.13× | 27.3 | 1.25× |
+| p8（retained），最大并行 | 116.7 | 95.7 | 1.22× | 48.7 | 2.11× |
+| p8（retained），关并行 | 72.0 | 58.2 | 1.23× | 27.3 | 2.37× |
+| c1，最大并行 | 12.7 | 9.5 | 1.33× | 5.8 | 1.95× |
+| c1，关并行 | 5.2 | 3.9 | 1.25× | 2.7 | 1.68× |
+| c1 native，最大并行 | 7.2 | 5.7 | 1.23× | 5.8 | 1.12× |
+| c1 native，关并行 | 3.9 | 3.2 | 1.22× | 2.7 | 1.31× |
+| N1 各配置 | | | 1.07–1.09× | | |
+
+大查询（最大并行，ms，向量关 → 开）：
+
+| 查询 | p8 | p8 native | c1 | c1 native |
+|---|---|---|---|---|
+| T21 21-0_testing_20 | 360 → 282 | 171 → 148 | 32 → 24 | 19 → 15 |
+| T22 22-0_testing_2 | 1379 → 1051 | 568 → 459 | 125 → 86 | 65 → 47 |
+| T23 23-0_testing_16 | 1121 → 947 | 520 → 430 | 96 → 68 | 49 → 37 |
+
+**每个场景的边际开销**：
+
+- **算法**：
+  - m2 取 (t[N=20] − t[N=1]) / 19；
+  - v20 的最小 N 是 4，所以取 (t[N=20] − t[N=4]) / 16。
+- 表中是 13 条的中位数（ms/场景），比值是逐条比值的几何平均：
+
+| 配置 | 向量关 | 向量开 | 提速 | v20 | 开/v20 |
+|---|---|---|---|---|---|
+| p8 native，最大并行 | 2.57 | 2.26 | 1.14× | 2.08 | 1.22× |
+| p8 native，关并行 | 1.55 | 1.33 | 1.14× | 1.17 | 1.33× |
+| c1 native，最大并行 | 0.236 | 0.172 | 1.34× | 0.188 | 1.30× |
+| c1 native，关并行 | 0.126 | 0.093 | 1.35× | 0.070 | 1.78× |
+| p8，最大并行 | 4.10 | 3.15 | 1.29× | 2.08 | 1.86× |
+| c1，最大并行 | 0.429 | 0.279 | 1.51× | 0.188 | 2.23× |
+
+**解读**：
+
+- 向量化让每个场景的开销快了 1.14–1.51 倍（即少了 12–34%），c1（E[Cost]）快得最多。
+- **但还没有降到 v20 以下**：
+  - native 的每场景开销仍是 v20 的 1.2–1.3 倍（关并行时 c1 native 是 1.8 倍）；
+  - retained 是 1.9–2.2 倍。retained 的候选本来就多，第 25 节说过。
+- 总时间上，p8 native 最大并行现在是 v20 的 1.12 倍（第 26 节后是 1.28 倍），c1 native 也是 1.12 倍。N1 的 native 配置仍然比 v20 快。
+
+### 27.5 还剩什么：T22 p8 native 的 profile（向量开，476 ms）
+
+- **数据**：`sample` 采样，21 次规划，占 standard_planner 的比例。
+- **代价计算 `compute` 合计 40%**（第 26 节之前那次 profile，655 ms 时，是 52%）：
+  - `join_at`（向量核，按场景算）17.6%，其中：
+    - `robust_replay_num_groups` 7.5%：Memoize 的 distinct calls。它的时间 70% 在 `hash_search_with_hash_value` 自身，调 `estimate_num_groups` 的只占 8%。
+      - 原因：缓存的键含本场景的 calls（外侧行数）和基表行数，所以每个（Memoize 参数，场景行数）组合都是一项。表很大，每次查找主要耗在访存上。
+      - 这是剩下的最大一块单项。可以按路径的输入向量预先算好整条向量，不再按场景查表，结果不变。
+    - 核本身约 6.5%。
+    - bucket stats 0.9%，`cost_sort` 0.6%。
+  - `compute_semifactors` 4.1%，`join_path_querylets` 2.6%。
+  - `replay_once` 3.3%：非连接路径（扫描、Material、Memoize、Gather 等）仍按场景 replay。
+- **选择这边**：`robust_search_finish_rel` 6.7%，`robust_precheck_join` 5.6%，`select_rel` 5.6%。这些也是每个候选 O(N) 的工作。
+
+## 28. Memoize 的 distinct calls 按路径一次取齐（试过后回退）；groups 缓存键的跨层碰撞
+
+- **结论**：
+  - 按路径预取的做法是对的，逐位不变（28.4），但规划时间测不出提速（28.5、28.6），所以从 m2 回退了。
+  - 代码保存在分支 `dev/memoize-ndistinct-precompute`，它的父提交就是 m2 回退后的状态。
+  - 留在 m2 的有两样：28.2 的 groups 缓存键修复，以及 28.3 里 bucket stats、groups 两个缓存的命中校验。
+  - 回退之后的验证见 28.7。
+- 28.1、28.4–28.6 说的“新版”“新缓存”都是指 dev 分支上的预取版。
+
+### 28.1 做法
+
+- **起因**（27.5）：`robust_replay_num_groups` 占 T22 p8 native 的 7.5%，几乎都花在查表的访存上。
+  - 主 pass 里，每条内侧是 Memoize 的 nestloop，每个场景都要查一次 groups 缓存。
+  - 临时计数：T22 p8 native 一次规划里，主 pass 查 704,739 次，envelope 轮查 328,142 次；表里 63,477 项，命中 94%。
+- **改动**：主 pass 里，向量版在逐场景计算之前，先一次取齐 Memoize 在全部 N 个场景的 distinct calls（`memo_ndistinct`），`vec_memoize_rescan` 直接读第 s 项。
+  - **缓存的键**：参数所在的关系和属性，加上每个场景的 calls（外侧行数，clamp 之后）和参数所在基表的行数，都按位存。
+  - **缓存的值**：N 个 ndistinct，以及各自的 `EstimationInfo` flags。
+  - **共享**：同一个 Memoize、同一个外侧关系的各条外侧路径共用一项；外侧行数向量相同的其他关系也共用。
+  - **envelope 轮**：每条路径只算本轮一个场景，仍按场景查 groups 缓存。
+- **为什么逐位不变**：
+  - 场景 s 里，replay 从 groups 缓存取值，键是（关系，属性，s 的基表行数，s 的 calls）。
+  - 新键包含这几样在所有场景的值。所以新键相同，每个场景的 groups 键就相同，取到的值也相同。
+  - 未命中时，逐个场景调 `robust_replay_num_groups`。调用前，replay 的全局状态和 hook 设得与 `join_at` 完全一样（抽成 `join_enter` / `join_leave` 共用），所以取到的就是原来那个值。整条向量算完才放进缓存。
+- **共用的小函数**：
+  - `join_calls(J, s)`：`join_in` 和新键共用；
+  - `rel_rows_at(rel, s)`：`scenario_rel_rows` 和新键共用；
+  - `groups_vars()`：判断能不能缓存，groups 缓存和新缓存共用。
+
+### 28.2 顺带发现的问题：groups 缓存的键跨查询层碰撞
+
+- **原因**：groups 缓存是整次规划（`standard_planner`）一份，所有查询层（子查询、CTE）共用，而键里的 Var 用的是 varno。
+  - varno 是每层各自编号的。同一个（varno，attno，基表行数，输入行数）在两层里指的是两列不同的数据。
+- **例子**（两层各一个 GROUP BY）：
+  - CTE 里对 g2 按 a 分组，g2.a 只有 10 个值；子查询里对 g1 按 a 分组，g1.a 唯一。
+  - 两张表在各自的层里都是 varno 1、attno 1、1000 行，过滤条件相同，所以每个场景的行数也相同。
+  - 先规划的是 CTE。于是 g1 那层的 Agg 在点上拿到 g2 的 10，而不是 499。`est_sub` 复现不了点，replay 只好退到 `sub_rows`。
+  - 这里碰巧无害，因为 g1.a 唯一，估计值本来就等于行数。一般情况下，会得到错误的每场景组数，或者变成 `mismatch`。
+- **修复**：键里用 RelOptInfo 指针代替 varno。一次规划里，每层每个关系各有自己的 RelOptInfo，基表的 RelOptInfo 不会中途释放。修复后，g1 那层是 `est_sub`。
+- **影响范围**：JOB 都是单层查询。make check 的结果文件也逐字节不变。所以这两处都没有碰到过这个问题。
+
+### 28.3 校验扩到估计的缓存
+
+- **以前的缺口**：校验只比向量版和 replay，而 replay 读的是同一个缓存。所以如果缓存的键漏掉了什么，两边错得一样，校验查不出来。
+- **现在**：`robust_debug_check_costs` 打开时，按场景的估计缓存每次命中都重新估计一次，结果有一位不同就 ERROR。这些缓存是：
+  - hash 子句的 bucket stats（m2）；
+  - groups（m2）；
+  - Memoize 的整条向量（只在 dev 分支上）。
+- **变异测试**（debug，各临时改一处，跑完还原）：
+  - **变异 1**（dev 分支的预取版）：Memoize 向量的键去掉 calls。
+    - JOB 5 条查询 × {p8 native, p8}，10 次规划全部报错。例如 Q4 在场景 0，缓存里是 28356，重新估计是 7089。
+    - make check 没有报错，因为 make check 里没有哪个 Memoize 会遇到两种不同的外侧行数向量。
+  - **变异 2**：groups 的键换回 varno。28.2 的例子立即报错：缓存里是 10，重新估计是 499。
+
+### 28.4 验证（预取版）
+
+- **dump 比对**（release，对第 27 节之前、向量化之前的基线）：
+  - 最大并行 130 条 × {p8 native, p8, c1, p1 native}，520 次规划全部相同；关并行 13 条 × 同样 4 个配置，52 次也全部相同。
+  - 打开校验再跑一遍：同样全部相同，没有报错。
+- **debug JOB**（-O0，assert 开，校验默认开）：364 次规划，没有报错，没有 assertion 失败，dump 与 release 逐位相同。
+- **debug make check**（robust 开，校验开）：失败集合仍是同样 18 个，都只是计划形状不同。结果文件与第 27 节逐字节相同，没有报错。
+- **嵌套规划**（27.2 的例子）：内层规划 87 次。校验开和关两种情况下，外层的 dump 都与静态函数版逐字节相同。
+- **gate**（release，校验开）：S6–S10 全部通过。非计时的行与第 27 节逐字相同；S7、S8、S10 也与向量化之前逐字相同。
+- **计数**（临时插桩，T22 p8 native）：
+  - 主 pass 的 groups 查找从 704,739 次降到 83,359 次。剩下的几乎都是两类：新缓存未命中时的逐场景取值（2,486 × 20 = 49,720 次），以及每条路径在点上的一次查找（33,555 次）。
+  - 新缓存查了 33,555 次，命中 92.6%，共 2,486 项。
+  - groups 缓存仍是 63,477 项，和改前一样，说明它的内容没有变。
+
+### 28.5 规划时间（13 条查询，同第 24–27 节的测法）
+
+- **测法**：同一时段、同一台空闲机器上先后跑两个二进制。
+  - 新版：`results/plantime_v2_memo.json`。
+  - 第 27 节的向量版，重新装到另一个目录，跑在同一个数据目录上：`results/plantime_v2_vec_ab.json`。它与第 27 节当时测的 `plantime_v2_vec.json` 相比，各配置逐条比值的几何平均在 0.97–1.03 之间。
+- **又试了一版更省的查找**（结果见下表第二组；这一版没有留下）：
+  - 键放在栈上，不再 palloc；
+  - 只对键头和 calls 做哈希，每个字一次乘法；比较时仍逐字节比较整个键。
+  - 数据：`results/plantime_v2_memo_cheaphash.json`，对照 `results/plantime_v2_vec_ab2.json`。
+
+13 条的中位数（ms）；"比值"是逐条"旧/新"之比的几何平均，大于 1 表示新版快：
+
+| 配置 | 旧 | 新 | 比值 | 旧 | 新（省查找版） | 比值 |
+|---|---|---|---|---|---|---|
+| p8 native，最大并行 | 51.6 | 50.9 | 1.009× | 52.2 | 53.2 | 0.996× |
+| p8 native，关并行 | 31.0 | 31.9 | 1.011× | 31.4 | 32.3 | 1.025× |
+| p8，最大并行 | 94.2 | 94.8 | 0.982× | 93.9 | 97.8 | 0.973× |
+| c1，最大并行 | 9.6 | 9.9 | 0.957× | 9.5 | 9.6 | 0.942× |
+| c1 native，最大并行 | 5.6 | 5.6 | 0.978× | 5.6 | 5.7 | 1.000× |
+| stock，最大并行（不经过 robust 代码，看噪声） | 1.3 | 1.3 | 1.038× | 1.3 | 1.2 | 0.958× |
+
+大查询（最大并行，ms，旧 → 新，两组）：
+
+| 查询 | p8 native | p8 |
+|---|---|---|
+| T21 21-0_testing_20 | 156 → 148，147 → 147 | 281 → 289，281 → 288 |
+| T22 22-0_testing_2 | 455 → 456，453 → 463 | 1040 → 1089，1047 → 1056 |
+| T23 23-0_testing_16 | 434 → 441，431 → 431 | 929 → 992，938 → 941 |
+
+- **结论：没有可测出的提速。**
+  - 各配置的比值都在 0.94–1.03 之间。不经过 robust 代码的 stock 也在 0.96–1.04 之间浮动，所以这就是噪声的幅度。
+  - c1 两组都慢了 4–6%，可能是真的：c1 里新缓存的命中率较低（T22 只有 65%），未命中时要多建一次键、多分配一次内存。
+  - **每场景的边际开销**（算法同 27.4，对 v20 的倍数，逐条几何平均）：
+    - native：不变。p8 native 1.21 → 1.19 / 1.21，c1 native 1.27 → 1.32 / 1.31。
+    - retained：变差。p8 1.84 → 1.89 / 1.91；c1 2.27 → 2.47 / 2.46，两组都是。这与 c1 整体慢 4–6% 一致。
+
+### 28.6 为什么省掉了查找，却不省时间
+
+- **profile**（T22 p8 native，`sample`，约 20 次规划，占 standard_planner 自身采样的比例）：
+  - 自身时间按 `standard_join_search` 的调用点分段：envelope 轮、主 pass、最终选择。
+  - 每个样本记到栈上最内层的 robust 函数；没有 robust 函数的，记到 PG 的类别。
+  - `vector_join` 在改前被内联进 `compute`，所以改前它的时间记在“其他计算”里。下表把两项合在一起比。
+
+| 主 pass 里的项 | 改前（27.5） | 改后（两次 profile） |
+|---|---|---|
+| groups 缓存查找 | 4.1% | 1.9% / 2.2% |
+| `vector_join` 准备 + 其他计算（建键、查新缓存、未命中时逐场景取值） | 3.1% | 4.7% / 4.5% |
+| 向量核 | 6.5% | 7.1% / 7.0% |
+| precheck、选择、非连接路径 replay、PG 自己的部分等 | 13.7% | 13.6% / 13.4% |
+| **主 pass 合计** | **27.4%** | **27.3% / 27.1%** |
+| envelope 轮的 groups 查找（不受影响） | 3.5% | 3.2% / 3.8% |
+| envelope 轮合计 | 65.6% | 65.5% / 66.1% |
+
+- **省下的被新开销抵掉**：
+  - 主 pass 的 groups 查找省了约 2 个百分点。
+  - 新缓存自己的开销（建键、哈希、比较、未命中时的逐场景取值、分配）多了约 1.5 个百分点，向量核多了约 0.5 个百分点。
+  - 合计持平。
+- **省掉的那部分本来就便宜**：
+  - 按 27.5 的 476 ms 折算，改前主 pass 每次 groups 查找平均约 27 ns，envelope 轮每次约 50 ns。
+  - 省掉的约 62 万次查找合计约 9.5 ms，即每次约 15 ns，是最便宜的那一批。同一个 Memoize、同一个外侧关系的键反复出现，所以它们多半落在 CPU 缓存里。
+  - 剩下的约 8.3 万次（新缓存未命中时的逐场景取值、点上的查找）每次约 110–125 ns，多半是冷的。
+  - groups 查找现在主要在 envelope 轮：32.8 万次，每次一个场景、一条路径。按路径预先算整条向量，对这部分帮不上忙。
+- **要再往下压这部分，方向应该是 groups 缓存本身的访存**，不是减少主 pass 的查找次数：
+  - 键现在是定长 176 字节（8 个变量的槽位），而 Memoize 参数通常只有 1–2 个；
+  - 表有 6 万多项，放不进 L2。
+  - 把键改成紧凑的变长键，或者换成开放寻址的表，可能减少 envelope 轮的缓存未命中。这一点还没有试。
+- **27.5 的估计错在哪**：当时把 7.5% 按查找次数分摊，以为主 pass 占大头，没有考虑到两部分每次查找的代价不同。
+
+### 28.7 回退之后
+
+- **m2 现在的状态**：
+  - 与第 27 节的向量版相比，只多了两样：28.2 的键修复，以及 bucket stats、groups 两个缓存的命中校验。
+  - `memo_ndistinct`、`JoinVec.nd`、`join_enter` / `join_leave` 等预取版的代码都已移走。
+  - `rel_rows_at` 和 `groups_vars` 留着，因为 groups 缓存自己要用。
+- **验证**（回退后的二进制）：
+  - **28.2 的例子**：两层都是 `est_sub`。
+  - **release dump**，打开校验，对向量化之前的基线：最大并行 520 次、关并行 52 次规划，全部相同，没有报错。
+  - **debug make check**（robust 开，校验开）：失败的仍是同样 18 个，都只是计划形状不同。结果文件与第 27 节逐字节相同。没有校验报错，也没有 assertion 失败。
+  - **debug JOB**：13 条 × {p8 native, p8, c1, p1 native}，最大并行和关并行，共 104 次规划。没有报错，dump 与 release 逐位相同。
+  - **gate**（release，校验开）：S6–S10 全部通过。非计时的行与预取版那次逐字相同，S7、S8、S10 也与向量化之前逐字相同。
+- **规划时间**（13 条查询，同第 24–27 节的测法）：
+  - 回退版和第 27 节的向量版在同一时段交替各跑两遍：回退版、向量版、回退版、向量版。数据是 `results/plantime_v2_reverted_{a,b}.json` 对 `results/plantime_v2_vec_ab{3,4}.json`。
+  - 这次机器上有别的程序占着约一个核，绝对值比前几节略高。所以两边都在同一时段测。
+  - 逐条“向量版 / 回退版”之比，两遍取平均后的几何平均：p8 native 0.997×，p8 1.000×，c1 0.982×，c1 native 0.972×；关并行各配置在 0.993–1.005× 之间。
+  - 同一个二进制两遍之间的比值在 0.96–1.05 之间，c1 的两个配置波动最大（2–5%）。
+  - 所以回退后回到了第 27 节的速度。28.5 里 c1 慢的 4–6% 基本没有了，剩下的 2–3% 在 c1 自身的波动之内。
+
+## 29. 离 v20 还差在哪（回退后）
+
+### 29.1 现状（13 条的中位数，ms，最大并行；28.7 那两遍的平均）
+
+| 配置 | m2 | v20 | 逐条 m2/v20 的几何平均 |
+|---|---|---|---|
+| p8 native | 52.2 | 48.7 | 1.14× |
+| p8（retained，默认） | 94.6 | 48.7 | 2.13× |
+| c1 native | 5.8 | 5.8 | 1.16× |
+| c1（retained，默认） | 10.3 | 5.8 | 2.02× |
+
+- **native pairing 已经接近 v20**：
+  - 大查询比 v20 快：T21 156 对 202，T22 483 对 492，T23 441 对 477。
+  - 慢的是小查询：每场景的边际开销仍是 v20 的 1.2–1.3 倍（27.4），但截距比 v20 低。
+- **默认的 retained pairing 慢一倍**：候选数多得多（第 24 节，T11 p8 256k 对 39.6k）。
+
+### 29.2 T22 p8：retained 和 native 的时间分在哪
+
+- **数据**：`sample`，回退后的 release，同一时段，按 28.6 的方法分段。
+- 每次规划的毫秒数按中位规划时间折算。这时机器上有别的负载，所以两边都比 28.7 的数略高：retained 1108 ms，native 506 ms。
+
+| 段 / 项 | retained | native | 差 |
+|---|---|---|---|
+| envelope 轮 | 341 | 330 | +11 |
+| 主 pass 合计 | 668 | 141 | +527 |
+| 其中 twin 去重（`robust_select_offer`） | 207 | 11 | +196 |
+| 其中 precheck | 153 | 23 | +130 |
+| 其中 向量核（给剩下的候选算代价） | 133 | 32 | +101 |
+| 其中 其他计算 | 58 | 17 | +41 |
+| 其中 其余（groups、bucket、非连接 replay、PG 自己的部分） | 117 | 58 | +59 |
+| 最终选择（排序、打分） | 93 | 28 | +65 |
+
+- **envelope 轮两边一样**：每轮只跑 PG 原生的 DP。
+- **多出来的约 600 ms 全在主 pass 和最终选择**，都与候选数成正比。
+- **最大的一项是 twin 去重**，占 retained 的 18.7%：
+  - `robust_select_offer` 对每个候选线性扫描一遍已有的候选，所以是 O(候选数²)（第 24 节）。
+  - precheck（第 25 节）剪掉了大部分候选，但留下来的仍然够多。
+- **native 的剩余开销**：
+  - envelope 轮里 robust 的部分约 25%（125 ms），其中 groups 缓存 3.6%；
+  - 主 pass 141 ms，其中 groups 缓存 4.5%。
+
+### 29.3 可以怎么改（都还没做），按把握从大到小
+
+| 改动 | 计划是否变化 | 预期 |
+|---|---|---|
+| K=1（c1）时默认用 native pairing | 第 24 节是 130/130 不变，需要用现在的二进制再确认一遍 | c1 10.3 → 约 5.8 ms，与 v20 持平 |
+| twin 去重改用 hash：键是 total、startup、rows 的位，只对同键的候选调 `same_candidate` | 不变（列表和顺序都一样） | retained 约快 18%，native 约快 2% |
+| p8 也用 native pairing | 第 24 节是 20/130 变化，要看这 20 条的执行时间和目标值 | p8 94.6 → 约 52 ms，接近 v20 |
+| 如果 retained 要留：先数清楚有多少候选是 twin，在哪一步产生的。如果大部分是 twin，就在 precheck 和算代价之前按输入路径识别出来 | 不变 | 省掉 twin 的 precheck 和代价计算，大小取决于计数 |
+| groups 缓存改用紧凑的变长键，或者开放寻址的表（28.6） | 不变 | native 最多省 groups 的一半，约 3–4% |
+| envelope 轮直接在场景 s 的输入上跑 DP，让 PG 原生的代价函数直接给出本轮的代价，省掉点检查和本轮的 replay | 需要证明逐位不变，点上的缓存（`norm_selec`、bucket size、`MergeScanSelCache`）要处理 | envelope 轮里 robust 的约 25% 中的大部分，是个设计工作 |

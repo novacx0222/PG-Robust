@@ -6,7 +6,8 @@ Planning time: median of EXPLAINs 2..REPS in one session.
     MODE=v2|v20 OUT=plantime_v2.json python3 plantime.py
     REPS=4 (EXPLAINs per configuration), ONLY=c1,c1n (subset), NSMALL (N of the
     'N1' configurations: 1 on v2, 4 on v20, whose minimum is 4), PRECHECK=on|off
-    (v2: robust_select_precheck; unset = the server's default)
+    (v2: robust_select_precheck; unset = the server's default), VECTOR=on|off
+    (v2: robust_vector_cost; unset = the server's default)
 """
 import glob, json, os, re, statistics, subprocess, sys
 from cmp_runs import B, PSQL
@@ -44,6 +45,8 @@ def robust(t, main, strat, ret, **kw):
                  robust_dominance='off', robust_penalty_tau='0.2', robust_envelope='on')
         if os.environ.get('PRECHECK'):
             s['robust_select_precheck'] = os.environ['PRECHECK']
+        if os.environ.get('VECTOR'):
+            s['robust_vector_cost'] = os.environ['VECTOR']
     else:
         s.update(final_score_id=str(main))
     s.update(kw)
