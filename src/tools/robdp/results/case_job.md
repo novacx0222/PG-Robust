@@ -1967,13 +1967,15 @@ v20 同设置下的结果（第 21 节）：E[Cost]×1 1.18，×8 1.17；E[Pen]�
   - 但 `effective_cache_size` = 4 GB，PG 认为这些页都已缓存，随机读很便宜。
 - **stock 为什么没选 NL**：它高估了 mi（397 万，真实 179 万）和输出行数（3214 万，真实 526 万），NL 的点代价因此高达 76 万。也就是说，它是靠估错“蒙对”的。
 - **m1 为什么没选 NL**：m1 不把乘子放进索引选择率。所以 m1 里每次探测仍按 stock 的 41 行计价（n_distinct 估成 36 万，真实 247 万），NL 在 m1 里依然很贵。m2 的 index_mult 把这个数改成约 14 行，其实更接近真实值。
-- **验证**：把 `effective_cache_size` 设为 128 MB（和 shared_buffers 一致），T3 的 10 条中 m2 执行总和 4.11 s，stock 4.09 s，持平；默认设置下 m2 是 6.9 s。
+- **验证**：把 `effective_cache_size` 设为 128 MB（和 shared_buffers 一致），T3 的 10 条中 m2 执行总和 4.46 s，stock 4.33 s，基本持平。同一时段、默认设置下，m2 是 7.26 s，stock 3.95 s。
 
 ### 31.4 T23：cc=t 的常数 4 倍（第 14–15 节）
 
+（31.3–31.5 中 `effective_cache_size` 的对照都是按 ep8 的 cost0 配置重跑的：E[Cost]，`retain_path_limit` = 0，`add_path_limit` = 1，每条取 3 次执行的中位数。）
+
 原因与第 14–15 节相同：profile 里的 cc=t 恒为 4.0，实测只有 0.5–0.94。m2 的 spanning forest 把这条边乘到所有同时含 cc 和 t 的 joinrel 上。
 
-把 `effective_cache_size` 设为 128 MB 时，T23 上 m2 比 stock 快（1.82 s 对 2.05 s），但 stock 自己也变了（默认设置下 1.48 s）。所以这一组数不能单独说明问题。
+把 `effective_cache_size` 设为 128 MB 时，T23 上 m2 比 stock 快（1.95 s 对 2.14 s）；同一时段、默认设置下是 3.74 s 对 1.85 s。所以 T23 输掉的执行时间里，也有很大一部分来自随机读的定价：cc=t 的 4 倍让 m2 推迟连接 title，选出的计划做了更多随机探测。不过 stock 在这个设置下自己也慢了 16%。
 
 ### 31.5 T22：profile 乘子组合后低估了 mi 的连接
 
@@ -1987,7 +1989,7 @@ v20 同设置下的结果（第 21 节）：E[Cost]×1 1.18，×8 1.17；E[Pen]�
   - 而 (k, mi_idx, mk) 是 0.90–1.04。
   - 来源是 mi=mk 乘子（0.10–0.49，中位 0.42）和 mi 的乘子（中位 2.62）相乘，加上与 it1=mi 的组合。单看 mi mk 一对是 0.38，叠加 k 的选择后偏差更大。这说明乘子之间按独立相乘，没有捕捉到关键词和电影信息之间的相关性。
 - **另一处偏差**：kt=t 的乘子约 4.6，第 15 节说过这个方向是反的。所有含 kt 和 t 的 joinrel 都被高估 20–12000 倍，但两边都把 kt 放在最后连，所以这次没有影响计划。
-- 把 `effective_cache_size` 设为 128 MB 后，T22 上 m2 更差（2.56 s 对 1.46 s），说明这里不是缓存假设的问题。
+- 把 `effective_cache_size` 设为 128 MB 后，T22 上 m2 仍然差（2.78 s 对 1.72 s）；默认设置下是 2.20 s 对 1.27 s。比值只从 1.73 降到 1.62，说明主要不是缓存假设的问题。
 
 ### 31.6 小结和可以做的
 
@@ -2060,3 +2062,138 @@ m2 pen8 的执行总和是 17.84 s，stock 是 15.65 s（同一次运行）。
 - **K = 8 比 K = 1 好**：cost8 和 pen8 的总和比是 1.27–1.29，cost0 和 pen0 是 1.16–1.17。
 - **算上规划时间，所有 RobDP 配置都不如 stock**。m3 cost0 最接近：12.12 s，stock 11.84 s。
 - 规划中位数和 130 条时相同：T3（4 张表）的规划都在中位数以下，T23（11 张表）都在中位数以上，各去掉 10 条，中位数不变。
+
+## 32. 规划时间：m3 还慢在哪里，以及 native pairing 的全量验证
+
+### 32.1 m3 对 m1（ep8 冷启动规划，130 条）
+
+逐条 m3 / m1 的几何平均：cost0 1.32×，cost8 1.64×，pen0 1.47×，pen8 1.68×。每个模板都慢，K = 8 的两个配置慢得最多。
+
+冷启动的影响很小：
+- 同一会话里第一次规划比第二次多约 1.1 ms，stock 自己是 0.7 ms。
+- 所以 profile 加载之类的额外开销约 0.5 ms 一条，130 条一共约 65 ms。
+
+### 32.2 T22 22-0_testing_2 的 profile（`sample`，同一会话内反复 EXPLAIN）
+
+占规划时间的百分比（包含被调函数）：
+
+| 项 | cost0 | cost8 | pen0 | pen8 |
+|---|---|---|---|---|
+| 候选的向量代价（`compute`） | 59.5 | 49.6 | 39.4 | 40.3 |
+| 其中 向量核 `join_at` | 37.6 | 34.0 | 17.0 | 22.4 |
+| precheck（`robust_precheck_join`） | 14.9 | 27.9 | 5.8 | 18.3 |
+| 选择（`robust_select_paths`） | 11.4 | 10.7 | 2.6 | 10.8 |
+| groups 缓存（`robust_replay_num_groups`） | 11.7 | — | 7.2 | 4.6 |
+
+候选数（主 pass，precheck 剪掉的 + 算了代价的）：
+
+| | cost0 | cost8 | pen0 | pen8 |
+|---|---|---|---|---|
+| retained（默认） | 11.5 万 + 8.0 万 | 153 万 + 51 万 | 11.6 万 + 7.9 万 | 189 万 + 56 万 |
+| native | 4.7 万 + 3.9 万 | 9.6 万 + 13.7 万 | 4.8 万 + 3.8 万 | 10.6 万 + 14.9 万 |
+
+- **K = 8 的时间几乎都花在候选上**。retained pairing 把每个输入保留的路径两两配对，候选数随保留路径数平方增长，T22 一条就有 200 多万个。
+- native pairing 少 8–10 倍。
+
+### 32.3 native pairing 的全量验证（`robust_join_pairing = native`，130 条 × 4 个配置）
+
+计划，和 m3 的 retained 比：
+- cost0 和 pen0：130/130 相同（形状和代价都一样）。
+- cost8：126/130 相同。
+- pen8：110/130 相同。
+- 一共 24 条计划变化。
+
+规划时间（冷启动，单次；这次运行 stock 比 m3 那次快约 12%）：
+
+| 配置 | m3 retained 中位数 / 总和 | native 中位数 / 总和 | m1 中位数 / 总和 | 逐条 native / m1 |
+|---|---|---|---|---|
+| cost0 | 13.3 ms / 3.10 s | 7.6 ms / 1.75 s | 10.3 ms / 2.40 s | 0.77× |
+| cost8 | 50.5 ms / 14.33 s | 17.1 ms / 4.18 s | 31.9 ms / 8.34 s | 0.58× |
+| pen0 | 54.0 ms / 13.28 s | 46.8 ms / 11.72 s | 36.5 ms / 9.76 s | 1.25× |
+| pen8 | 105.6 ms / 28.12 s | 59.2 ms / 14.78 s | 63.0 ms / 16.87 s | 0.95× |
+
+24 条变化计划的执行时间（同一时段，3 次的中位数，求和）：stock 2.40 s，retained 2.22 s，native 2.15 s。
+- native 快的：5-0_testing_11 pen8 110 → 94 ms，22-0_testing_7 cost8 205 → 186 ms。
+- native 慢的：1-0_testing_13 pen8 50 → 55 ms，2-0_testing_5 pen8 59 → 67 ms。
+- 其余都在噪声内。
+
+**结论**：native pairing 在 K = 1 时不改变任何计划；在 K = 8 时改变 24 条计划，但执行总和不变差。规划时间上，cost0、cost8、pen8 都比 m1 快，只有 pen0 仍比 m1 慢 1.25×。
+
+### 32.4 剩下的（按收益排）
+
+- **把 `robust_join_pairing` 的默认值改成 native**：收益见 32.3。
+  - 需要注意语义：native 下，保留的路径仍然会被 PostgreSQL 的 nestloop 和 merge join 当作外侧遍历（`match_unsorted_outer` 遍历外侧的整个 pathlist），只是不再和内侧的每一条两两配对。
+- **E[Pen] 的 envelope 轮**：
+  - pen0 在 native 下仍比 m1 慢 1.25×，而且 PostgreSQL 自己的路径生成占了一半以上，因为 envelope 要跑 N = 20 轮原生 DP。
+  - 方向是第 29.3 节的 projected envelope rounds，属于设计工作。
+- **precheck**：
+  - E[Cost] 的下界是均值，而均值对输入是线性的，可以用两条输入路径的均值直接相加，从 O(N) 变成 O(1)；
+  - E[Pen] 等非负损失的均值可以提前退出。
+  - retained 下这能省 15–20%。改成 native 后 precheck 只占 4–6%，收益变小。
+- **groups 缓存**（5–12%）：改用紧凑的变长键，或者开放寻址的表（第 28.6 节）。
+
+### 32.5 E[Pen] 的 envelope 轮：m3 每轮比 m1 贵 35%
+
+**两边的设计相同**：先跑 N 轮 envelope，每轮一遍原生 DP，取每个 joinrel 在该场景下的最便宜代价，然后跑一次主 pass。区别在每一轮怎么得到场景 s 的代价：
+- **m1**（PG-Robust 的 `robust_join_search`，pass 1）：
+  - `robust_round_view_begin` 先把基表、它们的路径和 ppi 的 rows、startup 和 total 换成样本 s 的值；
+  - 然后让 PostgreSQL 原生的连接构造和代价函数直接在这些值上算；
+  - 每条候选路径只算一次代价。
+- **m3**：
+  - PostgreSQL 先按点估计构造并计算每条候选路径的代价；
+  - 再在 `add_path` 里调 `compute()`，先做点检查（`join_at(-1)`，确认重算的点代价和路径上的标量逐位相同），再算本轮场景（`join_at(s)`）；
+  - 每条候选路径算三次代价，还要分配 `RobustPathCost`、查 groups 和 bucket 缓存。
+  - 之所以要 replay，是因为 m2 把乘子也放进了 cost 函数内部的选择率（索引选择率、qual 选择率、groups、bucket），光换 rows 得不到 m2 模型下的场景代价。
+
+**测法**：
+- 第 24 节的 13 条查询，最大并行，同一会话的热规划，取 EXPLAIN 第 2–5 次的中位数；m3 用 native pairing。
+- 每轮的成本 = E[Pen]×1 的斜率减去 E[Cost]×1 的斜率，两个斜率都是 (N=20 − N=4) / 16。减掉后只剩 envelope 一轮的成本。
+- m1 是先停掉 m2，再用 p0-release 启动同一个数据目录测的。
+- 数据在 scratchpad 的 `pt_round_{m3,m1}.json`。
+
+| 查询 | stock 一次规划 | m3 每轮 | m1 每轮 | 主 pass 每场景 m3 / m1 |
+|---|---|---|---|---|
+| 11-0_testing_7 | 1.4 ms | 1.88 ms | 1.34 ms | 0.17 / 0.18 |
+| 13-0_testing_11 | 2.3 ms | 3.39 ms | 2.37 ms | 0.23 / 0.25 |
+| 21-0_testing_20 | 3.6 ms | 5.04 ms | 3.73 ms | 0.42 / 0.59 |
+| 22-0_testing_2 | 9.9 ms | 15.26 ms | 11.48 ms | 1.64 / 1.64 |
+| 23-0_testing_16 | 10.3 ms | 15.36 ms | 11.03 ms | 1.23 / 1.45 |
+
+- **一轮的代价**（stock 一次规划 ≥ 1 ms 的 8 条，几何平均）：m3 是 stock 一次规划的 1.48 倍，m1 是 1.10 倍。
+- **主 pass 每个场景的边际成本，两边基本相同**。
+- **整体**：E[Pen]×1、N=20 的规划时间，逐条 m3 / m1 是 1.44×；E[Cost]×1 只有 1.11×。所以 pen0 的差距几乎全在 envelope 轮。
+- **与 profile 吻合**：
+  - pen0 native 的 `compute` 占 36.8%，其中主 pass 约 8%，所以 envelope 轮里约三分之一是 robust 的 replay；
+  - 剩下三分之二是 PostgreSQL 自己的 DP，约合 stock 规划的 1.0 倍。
+
+**怎么改**：就是第 29.3 节的 projected envelope rounds，即 m1 的做法加上 m2 的钩子。
+- 一轮开始时，把基表、ppi 和输入路径的 rows 投影到场景 s；
+- 把 `robust_replay` 的钩子（index_mult、qual_mult、semi_mult、groups、bucket）设成本轮场景，在整轮内都生效；
+- 这样 PostgreSQL 原生的代价函数算出来的就是本轮代价，`add_path` 里不再需要 `compute()`。
+- 预期每轮从 1.48 倍降到约 1.1 倍，pen0 和 pen8 的规划时间少 20–25%，与 m1 持平。
+- **难点**：
+  - 本轮代价要和现在 replay 得到的逐位相同，否则 envelope 会变、计划会变。
+  - 点估计上的缓存（`norm_selec`、bucket size、`MergeScanSelCache`、groups）在轮内要按场景区分，或者整轮关掉。
+  - joinrel 的 rows 要在建 joinrel 时直接取场景 s 的值（现在是先按点估计建好，再给向量）。
+  - 可以用 `robust_debug_check_costs` 逐位核对：每轮的 envelope 都和 replay 得到的比一遍。
+
+## 33. `robust_join_pairing` 的默认值改为 native
+
+依据是第 32.3 节：
+- K = 1 时，计划 130/130 不变；
+- K = 8 时，24 条计划变化，执行总和不变差；
+- 规划时间少 1.4–3.4 倍。
+
+改动：
+- `robust.c` 和 `guc_tables.c`：默认值改为 `ROBUST_PAIRING_NATIVE`。
+- `robustselect.h`：注释写明 native 是默认，retained 对应论文的 P(U1) × P(U2) × J。
+- `case_job/cmp_runs.py` 和 `plantime.py`：pairing 改由 `ROBDP_PAIRING` 指定，默认 native。
+  - 要复现第 33 节以前的数据，需设 `ROBDP_PAIRING=retained`。
+  - case.py、passes.py、truth.py、overhead.py 仍然写死 retained，按原样复现旧的分析。
+- gate 脚本：S8 两种 pairing 都测；S9、S10 用服务器默认值，现在测的是 native。
+
+验证：
+- `make check`：
+  - 不带 robust 设置时，215 个测试全部通过；
+  - robust 模式（E[Pen]×8，lognormal profile，并行 4）下 17 个失败，都是计划不同造成的预期差异；debug 构建里没有 TRAP，也没有 RobDP 的报错。
+- 130 条 × 4 个配置，完全不设 `robust_join_pairing`：计划（形状和代价）与第 32.3 节显式设 native 的结果 650/650 相同。

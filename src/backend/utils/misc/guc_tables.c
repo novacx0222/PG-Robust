@@ -5164,7 +5164,7 @@ struct config_enum ConfigureNamesEnum[] =
 			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
 		},
 		&robust_join_pairing,
-		ROBUST_PAIRING_RETAINED, robust_join_pairing_options,
+		ROBUST_PAIRING_NATIVE, robust_join_pairing_options,
 		NULL, NULL, NULL
 	},
 

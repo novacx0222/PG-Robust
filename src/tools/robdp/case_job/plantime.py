@@ -41,7 +41,7 @@ def robust(t, main, strat, ret, **kw):
              error_sample_kde_bandwidth='0', error_profile_path=prof, main_objective_id=str(main),
              retain_strategy_id=str(strat), add_path_limit='1', retain_path_limit=str(ret))
     if MODE == 'v2':
-        s.update(robust_search='on', robust_select='on', robust_final_path_limit='1', robust_join_pairing='retained',
+        s.update(robust_search='on', robust_select='on', robust_final_path_limit='1', robust_join_pairing=os.environ.get('ROBDP_PAIRING', 'native'),
                  robust_dominance='off', robust_penalty_tau='0.2', robust_envelope='on')
         if os.environ.get('PRECHECK'):
             s['robust_select_precheck'] = os.environ['PRECHECK']

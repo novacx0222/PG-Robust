@@ -81,9 +81,14 @@
  * pathkeys) are the best by the objective.  The level-1 relations of the
  * search are scored but not pruned.
  *
- * With robust_join_pairing = retained, a join is built from every path its
- * inputs keep, where PostgreSQL uses only a few of them (the cheapest
- * total path, ...): the paper's P(U1) x P(U2) x J (see joinpath.c).
+ * With robust_join_pairing = native (the default), the join builders are
+ * PostgreSQL's: they build a join from a few paths of each input (its
+ * cheapest total path, cheapest startup path, cheapest path per
+ * parameterization or sort order, and, as a nestloop's or merge join's
+ * outer, every path it keeps).  With retained, a join is built from every
+ * path its inputs keep: the paper's P(U1) x P(U2) x J (see joinpath.c).
+ * Retained tries many more candidates (on JOB with K = 8, about ten times
+ * as many) for the same plans at K = 1 and execution no better at K = 8.
  *
  * With robust_select_precheck on, the join builders ask
  * robust_precheck_join() before they build and cost a join path

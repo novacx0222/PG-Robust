@@ -9,12 +9,15 @@ PAR = os.environ.get('ROBDP_PAR', '0')
 PARSET = "SET max_parallel_workers_per_gather = %s;\n" % PAR + ''.join(
     "SET %s = '%s';\n" % tuple(kv.split('=', 1)) for kv in os.environ.get('ROBDP_PAR_GUCS', '').split(',') if kv)
 
+# robust_join_pairing; the server's default since case_job.md §33, retained before
+PAIRING = os.environ.get('ROBDP_PAIRING', 'native')
+
 def robust(t, main=0, retain=0, rlimit=1, extra=()):
     prof = B + 'imdb-separate-ep-0826-2/%s-0_cardinality/error_profile' % t
     s = dict(enable_rows_dist='on', error_sample_count='20', error_bin_count='2', error_sample_seed='42',
              error_sample_kde_bandwidth='0', error_profile_path=prof, robust_search='on', robust_select='on',
              main_objective_id=str(main), retain_strategy_id=str(retain), add_path_limit='1',
-             retain_path_limit=str(rlimit), robust_final_path_limit='1', robust_join_pairing='retained',
+             retain_path_limit=str(rlimit), robust_final_path_limit='1', robust_join_pairing=PAIRING,
              robust_dominance='off', robust_penalty_tau='0.2', robust_envelope='on')
     s.update(dict(extra))
     return ''.join("SET %s = '%s';\n" % kv for kv in s.items())
