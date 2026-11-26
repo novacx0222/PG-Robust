@@ -19,6 +19,15 @@
  * Ties go to the lower expected total cost, then as in compare_path_costs
  * (point total, then startup cost), then to the earlier candidate.
  *
+ * With robust_select_dedup on, a candidate is not collected when the list
+ * already has its twin: the same parameterization, pathkeys, parallel
+ * safety and workers, and rows, startup and total cost in every scenario
+ * (the join builders meet the same inputs more than once under retained
+ * pairing).  The twins are looked up in an index of the list by the point
+ * rows and costs (robust_select_offer), so collecting stays linear in the
+ * number of candidates; with robust_debug_check_costs on, the list is
+ * scanned as well, and a different answer is an error.
+ *
  * The objectives score a path by its cost vectors (optimizer/robustcost.h),
  * the lower the better: a loss x(s) per scenario, summed up over the N
  * scenarios (the paper's Section 4.1; the numbering is v20's):
@@ -133,7 +142,7 @@
 
 extern bool robust_objective_needs_envelope(int objective);
 extern bool robust_select_retained(PlannerInfo *root);
-extern bool robust_select_offer(List **pathlist, Path *path);
+extern bool robust_select_offer(RelOptInfo *rel, bool partial, Path *path);
 
 /* The join method of a candidate robust_precheck_join() bounds */
 typedef enum RobustJoinBound

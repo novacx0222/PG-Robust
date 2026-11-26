@@ -585,7 +585,7 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 	/* RobDP: every candidate, for the selection (optimizer/robustselect.h) */
 	if (enable_rows_dist && robust_cost_collect())
 	{
-		(void) robust_select_offer(&parent_rel->pathlist, new_path);
+		(void) robust_select_offer(parent_rel, false, new_path);
 		return;
 	}
 
@@ -961,7 +961,7 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 	/* RobDP: every candidate, for the selection (optimizer/robustselect.h) */
 	if (enable_rows_dist && robust_cost_collect())
 	{
-		(void) robust_select_offer(&parent_rel->partial_pathlist, new_path);
+		(void) robust_select_offer(parent_rel, true, new_path);
 		return;
 	}
 

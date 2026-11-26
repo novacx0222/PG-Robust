@@ -401,28 +401,205 @@ same_candidate(Path *a, Path *b)
 				 rb ? rb->total : NULL, b->total_cost);
 }
 
+/* ------------------------------------------------------------ twins */
+
+/*
+ * An index of a relation's pathlist or partial_pathlist in the main pass
+ * by the candidates' point rows, startup and total cost, which twins share
+ * (same_candidate), so that a new candidate is compared only with those
+ * candidates instead of the whole list.  The index holds exactly the
+ * list's elements, in order: it records the list, its length and its last
+ * element, and is rebuilt from the list when any of them is not what
+ * robust_select_offer() left (the list of a relation made dummy is
+ * replaced; the selection replaces it with the kept paths).  Entries are
+ * chained per bucket; the buckets double when they are 3/4 full.
+ */
+typedef struct TwinIndex
+{
+	const List *list;			/* the list indexed */
+	int			n;				/* its length: the entries */
+	const Path *last;			/* its last element */
+	int			cap;			/* entries allocated */
+	int			nbuckets;		/* a power of 2, or 0 */
+	int		   *head;			/* per bucket: its first entry, or -1 */
+	int		   *next;			/* per entry: the next of its bucket, or -1 */
+	uint32	   *hash;			/* per entry */
+	Path	  **path;			/* per entry: the list's element */
+} TwinIndex;
+
+typedef struct RobustTwins
+{
+	TwinIndex	kind[2];		/* pathlist, partial_pathlist */
+} RobustTwins;
+
+/* A double's bits, with -0 as 0: equal doubles give equal words */
+static inline uint64
+twin_word(double x)
+{
+	uint64		w;
+
+	if (x == 0.0)
+		return 0;
+	memcpy(&w, &x, sizeof(w));
+	return w;
+}
+
+static inline uint64
+twin_mix(uint64 x)
+{
+	x ^= x >> 30;
+	x *= UINT64CONST(0xbf58476d1ce4e5b9);
+	x ^= x >> 27;
+	x *= UINT64CONST(0x94d049bb133111eb);
+	x ^= x >> 31;
+	return x;
+}
+
+/* The hash of what same_candidate() first requires to be equal */
+static uint32
+twin_hash(const Path *p)
+{
+	uint64		h;
+
+	h = twin_mix(twin_word(p->total_cost));
+	h = twin_mix(h ^ twin_word(p->startup_cost));
+	h = twin_mix(h ^ twin_word(p->rows));
+	return (uint32) (h ^ (h >> 32));
+}
+
+static void
+twin_insert(TwinIndex *t, MemoryContext cxt, Path *path, uint32 h)
+{
+	int			i;
+	int			b;
+
+	if (t->n == t->cap)
+	{
+		int			cap = Max(16, 2 * t->cap);
+
+		if (t->cap == 0)
+		{
+			t->next = MemoryContextAlloc(cxt, sizeof(int) * cap);
+			t->hash = MemoryContextAlloc(cxt, sizeof(uint32) * cap);
+			t->path = MemoryContextAlloc(cxt, sizeof(Path *) * cap);
+		}
+		else
+		{
+			t->next = repalloc(t->next, sizeof(int) * cap);
+			t->hash = repalloc(t->hash, sizeof(uint32) * cap);
+			t->path = repalloc(t->path, sizeof(Path *) * cap);
+		}
+		t->cap = cap;
+	}
+	if (4 * (t->n + 1) > 3 * t->nbuckets)
+	{
+		int			nb = Max(32, 2 * t->nbuckets);
+
+		if (t->nbuckets == 0)
+			t->head = MemoryContextAlloc(cxt, sizeof(int) * nb);
+		else
+			t->head = repalloc(t->head, sizeof(int) * nb);
+		t->nbuckets = nb;
+		memset(t->head, -1, sizeof(int) * nb);
+		for (int j = 0; j < t->n; j++)
+		{
+			b = t->hash[j] & (nb - 1);
+			t->next[j] = t->head[b];
+			t->head[b] = j;
+		}
+	}
+	i = t->n++;
+	t->path[i] = path;
+	t->hash[i] = h;
+	b = h & (t->nbuckets - 1);
+	t->next[i] = t->head[b];
+	t->head[b] = i;
+}
+
+static void
+twin_rebuild(TwinIndex *t, MemoryContext cxt, List *list)
+{
+	ListCell   *lc;
+
+	t->n = 0;
+	if (t->nbuckets > 0)
+		memset(t->head, -1, sizeof(int) * t->nbuckets);
+	foreach(lc, list)
+		twin_insert(t, cxt, (Path *) lfirst(lc), twin_hash((Path *) lfirst(lc)));
+	t->list = list;
+	t->last = list != NIL ? (Path *) llast(list) : NULL;
+}
+
 /*
  * robust_select_offer
  *		add_path() / add_partial_path() in the main pass of a selecting
- *		search: append the candidate, unless the list has its twin (with
- *		robust_select_dedup on).  Returns whether it was appended.
+ *		search: append the candidate to rel's pathlist (partial_pathlist),
+ *		unless the list has its twin (with robust_select_dedup on).
+ *		Returns whether it was appended.
+ *
+ * The twins are found through the relation's TwinIndex.  With
+ * robust_debug_check_costs on, the list is scanned as well, and an answer
+ * of the index that is not the scan's is an error.
  */
 bool
-robust_select_offer(List **pathlist, Path *path)
+robust_select_offer(RelOptInfo *rel, bool partial, Path *path)
 {
-	ListCell   *lc;
+	List	  **pathlist = partial ? &rel->partial_pathlist : &rel->pathlist;
+	MemoryContext cxt;
+	TwinIndex  *t;
+	uint32		h;
+	bool		twin = false;
 
 	if (!robust_select_dedup)
 	{
 		*pathlist = lappend(*pathlist, path);
 		return true;
 	}
-	foreach(lc, *pathlist)
+	cxt = GetMemoryChunkContext(rel);
+	if (rel->robust_twins == NULL)
+		rel->robust_twins = MemoryContextAllocZero(cxt, sizeof(RobustTwins));
+	t = &rel->robust_twins->kind[partial ? 1 : 0];
+	if (t->list != *pathlist || t->n != list_length(*pathlist) ||
+		(t->n > 0 && t->last != (Path *) llast(*pathlist)))
+		twin_rebuild(t, cxt, *pathlist);
+
+	h = twin_hash(path);
+	if (t->nbuckets > 0)
 	{
-		if (same_candidate((Path *) lfirst(lc), path))
-			return false;
+		for (int i = t->head[h & (t->nbuckets - 1)]; i >= 0; i = t->next[i])
+		{
+			if (t->hash[i] == h && same_candidate(t->path[i], path))
+			{
+				twin = true;
+				break;
+			}
+		}
 	}
+	if (robust_debug_check_costs)
+	{
+		bool		scan = false;
+		ListCell   *lc;
+
+		foreach(lc, *pathlist)
+		{
+			if (same_candidate((Path *) lfirst(lc), path))
+			{
+				scan = true;
+				break;
+			}
+		}
+		if (scan != twin)
+			elog(ERROR, "RobDP: twin index of %s path list of %d paths finds %s twin, a scan of the list %s",
+				 partial ? "a partial" : "a", list_length(*pathlist),
+				 twin ? "a" : "no", scan ? "one" : "none");
+	}
+	if (twin)
+		return false;
+
 	*pathlist = lappend(*pathlist, path);
+	twin_insert(t, cxt, path, h);
+	t->list = *pathlist;
+	t->last = path;
 	return true;
 }
 

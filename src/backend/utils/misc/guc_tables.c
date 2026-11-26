@@ -1092,7 +1092,8 @@ struct config_bool ConfigureNamesBool[] =
 		{"robust_debug_check_costs", PGC_USERSET, DEVELOPER_OPTIONS,
 			gettext_noop("Checks RobDP's vector costing of join paths against the replay of PostgreSQL's cost functions."),
 			gettext_noop("Every join path costed by the vector functions is replayed as well, and a difference in any "
-						 "scenario is an error; so is a cached estimate that differs from the estimator's anew.  "
+						 "scenario is an error; so is a cached estimate that differs from the estimator's anew, "
+						 "and a twin lookup of the main pass's candidates that differs from a scan of the list.  "
 						 "On by default in assert-enabled builds; planning becomes slower."),
 			GUC_NOT_IN_SAMPLE
 		},

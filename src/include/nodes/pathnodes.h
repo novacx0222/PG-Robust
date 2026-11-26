@@ -1065,6 +1065,13 @@ typedef struct RelOptInfo
 	 * join path candidates, NULL until the first one
 	 */
 	struct RobustPrecheck *robust_precheck pg_node_attr(read_write_ignore);
+
+	/*
+	 * RobDP (optimizer/robustselect.h): the index of the main pass's path
+	 * candidates by which robust_select_offer() finds twins, NULL until the
+	 * first candidate
+	 */
+	struct RobustTwins *robust_twins pg_node_attr(read_write_ignore);
 } RelOptInfo;
 
 /*
