@@ -1,16 +1,22 @@
 """m1 vs m3 (vs stock) on JOB test queries with the regenerated PAR2QO
 error profiles (train-50 profiles, test queries only).
 
-Per mode (m1 = PG-Robust p0-release, m3 = PG-Robust-v2 v2-release) the
-script (re)starts the server on --pgdata with that mode's binaries, then for
-every selected query:
+Per mode (m0 = stock PostgreSQL 16.2, m1 = PG-Robust robdp/m1, m3 =
+robdp/m2) the script (re)starts the server on --pgdata with that mode's
+binaries (one data directory serves all three: same catalog version), then
+for every selected query:
   1. one stock EXPLAIN ANALYZE to warm the cache (not recorded),
   2. stock: plan (cost, shape, planning time) and execution, --repeat times,
   3. each robust configuration: EXPLAIN (SUMMARY) for plan, point cost and
      planning time, then EXPLAIN ANALYZE --repeat times unless a plan of the
      same shape was already timed for this query in this mode.
 Execution = median of the --repeat runs; a run that hits --timeout is
-recorded as timeout.
+recorded as timeout.  Mode m0 runs stock only (its configurations are
+ignored).
+
+Paths default to the layout under $ROBDP_HOME (default ~/RobDP):
+install/<m0|m1|m3>/bin (locally install/p0-release and v2-release for m1 and
+m3), data/par2qo-ep/{m3,imdb,pgdata} and PG-PAR2QO/code/data/imdb-new.
 
 Queries: the test set (<q>-0_testing.json, testing_0..199) in id order,
 leaving out every query whose SQL (whitespace-normalized) occurs in the
@@ -25,8 +31,9 @@ and the configurations without running anything.
     python3 m1m3.py --out res.json [--templates 1,2,...] [--per 20] [--repeat 1]
         [--modes m3,m1] [--configs cost0,pen0] [--workload cardinality]
         [--port 55503] [--pgdata DIR] [--timeout 30s] [--samples 20] [--bins 2]
-        [--par 8] [--base_gucs enable_bitmapscan=off]
-Defaults: 8 workers per Gather, no bitmap plans in any run.
+        [--par 8] [--base_gucs enable_bitmapscan=off,geqo=off]
+Defaults: 8 workers per Gather, no bitmap plans and no GEQO in any run, all
+templates but 29.
     python3 m1m3.py --out res.json --report
 """
 import argparse
@@ -39,9 +46,21 @@ import subprocess
 import sys
 import time
 
-HOME = os.path.expanduser('~')
-INSTALL = {'m1': f'{HOME}/RobDP/install/p0-release/bin', 'm3': f'{HOME}/RobDP/install/v2-release/bin'}
-TEMPLATES = '1,2,3,4,5,11,12,13,14,21,22,23,27,28,32,33'   # the templates that use no missing table
+ROOT = os.environ.get('ROBDP_HOME', os.path.expanduser('~/RobDP'))
+
+
+def default_bin(mode):
+    """<ROOT>/install/<mode>/bin, else the local build names of m1 / m3"""
+    legacy = {'m1': 'p0-release', 'm3': 'v2-release'}
+    for name in (mode, legacy.get(mode)):
+        if name and os.path.isdir(f'{ROOT}/install/{name}/bin'):
+            return f'{ROOT}/install/{name}/bin'
+    return f'{ROOT}/install/{mode}/bin'
+
+
+INSTALL = {}   # mode -> bin directory, from --m0_bin / --m1_bin / --m3_bin
+TEMPLATES = ','.join(str(t) for t in range(1, 34) if t != 29)   # 29: its released sample-50.csv is another script's
+LOCAL16 = '1,2,3,4,5,11,12,13,14,21,22,23,27,28,32,33'   # the templates of the laptop's 14-table imdb
 # name: (main objective, retain strategy, retain_path_limit, add_path_limit), as case_job/ep8.py
 CONFIGS = {'cost0': (3, 0, 0, 1), 'cost8': (3, 0, 0, 8), 'pen0': (1, 0, 0, 1),
            'pen8': (1, 1, 8, 1), 'mix8': (1, 14, 8, 1)}
@@ -51,12 +70,12 @@ def norm(sql):
     return ' '.join(sql.split())
 
 
-def select_queries(qdir, w, t, per):
+def select_queries(qdir, w, t, per, released=None):
     d = f'{qdir}/{t}_{w}/raw_data'
     test = json.load(open(f'{d}/{t}_testing.json'))
     train = set()
     for f in (f'{d}/{t}_training_50.json', f'{d}/{t}_training_400.json',
-              f'{HOME}/RobDP/PG-PAR2QO/code/data/imdb-new/{t}_{w}/raw_data/{t}_training_400.json'):
+              f'{released or ROOT + "/PG-PAR2QO/code/data/imdb-new"}/{t}_{w}/raw_data/{t}_training_400.json'):
         if os.path.exists(f):
             train |= set(map(norm, json.load(open(f)).values()))
     out, seen = [], set()
@@ -94,7 +113,7 @@ class Server:
 
     def psql(self, text, timeout=None):
         b = INSTALL[self.mode or 'm3']
-        return subprocess.run([f'{b}/psql', '-h', '/tmp', '-p', str(self.args.port), '-U', 'postgres', '-X', '-q',
+        return subprocess.run([f'{b}/psql', '-h', self.args.host, '-p', str(self.args.port), '-U', self.args.user, '-X', '-q',
                                '-At', '-d', self.args.db], input=text, capture_output=True, text=True,
                               timeout=timeout)
 
@@ -147,7 +166,7 @@ def shape(n):
 def run_query(srv, sql, configs, prof, args):
     srv.explain(sql, '', True)   # warm-up, not recorded
     row, timed = {}, {}
-    for tag in ['pg'] + configs:
+    for tag in ['pg'] + ([] if srv.mode == 'm0' else configs):
         try:
             st = '' if tag == 'pg' else robust_sets(srv.mode, prof, tag, args)
             p = srv.explain(sql, st, False)
@@ -208,17 +227,24 @@ def main():
     ap.add_argument('--modes', default='m3,m1')
     ap.add_argument('--configs', default='cost0,cost8,pen0,pen8')
     ap.add_argument('--workload', default='cardinality')
-    ap.add_argument('--profiles', default=f'{HOME}/RobDP/data/par2qo-ep/m3', help='<dir>/<workload>/<q>-0/')
-    ap.add_argument('--queries', default=f'{HOME}/RobDP/data/par2qo-ep/imdb', help='<dir>/<q>-0_<workload>/raw_data/')
-    ap.add_argument('--pgdata', default=f'{HOME}/RobDP/data/par2qo-ep/pgdata')
-    ap.add_argument('--pglog', default=f'{HOME}/RobDP/data/par2qo-ep/pgdata.log')
+    ap.add_argument('--profiles', default=f'{ROOT}/data/par2qo-ep/m3', help='<dir>/<workload>/<q>-0/')
+    ap.add_argument('--queries', default=f'{ROOT}/data/par2qo-ep/imdb', help='<dir>/<q>-0_<workload>/raw_data/')
+    ap.add_argument('--released', default=f'{ROOT}/PG-PAR2QO/code/data/imdb-new',
+                    help='the released PAR2QO data (its training_400 queries are left out too)')
+    ap.add_argument('--pgdata', default=f'{ROOT}/data/par2qo-ep/pgdata')
+    ap.add_argument('--pglog', default=f'{ROOT}/data/par2qo-ep/pgdata.log')
+    for m in ('m0', 'm1', 'm3'):
+        ap.add_argument(f'--{m}_bin', default=default_bin(m), help=f'bin directory of the {m} installation')
+    ap.add_argument('--host', default='/tmp')
+    ap.add_argument('--user', default='postgres')
     ap.add_argument('--server_opts', default='-c max_worker_processes=16 -c allow_in_place_tablespaces=on')
     ap.add_argument('--port', type=int, default=55503)
     ap.add_argument('--db', default='imdb')
     ap.add_argument('--timeout', default='30s', help='statement_timeout of every timed execution')
     ap.add_argument('--par', default='8', help='max_parallel_workers_per_gather')
-    ap.add_argument('--base_gucs', default='enable_bitmapscan=off',
-                    help='a=b,c=d set for every statement (stock, warm-up and robust); default: no bitmap plans')
+    ap.add_argument('--base_gucs', default='enable_bitmapscan=off,geqo=off',
+                    help='a=b,c=d set for every statement (stock, warm-up and robust); default: no bitmap plans, '
+                         'no GEQO (RobDP\'s join search does not run under GEQO)')
     ap.add_argument('--samples', type=int, default=20)
     ap.add_argument('--bins', type=int, default=2)
     ap.add_argument('--seed', type=int, default=42)
@@ -226,6 +252,7 @@ def main():
     ap.add_argument('--report', action='store_true')
     ap.add_argument('--dry_run', action='store_true')
     args = ap.parse_args()
+    INSTALL.update(m0=args.m0_bin, m1=args.m1_bin, m3=args.m3_bin)
     configs = args.configs.split(',')
     for c in configs:
         if c not in CONFIGS:
@@ -237,11 +264,12 @@ def main():
         return
     res['meta'] = dict(templates=args.templates, per=args.per, repeat=args.repeat, configs=configs,
                        workload=args.workload, samples=args.samples, bins=args.bins, timeout=args.timeout,
-                       par=args.par, base_gucs=args.base_gucs, extra_gucs=args.extra_gucs, profiles=args.profiles)
+                       par=args.par, base_gucs=args.base_gucs, extra_gucs=args.extra_gucs, profiles=args.profiles,
+                       modes=args.modes, bins_dirs={m: INSTALL[m] for m in args.modes.split(',')})
     work = []
     for q in args.templates.split(','):
         t = f'{q}-0'
-        for name, sql in select_queries(args.queries, args.workload, t, args.per):
+        for name, sql in select_queries(args.queries, args.workload, t, args.per, args.released):
             work.append((t, name, sql))
     if args.dry_run:
         for t in args.templates.split(','):
