@@ -451,6 +451,8 @@ ec_graph(PlannerInfo *root)
 	ListCell   *lc;
 	int			allocated = 8;
 
+	if (!robust_ec_forest)
+		return NULL;			/* clause mode: no class is treated as multi-member */
 	if (root->robust_ec_graph != NULL)
 		return root->robust_ec_graph;
 	if (!root->ec_merging_done)

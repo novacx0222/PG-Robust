@@ -2306,3 +2306,27 @@ m2 pen8 的执行总和是 17.84 s，stock 是 15.65 s（同一次运行）。
   - 与 N 无关的固定开销大多也多 0.1–0.2 ms。
   - 这类查询整个规划只要几毫秒，但在逐条几何平均里和大查询同权。冷启动 pen0 按 stock 归一后的 1.16× 主要来自它们；而且归一时除的是 0.2 ms 左右的 stock 规划，噪声也大。
 - 轮内还有一项可以省：joinrel 的行数向量（N 个场景）在每一轮都重新算一遍，而每一轮算出来的都一样。可以按 relids 在轮间缓存。没有做。
+
+## 35. 多成员等价类改用子句模式（`robust_ec_forest`，默认 off）
+
+### 35.1 森林模式的错位
+
+3 个及以上成员的等价类（JOB 里基本就是 movie_id），原来用固定的生成森林：成员按"有 profile 的 pair 数"排序，再用 Kruskal 选边，结果通常是一个星形。X 由 Y、Z 构造时，乘 M(X) / (M(Y)·M(Z))。问题在于这个系数乘在 PG 的选择率上，而 PG 的选择率是按它第一次构造 X 时生成的那一条子句算的：
+
+- PG 只在第一次构造 joinrel 时估计行数（relnode.c 的 `set_joinrel_size_estimates`，之后 `find_join_rel` 直接复用）。
+- 生成哪条子句由 `generate_join_implied_equalities_normal` 决定：JOB 的成员都是可 hash 的普通 Var，第一对就拿满分，即 outer 的第一个成员 = inner 的第一个成员。成员顺序由 WHERE 的书写顺序决定。
+- 同一个三表查询（mc、mi、t 都按 movie_id 连接）只改写法，PG 的估计就从 15.3M 变成 75.4M：用的分别是 `t.id = mi.movie_id`（4.0e-7）和 `mc.movie_id = mi.movie_id`（1.95e-6）。
+
+森林边 e 的乘数 m_e = sel_true_e / sel_est_e，乘到的却是另一条子句 e′ 的估计上。在 16 个本地模板上，把森林和其他生成树的估计乘积相比：3 个成员差到 10^0.7–0.8，4 个成员 10^1.4–1.6，T22（5 个成员）10^2.1。也就是说即使 profile 完全准，森林模式也给不出真实行数。
+
+profile 本身没有问题：17 个多成员等价类的 42 条森林边全是 SQL 里显式写出的连接，并且都有 profile；86 个有 profile 的 pair，m3 算出的 sel_est 都在 profile est 中位数的 2 倍以内。
+
+### 35.2 子句模式
+
+`robust_ec_forest = off`（现在的默认）时，`ec_graph()` 返回 NULL，等价类生成的子句和其他连接子句一样，按两端实例归成 pair querylet：每个 joinrel 取的是 PG 在第一次构造它时用的那条子句的 profile，误差乘回的正是它测量时对应的估计。这和 m1（v20）以及 PAR2QO 的做法一致。PAR2QO（`prep_selectivity.py`）对"单表 ⋈ 一组表"也只取一条边，注入该边修正后的选择率；它按表的编号挑边，PG 按成员顺序挑，两者常常是同一条，但不保证。
+
+- 子句模式下，每个第一次构造的 joinrel，其 querylet 估计的乘积都等于 PG 当层的 jselec（T5 14/14，T22 399/399；T23 是 342/399，其余的含没有 profile 的子句）。
+- 零误差 profile：子句模式、森林模式和 m1 的计划相同。T22 上三者都比 stock 便宜 0.08%（PG 的 add_path 有 1% 的模糊剪枝），不是 EC 的问题。
+- `robust_ec_forest = on` 保留原来的森林模式。S4–S9 的检查脚本是按森林写的，现在显式设 on。子句模式走的是双成员等价类本来就有的子句路径。
+
+缺点：用哪条边仍由第一次构造 joinrel 的那一对输入和成员顺序决定，所以同一查询换种写法，误差场景会变；GEQO 下还要看染色体。一个 k 成员的类只用到 PG 那棵树上的 k−1 条边。

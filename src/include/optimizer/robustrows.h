@@ -81,6 +81,17 @@ typedef struct RobustQuerylet
  * counts once), and a relation of sets X built from inputs Y, Z gets the
  * factor M(X) / (M(Y) M(Z)), which depends on X, Y and Z only.  Member pairs
  * without a profile have multiplier 1.
+ *
+ * This is used with robust_ec_forest on.  By default (off: clause mode, as
+ * v20 and PAR2QO) the classes get no forests: the clause PostgreSQL
+ * generates between the two sides of a join is a join querylet like any
+ * other, so a join relation's errors are those of the member pairs its
+ * first-built pair's clauses join, the same clauses PostgreSQL's estimate
+ * of it uses.  A forest edge's multiplier m = sel_true / sel_est of its own
+ * pair instead scales PostgreSQL's estimate of whichever clause the first
+ * pair generated, whose sel_est can differ by 5x (t.id = x.movie_id against
+ * x.movie_id = y.movie_id on JOB), so a perfect profile would not give the
+ * true row count.
  */
 typedef struct RobustECGraph RobustECGraph;
 

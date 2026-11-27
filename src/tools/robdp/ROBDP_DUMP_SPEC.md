@@ -24,7 +24,7 @@ Formatting rules:
 
 | `ev` | Emitted when | Fields |
 |---|---|---|
-| `query` | `standard_planner` starts (S1) | `enabled`, `N`, `seed`, `bins`, `bandwidth`, `profile_path` |
+| `query` | `standard_planner` starts (S1) | `enabled`, `N`, `seed`, `bins`, `bandwidth`, `profile_path`, `ec_forest` |
 | `profile` | a profile is loaded or reloaded (S2) | `key`, `path`, `n` (valid points), `skipped` (invalid lines), `bins`: list of `{first, n, lo, hi, mean, sd, h}` |
 | `draw` | a querylet's samples are drawn (S3) | `key` (profile key), `inst` (instance key), `seed` (16 hex digits), `sel_est`, `bin`, `h` (bandwidth used), `x` (list of N) |
 | `rel` | a rel gets its row vector (S4/S5) | `pass`, `rels`, `kind` (`base`/`join`/`append`/`other`), `tuples`, `sel_est` (base/other only), `querylets` (list of `{key, inst, sel_est, bin}`, only those with a profile), `children` (append only: the live children's rels, in summation order), `rows_point`, `rows` (list of 1 or N), `pair` (join only: `[outer rels, inner rels]` of the pair that built it) |

@@ -157,7 +157,7 @@ U2_CASES = [
 
 def planning(sql, pdir, install, extra=()):
     q = ''.join('SET %s;\n' % s for s in extra)
-    q += ("SET enable_rows_dist=on; SET robust_search=off; SET error_profile_path='%s'; SET error_sample_count=1;\n"
+    q += ("SET enable_rows_dist=on; SET robust_ec_forest=on; SET robust_search=off; SET error_profile_path='%s'; SET error_sample_count=1;\n"
           "SET error_sample_kde_bandwidth=0; SET robust_debug_dump=on; SET client_min_messages=log;\n"
           "EXPLAIN %s;\n" % (pdir, sql))
     _, err = common.psql(q, install, on_error_stop=False)

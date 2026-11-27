@@ -255,7 +255,7 @@ def j6(install):
         for jt, tmpl, alias, thr in J6_CASES:
             q_scn = tmpl.format(thr=thr)
             q_stock = tmpl.format(thr=int(round(thr * K)))
-            sql = ("SET enable_rows_dist=on; SET robust_search=off; SET error_profile_path='%s'; SET error_sample_count=1;\n"
+            sql = ("SET enable_rows_dist=on; SET robust_ec_forest=on; SET robust_search=off; SET error_profile_path='%s'; SET error_sample_count=1;\n"
                    "SET robust_debug_dump=on; SET client_min_messages=log;\nEXPLAIN %s;\n"
                    "RESET robust_debug_dump; RESET client_min_messages; RESET enable_rows_dist;\n"
                    "EXPLAIN (FORMAT JSON) %s;\nEXPLAIN (FORMAT JSON) SELECT * FROM %s WHERE b < %d;\n"
@@ -355,7 +355,7 @@ def j9(install):
         for key, m in mult.items():
             with open(os.path.join(pdir, key + '.txt'), 'w') as f:
                 f.write('%r 0.01\n' % (0.01 * m))
-        out, err = common.psql("SET enable_rows_dist=on; SET robust_search=off; SET error_profile_path='%s'; SET error_sample_count=1;"
+        out, err = common.psql("SET enable_rows_dist=on; SET robust_ec_forest=on; SET robust_search=off; SET error_profile_path='%s'; SET error_sample_count=1;"
                                "SET error_sample_kde_bandwidth=0; SET robust_debug_dump=on;"
                                "SET client_min_messages=log;\nEXPLAIN %s;\n" % (pdir, sql),
                                install, on_error_stop=False)

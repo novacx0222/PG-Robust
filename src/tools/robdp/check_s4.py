@@ -88,10 +88,13 @@ def robust_sets(prof_dir, N=20, bw=0.0, seed=42, bins=2, debug=True, search=Fals
     """settings for robust planning; the S4..S6 gates check the rows and costs
     PostgreSQL's own join search gives (robust_search off), S7 on.  'more'
     goes before the dump settings: a setting after client_min_messages = log
-    is a query whose planning is dumped (and taken for the first one)"""
+    is a query whose planning is dumped (and taken for the first one).
+    The gates check the spanning forests of the multi-member equivalence
+    classes, so robust_ec_forest is on (its default is clause mode)"""
     s = ['enable_rows_dist=on', 'error_sample_count=%d' % N, 'error_bin_count=%d' % bins,
          'error_sample_seed=%d' % seed, 'error_sample_kde_bandwidth=%r' % bw,
-         'error_profile_path=' + prof_dir, 'robust_search=%s' % ('on' if search else 'off')] + list(more)
+         'error_profile_path=' + prof_dir, 'robust_search=%s' % ('on' if search else 'off'),
+         'robust_ec_forest=on'] + list(more)
     if debug:
         s += ['robust_debug_dump=on', 'client_min_messages=log']
     return s

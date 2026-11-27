@@ -1101,6 +1101,19 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"robust_ec_forest", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Applies the errors of equivalence classes with 3 or more member relations through spanning forests."),
+			gettext_noop("When off (clause mode, the default), the clause PostgreSQL generates from such a class "
+						 "at a join is a join querylet like any other: the join gets the errors of the member pair "
+						 "that clause joins, as for the classes with 2 members, so each error multiplies the "
+						 "estimate it was measured against (optimizer/robustrows.h)."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&robust_ec_forest,
+		false,
+		NULL, NULL, NULL
+	},
+	{
 		{"robust_debug_check_costs", PGC_USERSET, DEVELOPER_OPTIONS,
 			gettext_noop("Checks RobDP's vector costing of join paths against the replay of PostgreSQL's cost functions."),
 			gettext_noop("Every join path costed by the vector functions is replayed as well, and a difference in any "
