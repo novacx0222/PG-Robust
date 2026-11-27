@@ -67,6 +67,9 @@ int read_error_profile(
         }
         if (result == 2) {
             if (sample_count >= EP_MAX_SAMPLE) {
+                /* RobDP: was a silent break */
+                elog(WARNING, "error profile %s has more than %d points, the rest are ignored",
+                     filename, EP_MAX_SAMPLE);
                 break;
             }
             sel_true = clamp01(sel_true);

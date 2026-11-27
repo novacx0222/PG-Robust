@@ -9,7 +9,12 @@
 #include "nodes/pathnodes.h"
 #include "optimizer/sample.h"
 
-#define EP_MAX_SAMPLE     1024
+/*
+ * Points read per profile (RobDP: was 1024; the regenerated PAR2QO profiles
+ * have up to 50 x 50 = 2500, and read_error_profile used to drop the rest
+ * silently).  ErrorProfile is about 24 bytes per point, cached per backend.
+ */
+#define EP_MAX_SAMPLE     4096
 #define EP_MAX_BIN        8
 
 /* Forward Declarations */
