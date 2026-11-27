@@ -1089,6 +1089,18 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"robust_projected_rounds", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Costs the paths of RobDP's envelope rounds in the round's scenario as they are built."),
+			gettext_noop("PostgreSQL's cost functions apply the round's querylet multipliers themselves, and no "
+						 "path of a round is replayed (optimizer/robustcost.h).  When off, each path is costed "
+						 "at the point and then replayed in the round's scenario."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&robust_projected_rounds,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"robust_debug_check_costs", PGC_USERSET, DEVELOPER_OPTIONS,
 			gettext_noop("Checks RobDP's vector costing of join paths against the replay of PostgreSQL's cost functions."),
 			gettext_noop("Every join path costed by the vector functions is replayed as well, and a difference in any "

@@ -480,6 +480,8 @@ dump_envelope(RobustSearch *rs)
 	robust_dump_int(&d, "mismatch", counts[ROBUST_COST_MISMATCH]);
 	robust_dump_int(&d, "unsupported", counts[ROBUST_COST_UNSUPPORTED]);
 	robust_dump_int(&d, "nocontext", counts[ROBUST_COST_NOCONTEXT]);
+	robust_dump_int(&d, "projected", counts[ROBUST_COST_PROJECTED]);
+	robust_dump_int(&d, "flips", robust_cost_round_flips());
 	robust_dump_end(&d);
 }
 
@@ -582,6 +584,7 @@ robust_round_begin(RobustSearch *rs, int s)
 	reset_rinfos(rs);
 	foreach(lc, rs->view_rels)
 		view_rel(rs, (RelOptInfo *) lfirst(lc), s);
+	robust_cost_round_project(s);
 	foreach(lc, rs->initial_rels)
 		record(rs, (RelOptInfo *) lfirst(lc), 1, false);
 }
@@ -601,6 +604,7 @@ robust_round_record(RobustSearch *rs, RelOptInfo *rel)
 void
 robust_round_end(RobustSearch *rs)
 {
+	robust_cost_round_project(-1);
 	unview(rs);
 	robust_cost_search_restore(rs->cost_save);
 	rs->round = -1;

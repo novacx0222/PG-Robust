@@ -32,6 +32,7 @@ extern PGDLLIMPORT bool robust_envelope;
 extern PGDLLIMPORT bool robust_select_dedup;
 extern PGDLLIMPORT bool robust_select_precheck;
 extern PGDLLIMPORT bool robust_vector_cost;
+extern PGDLLIMPORT bool robust_projected_rounds;
 extern PGDLLIMPORT bool robust_debug_check_costs;
 extern PGDLLIMPORT bool robust_gather_all;
 extern PGDLLIMPORT bool robust_select;

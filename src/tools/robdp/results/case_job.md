@@ -2197,3 +2197,112 @@ m2 pen8 的执行总和是 17.84 s，stock 是 15.65 s（同一次运行）。
   - 不带 robust 设置时，215 个测试全部通过；
   - robust 模式（E[Pen]×8，lognormal profile，并行 4）下 17 个失败，都是计划不同造成的预期差异；debug 构建里没有 TRAP，也没有 RobDP 的报错。
 - 130 条 × 4 个配置，完全不设 `robust_join_pairing`：计划（形状和代价）与第 32.3 节显式设 native 的结果 650/650 相同。
+
+## 34. projected envelope rounds（`robust_projected_rounds`，默认 on）
+
+第 32.5 节：m3 的一轮 envelope 是 stock 一次规划的 1.48 倍，m1 是 1.10 倍。差别在于 m3 的每条轮内路径都先按点估计算一遍代价，再在本轮场景里 replay。
+
+### 34.1 做法
+
+一轮开始时，关系的 rows、ppi 的 rows、level-1 关系的路径代价已经投影到本轮场景 s（`view_rel`）。在这个视图下，PostgreSQL 的代价函数在轮内直接算出的代价，和 replay 在 s 里算的只差一点：连接代价函数自己做的估计还没乘乘子。这样的估计只有两处：
+- **`approx_tuple_count`**（merge 和 hash 子句的元组数）：
+  - 新钩子 `robust_project_qual_selec` 按本轮场景乘上这些子句碰到的 querylet 的乘子；
+  - 乘法的顺序和 replay 相同：两边都用 `touched_product`，`touched_mult` 也改成调用它。
+- **semi-join factors**：
+  - `robust_cost_join_context` 把 `add_paths_to_joinrel` 传给各条路径的 `extra.semifactors` 换成本轮场景的值；
+  - 这个值来自 `compute_semifactors`，和 replay 用的是同一个。
+
+其余输入，比如 bucket 统计、Memoize 的 ndistinct、输入路径的代价，在视图下已经是 s 的值。replay 在 s 和在点上读到的是同一个值。
+
+于是轮内的 `compute()` 不再 replay，路径状态记为 `projected`：
+- index 和 bitmap heap 路径照旧 replay，因为它们的代价函数自己估计索引选择率；
+- 轮内只有 `reparameterize_path` 给 Append 建子路径时才会出现这两类路径，JOB 上没有。
+
+`robust_projected_rounds = off` 保留旧做法。envstat 多了两项：`projected`（投影的路径数）和 `flips`（见 34.2，只在校验打开时计数）。
+
+### 34.2 计算能不能保证完全正确
+
+**逐条路径逐位相同，有校验。** `robust_debug_check_costs` 打开时，每条投影出来的轮内路径都再按旧做法算一遍，和投影的代价逐位比较，不同就报 ERROR：
+- 非连接路径：直接跑旧做法的 replay。
+- 连接路径：在本轮场景 s 里 replay。旧做法的点检查要用没乘乘子的代价，投影后已经没有这个值了。
+
+结果：
+- JOB 130 条 × {pen0, pen8}：4890 万条轮内路径，没有一条不同。
+- `make check`（robust 模式，debug 构建，校验默认打开）：没有报错。结果文件与改动前逐个相同（17 个预期的计划差异）；不带 robust 设置时 215 个全过。
+- S6–S10 gate（release，`robust_debug_check_costs=on`）全部通过，没有报错。其中 K4 是独立的对照：单点 profile 把一个过滤条件放大 K 倍，C*(U, 0) 等于 stock PostgreSQL 对放大后查询的最便宜代价。不过 K4 只放大基表的过滤条件，碰不到本节的两个钩子。
+
+**校验确实能抓到错。** debug 构建上的两个变异：
+
+| 变异 | make check 报错数 | JOB 规划报错 |
+|---|---|---|
+| qual 乘子取错场景（s + 1） | 291 | 16/16 |
+| semi factors 不投影 | 49 | 16/16 |
+
+- 第二个变异的第一处报错只差最后一位：64706.077115998334 对 64706.077115998341。
+
+**唯一有意的不同：merge join 的 `materialize_inner`。**
+- PostgreSQL 按 rescanratio 决定物化与否。rescanratio 来自 `approx_tuple_count`，所以这个选择和乘子有关。
+- 旧做法在没乘乘子时做选择，replay 保留这个选择，只重算代价。
+- 投影在场景 s 里做选择，也就是 PostgreSQL 在 s 里自己会做的选择。
+- 投影的选择在 s 里的代价不会高于旧的选择：
+  - PostgreSQL 的判断就是在物化和不物化里取便宜的；
+  - 强制物化的几种情况和乘子无关，两边相同。
+- 校验对每条选择不同的路径都验证了这一点。JOB 上有 22,856 条，全部成立。
+
+**对 envelope 和计划的影响**（130 × {pen0, pen8}，和 off 比）：
+- envelope 不同的规划共 28 次（260 次中），每一次都有选择不同的路径。
+  - 没有选择不同的 76 次规划，envelope 全部逐位相同；
+  - 另有 156 次规划虽有选择不同，envelope 仍然相同。
+- 不同的 envelope 值共 2510 个：
+  - 2492 个更低，最多低 5.8%（21-0_testing_20）；
+  - 18 个更高，都在 1% 以内（最多 +0.996%）。原因是 `add_path` 的 1% fuzz：更便宜的路径进来以后，可能挤掉一条代价在 1% 以内、但 pathkeys 更好的路径。
+- 计划：dump 比较中 520/520 相同（cost0、cost8、pen0、pen8）；冷启动规划中 pen0 和 pen8 也是 130/130 相同。
+
+**旧做法没有被改动。**
+- 重构把 `touched_mult`、`join_setup`、`memo_setup` 拆成了函数。
+- 重构后，off 与上一个提交 e7bd5f8403b 相比，520 次规划的 envelope、其余所有 dump 行和计划都逐位相同。
+- `make check` 的 robust 模式结果也与之前完全相同。
+
+**结论**：
+- 每条轮内路径的代价，就是主 pass 用的同一个代价模型在场景 s 下的值，逐位相同。校验覆盖了每一条路径，变异测试说明校验有效。
+- 和旧做法只差 merge join 的物化选择这一处，这一处是旧做法偏离了 PostgreSQL 在 s 里会做的选择。
+- 想要和旧做法逐位相同，可以设 `robust_projected_rounds = off`。
+
+### 34.3 规划时间
+
+**每轮的成本**（测法同第 32.5 节：13 条查询，最大并行，同一会话热规划，取 EXPLAIN 第 2–5 次的中位数；每轮的成本 = E[Pen]×1 的斜率减去 E[Cost]×1 的斜率，斜率都是 (N=20 − N=4) / 16）：
+
+| 查询 | stock 一次规划 | 旧做法每轮 | 投影每轮 | m1 每轮（第 32.5 节） |
+|---|---|---|---|---|
+| 11-0_testing_7 | 1.5 ms | 1.89 ms | 1.44 ms | 1.34 ms |
+| 13-0_testing_11 | 2.3 ms | 3.43 ms | 2.54 ms | 2.37 ms |
+| 21-0_testing_20 | 3.9 ms | 4.94 ms | 3.90 ms | 3.73 ms |
+| 22-0_testing_2 | 9.4 ms | 15.58 ms | 11.22 ms | 11.48 ms |
+| 23-0_testing_16 | 9.9 ms | 15.48 ms | 11.38 ms | 11.03 ms |
+
+- stock 一次规划 ≥ 1 ms 的 7 条，每轮除以 stock 一次规划的几何平均：旧做法 1.48，与第 32.5 节相同；投影 1.09；m1 1.10。
+- E[Pen]×1、N = 20 的热规划时间，13 条逐条 on / off 的几何平均为 0.78。
+
+**130 条冷启动**（同第 32.3 节的测法，每个配置各开一次新会话，同一时段里 off 和 on 交替运行）：
+
+| 配置 | off 中位数 / 总和 | on 中位数 / 总和 | 逐条 on / off | m1 中位数 / 总和（第 32.3 节） |
+|---|---|---|---|---|
+| pen0 | 46.3 ms / 11.57 s | 35.8 ms / 8.94 s | 0.79× | 36.5 ms / 9.76 s |
+| pen8 | 58.3 ms / 14.67 s | 48.4 ms / 12.04 s | 0.84× | 63.0 ms / 16.87 s |
+
+- 逐条和 m1 比：pen0 0.98×，pen8 0.79×。
+- 这次 stock 比 m1 那次快约 8%（中位数 2.2 对 2.4 ms）。逐条除以各自那次的 stock 后：pen0 1.16×，pen8 0.93×。
+- cost0 和 cost8 不跑 envelope 轮，不受影响：中位数 7.6 和 16.9 ms，第 32.3 节是 7.6 和 17.1 ms。
+
+数据：scratchpad 的 `pt_proj.json`（每轮成本）、`plan_proj.json`（130 条冷启动）、`pr_{base,off,on,onchk,offchk}.json`（dump 比较）。
+
+### 34.4 剩下的
+
+- stock 规划 ≥ 1 ms 的查询上，投影后一轮的成本与 m1 持平；最大的两条热规划（E[Pen]×1，N = 20）已经比 m1 快：
+  - 22-0_testing_2：272.8 对 285.6 ms；
+  - 23-0_testing_16：266.7 对 273.7 ms。
+- 剩下的差距在小查询上（stock 规划 0.1–0.4 ms 的 6 条）：
+  - 每轮 0.07–0.30 ms，m1 是 0.05–0.25 ms；
+  - 与 N 无关的固定开销大多也多 0.1–0.2 ms。
+  - 这类查询整个规划只要几毫秒，但在逐条几何平均里和大查询同权。冷启动 pen0 按 stock 归一后的 1.16× 主要来自它们；而且归一时除的是 0.2 ms 左右的 stock 规划，噪声也大。
+- 轮内还有一项可以省：joinrel 的行数向量（N 个场景）在每一轮都重新算一遍，而每一轮算出来的都一样。可以按 relids 在轮间缓存。没有做。

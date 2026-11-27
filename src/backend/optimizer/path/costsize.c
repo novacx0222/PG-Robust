@@ -5023,9 +5023,11 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
 		selec *= clause_selectivity(root, qual, 0, JOIN_INNER, &sjinfo);
 	}
 
-	/* RobDP: in the error scenario being replayed */
+	/* RobDP: in the error scenario being replayed, or of a projected round */
 	if (unlikely(robust_replay != NULL))
 		selec = robust_replay_qual_selec(quals, selec);
+	else if (unlikely(robust_project_s >= 0))
+		selec = robust_project_qual_selec(root, path, quals, selec);
 
 	/* Apply it to the input relation sizes */
 	tuples = selec * outer_tuples * inner_tuples;

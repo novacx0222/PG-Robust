@@ -272,7 +272,11 @@ add_paths_to_joinrel(PlannerInfo *root,
 									   jointype, sjinfo, restrictlist,
 									   &extra.semifactors);
 
-	/* RobDP: what the replay of this join's paths needs besides the paths */
+	/*
+	 * RobDP: what the replay of this join's paths needs besides the paths
+	 * (in a projected envelope round, the semi-join factors become the
+	 * round's)
+	 */
 	if (enable_rows_dist)
 		robust_cost_join_context(root, joinrel, outerrel, innerrel, jointype,
 								 sjinfo, restrictlist, extra.inner_unique,

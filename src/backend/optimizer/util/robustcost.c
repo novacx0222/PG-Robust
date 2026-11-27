@@ -45,6 +45,7 @@
 #include "utils/selfuncs.h"
 
 RobustReplayHooks *robust_replay = NULL;
+int			robust_project_s = -1;
 
 static RobustReplayHooks hooks;
 static const Path *replay_path = NULL;	/* the path a replay is for */
@@ -57,6 +58,7 @@ static double scenario_rel_rows(const RelOptInfo *rel);
 static bool scenario_enter(void);
 static void scenario_leave(bool entered);
 static const char *path_type_name(Path *path);
+static void compute_semifactors(void);
 
 /*
  * The join add_paths_to_joinrel() is building paths for: what the cost
@@ -109,6 +111,7 @@ typedef struct CostState
 	const Path *outer_replay_path;
 	int			outer_replay_s;
 	struct Replay *outer_vec_R;
+	int			outer_project_s;
 	RelOptInfo *prows_rel;		/* add_paths_to_append_rel's partial_rows */
 	Path	   *prows_path;		/* came from this path of prows_rel */
 	List	   *append_paths;	/* Appends given their rows, and */
@@ -122,8 +125,11 @@ typedef struct CostState
 	List	   *ordered_limits; /* OrderedLimits */
 	bool		varies;			/* some row count or cost differs from the
 								 * point estimate in some scenario */
-	int			round_counts[ROBUST_COST_NOCONTEXT + 1];	/* statuses of
+	int			round_counts[ROBUST_COST_PROJECTED + 1];	/* statuses of
 															 * envelope paths */
+	int			round_flips;	/* projected merge joins whose
+								 * materialize_inner the replay would not
+								 * choose (robust_debug_check_costs) */
 } CostState;
 
 static CostState *st = NULL;
@@ -211,7 +217,8 @@ robust_cost_begin_query(void)
 {
 	CostState  *saved = st;
 
-	Assert(saved != NULL || (robust_replay == NULL && vec_R == NULL));
+	Assert(saved != NULL ||
+		   (robust_replay == NULL && vec_R == NULL && robust_project_s < 0));
 	st = palloc0(sizeof(CostState));
 	st->cxt = CurrentMemoryContext;
 	st->outer_replay = robust_replay;
@@ -219,10 +226,12 @@ robust_cost_begin_query(void)
 	st->outer_replay_path = replay_path;
 	st->outer_replay_s = replay_s;
 	st->outer_vec_R = vec_R;
+	st->outer_project_s = robust_project_s;
 	robust_replay = NULL;
 	replay_path = NULL;
 	replay_s = -1;
 	vec_R = NULL;
+	robust_project_s = -1;
 	return saved;
 }
 
@@ -243,6 +252,7 @@ robust_cost_end_query(void *saved)
 		replay_path = cur->outer_replay_path;
 		replay_s = cur->outer_replay_s;
 		vec_R = cur->outer_vec_R;
+		robust_project_s = cur->outer_project_s;
 		if (cur->scratch != NULL)
 		{
 			/* (after an error inside a replay, we may still be in it) */
@@ -284,12 +294,19 @@ robust_cost_set_root(PlannerInfo *root)
 		st->root = root;
 }
 
+/*
+ * robust_cost_join_context
+ *		add_paths_to_joinrel() is to build the paths of a join, the semi-join
+ *		factors (*semifactors, if any) computed.  In a projected envelope
+ *		round they become the round's, those a replay of the paths in the
+ *		round's scenario reads (replay(): the same condition, st->varies).
+ */
 void
 robust_cost_join_context(PlannerInfo *root, RelOptInfo *joinrel,
 						 RelOptInfo *outerrel, RelOptInfo *innerrel,
 						 JoinType jointype, SpecialJoinInfo *sjinfo,
 						 List *restrictlist, bool inner_unique,
-						 const SemiAntiJoinFactors *semifactors)
+						 SemiAntiJoinFactors *semifactors)
 {
 	if (st == NULL)
 		return;
@@ -306,6 +323,14 @@ robust_cost_join_context(PlannerInfo *root, RelOptInfo *joinrel,
 	jcx.has_semi = jointype == JOIN_SEMI || jointype == JOIN_ANTI || inner_unique;
 	if (jcx.has_semi)
 		jcx.semifactors = *semifactors;
+
+	if (jcx.has_semi && robust_project_s >= 0 && st->varies)
+	{
+		Assert(root->robust_pass == ROBUST_PASS_ENVELOPE &&
+			   root->robust_round == robust_project_s);
+		compute_semifactors();
+		*semifactors = jcx.sf[robust_project_s];
+	}
 }
 
 /*
@@ -430,6 +455,7 @@ robust_cost_search_save(void)
 		}
 	}
 	memset(st->round_counts, 0, sizeof(st->round_counts));
+	st->round_flips = 0;
 	return cs;
 }
 
@@ -471,9 +497,28 @@ robust_cost_search_restore(void *save)
 const int *
 robust_cost_round_counts(void)
 {
-	static const int zero[ROBUST_COST_NOCONTEXT + 1];
+	static const int zero[ROBUST_COST_PROJECTED + 1];
 
 	return st ? st->round_counts : zero;
+}
+
+/* The envelope pass's merge joins whose choice the replay would not make */
+int
+robust_cost_round_flips(void)
+{
+	return st ? st->round_flips : 0;
+}
+
+/*
+ * robust_cost_round_project
+ *		Envelope round s starts (-1: it ends).  With robust_projected_rounds
+ *		on, the round's paths are costed in s as they are built.
+ */
+void
+robust_cost_round_project(int s)
+{
+	robust_project_s = (s >= 0 && st != NULL && robust_projected_rounds) ?
+		s : -1;
 }
 
 /* ------------------------------------------------- caches of estimates */
@@ -1366,17 +1411,15 @@ clause_querylet(PlannerInfo *root, RestrictInfo *rinfo, List *qs)
 }
 
 /*
- * The product of the multipliers of the querylets in qs that the clauses
- * (RestrictInfos) touch, each counted once, in the order of qs; NULL if
- * none is touched.
+ * Which querylets in qs the clauses (RestrictInfos) touch, by position in
+ * qs; NULL if none.
  */
-static RobustVec *
-touched_mult(PlannerInfo *root, List *clauses, List *qs)
+static bool *
+touched_querylets(PlannerInfo *root, List *clauses, List *qs)
 {
 	int			nq = list_length(qs);
 	bool	   *touched;
 	bool		any = false;
-	RobustVec  *m;
 	ListCell   *lc;
 
 	if (nq == 0)
@@ -1405,18 +1448,40 @@ touched_mult(PlannerInfo *root, List *clauses, List *qs)
 		pfree(touched);
 		return NULL;
 	}
+	return touched;
+}
+
+/* The product of the touched querylets' multipliers in scenario s */
+static inline double
+touched_product(List *qs, const bool *touched, int s)
+{
+	double		f = 1.0;
+	ListCell   *lc;
+
+	foreach(lc, qs)
+	{
+		if (touched[foreach_current_index(lc)])
+			f = f * robust_vec_at(((RobustQuerylet *) lfirst(lc))->mult, s);
+	}
+	return f;
+}
+
+/*
+ * The product of the multipliers of the querylets in qs that the clauses
+ * (RestrictInfos) touch, each counted once, in the order of qs; NULL if
+ * none is touched.
+ */
+static RobustVec *
+touched_mult(PlannerInfo *root, List *clauses, List *qs)
+{
+	bool	   *touched = touched_querylets(root, clauses, qs);
+	RobustVec  *m;
+
+	if (touched == NULL)
+		return NULL;
 	m = robust_vec_make(error_sample_count);
 	for (int s = 0; s < m->n; s++)
-	{
-		double		f = 1.0;
-
-		foreach(lc, qs)
-		{
-			if (touched[foreach_current_index(lc)])
-				f = f * robust_vec_at(((RobustQuerylet *) lfirst(lc))->mult, s);
-		}
-		m->v[s] = f;
-	}
+		m->v[s] = touched_product(qs, touched, s);
 	pfree(touched);
 	return m;
 }
@@ -1488,6 +1553,48 @@ join_path_querylets(PlannerInfo *root, JoinPath *jp, SpecialJoinInfo *sjinfo)
 		}
 		return qs;
 	}
+}
+
+/*
+ * robust_project_qual_selec
+ *		approx_tuple_count's selectivity of a merge or hash join's clauses,
+ *		in a projected envelope round: scaled as the replay of the path in
+ *		the round's scenario scales it (replay(), robust_replay_qual_selec),
+ *		or as built where that replay keeps the scalars (nothing varies, or
+ *		the path is not of the join being built).
+ */
+Selectivity
+robust_project_qual_selec(PlannerInfo *root, JoinPath *path, List *quals,
+						  Selectivity sel)
+{
+	double		m = 1.0;
+	double		p;
+
+	if (st == NULL || !st->varies || !jcx.valid || jcx.root != root ||
+		jcx.joinrel != path->path.parent ||
+		path->outerjoinpath->parent != jcx.outerrel ||
+		path->innerjoinpath->parent != jcx.innerrel)
+		return sel;
+	Assert(root->robust_pass == ROBUST_PASS_ENVELOPE &&
+		   root->robust_round == robust_project_s);
+	Assert((IsA(path, MergePath) &&
+			quals == ((MergePath *) path)->path_mergeclauses) ||
+		   (IsA(path, HashPath) &&
+			quals == ((HashPath *) path)->path_hashclauses));
+	if (quals != NIL)
+	{
+		List	   *qs = join_path_querylets(root, path, jcx.sjinfo);
+		bool	   *touched = touched_querylets(root, quals, qs);
+
+		if (touched != NULL)
+		{
+			m = touched_product(qs, touched, robust_project_s);
+			pfree(touched);
+		}
+	}
+	p = sel * m;
+	CLAMP_PROBABILITY(p);
+	return p;
 }
 
 /* -------------------------------------------------- semi-join factors */
@@ -3916,6 +4023,72 @@ vector_join(Replay *R, RobustPathCost *rc, bool round)
 	return true;
 }
 
+static inline bool
+is_join_path(Path *path)
+{
+	return IsA(path, NestPath) || IsA(path, MergePath) || IsA(path, HashPath);
+}
+
+/*
+ * What the replay of a join path reads besides its inputs: the semi-join
+ * factors of its join, and the multiplier of the clauses approx_tuple_count
+ * is given.  False if the path is not of the join being built.
+ */
+static bool
+join_setup(Replay *R, RobustPathCost *rc)
+{
+	PlannerInfo *root = R->root;
+	Path	   *path = R->path;
+	JoinPath   *jp = (JoinPath *) path;
+
+	if (!jcx.valid || jcx.root != root || jcx.joinrel != path->parent ||
+		jp->outerjoinpath->parent != jcx.outerrel ||
+		jp->innerjoinpath->parent != jcx.innerrel)
+		return false;
+	if (jcx.has_semi && jcx.sf == NULL)
+		compute_semifactors();
+	rc->semi_frozen = jcx.sf_frozen;
+	if (IsA(path, MergePath))
+		R->quals = ((MergePath *) path)->path_mergeclauses;
+	else if (IsA(path, HashPath))
+		R->quals = ((HashPath *) path)->path_hashclauses;
+	if (R->quals != NIL)
+		R->qual_mult = touched_mult(root, R->quals,
+									join_path_querylets(root, jp, jcx.sjinfo));
+	return true;
+}
+
+/*
+ * A nested loop over a Memoize: cost_memoize_rescan overwrites the
+ * Memoize's est_entries, and is to read the param_exprs it was costed with
+ * (memo_restore() puts both back)
+ */
+static void
+memo_setup(Replay *R)
+{
+	Path	   *path = R->path;
+	MemoizePath *mp;
+
+	if (!IsA(path, NestPath) ||
+		!IsA(((JoinPath *) path)->innerjoinpath, MemoizePath))
+		return;
+	mp = (MemoizePath *) ((JoinPath *) path)->innerjoinpath;
+	R->memo = mp;
+	R->memo_entries = mp->est_entries;
+	R->memo_exprs = mp->param_exprs;
+	mp->param_exprs = memo_costed_exprs(mp);
+}
+
+static void
+memo_restore(Replay *R)
+{
+	if (R->memo)
+	{
+		R->memo->est_entries = R->memo_entries;
+		R->memo->param_exprs = R->memo_exprs;
+	}
+}
+
 static void
 replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 {
@@ -3981,28 +4154,14 @@ replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 		return;
 	}
 
-	R.join = IsA(path, NestPath) || IsA(path, MergePath) || IsA(path, HashPath);
+	R.join = is_join_path(path);
 	if (R.join)
 	{
-		JoinPath   *jp = (JoinPath *) path;
-
-		if (!jcx.valid || jcx.root != root || jcx.joinrel != path->parent ||
-			jp->outerjoinpath->parent != jcx.outerrel ||
-			jp->innerjoinpath->parent != jcx.innerrel)
+		if (!join_setup(&R, rc))
 		{
 			rc->status = ROBUST_COST_NOCONTEXT;
 			return;
 		}
-		if (jcx.has_semi && jcx.sf == NULL)
-			compute_semifactors();
-		rc->semi_frozen = jcx.sf_frozen;
-		if (IsA(path, MergePath))
-			R.quals = ((MergePath *) path)->path_mergeclauses;
-		else if (IsA(path, HashPath))
-			R.quals = ((HashPath *) path)->path_hashclauses;
-		if (R.quals != NIL)
-			R.qual_mult = touched_mult(root, R.quals,
-									   join_path_querylets(root, jp, jcx.sjinfo));
 	}
 	else if (IsA(path, IndexPath))
 		R.index_mult = touched_mult(root, index_rinfos((IndexPath *) path),
@@ -4024,19 +4183,7 @@ replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 		IsA(path, UpperUniquePath) || IsA(path, SetOpPath))
 		groups_setup(&R, path);
 
-	if (IsA(path, NestPath) && IsA(((JoinPath *) path)->innerjoinpath, MemoizePath))
-	{
-		/*
-		 * cost_memoize_rescan overwrites the Memoize's est_entries, and is to
-		 * read the param_exprs it was costed with
-		 */
-		MemoizePath *mp = (MemoizePath *) ((JoinPath *) path)->innerjoinpath;
-
-		R.memo = mp;
-		R.memo_entries = mp->est_entries;
-		R.memo_exprs = mp->param_exprs;
-		mp->param_exprs = memo_costed_exprs(mp);
-	}
+	memo_setup(&R);
 
 	/* A join path: its cost functions' vector versions, unless... */
 	if (R.join && robust_vector_cost && vector_join(&R, rc, round))
@@ -4110,11 +4257,7 @@ replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 		}
 		if (!ok)
 		{
-			if (R.memo)
-			{
-				R.memo->est_entries = R.memo_entries;
-				R.memo->param_exprs = R.memo_exprs;
-			}
+			memo_restore(&R);
 			rc->status = ROBUST_COST_MISMATCH;
 			memcpy(rc->replayed, R.got, sizeof(rc->replayed));
 			return;
@@ -4130,11 +4273,7 @@ replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 		int			b;
 
 		replay_once(&R, root->robust_round, &r, &su, &t, &b);
-		if (R.memo)
-		{
-			R.memo->est_entries = R.memo_entries;
-			R.memo->param_exprs = R.memo_exprs;
-		}
+		memo_restore(&R);
 		path->rows = r;
 		path->startup_cost = su;
 		path->total_cost = t;
@@ -4159,11 +4298,7 @@ replay(PlannerInfo *root, Path *path, RobustPathCost *rc)
 		if (nb)
 			nb[s] = b;
 	}
-	if (R.memo)
-	{
-		R.memo->est_entries = R.memo_entries;
-		R.memo->param_exprs = R.memo_exprs;
-	}
+	memo_restore(&R);
 
 	rc->status = ROBUST_COST_REPLAY;
 	rc->rows = vec_or_null(rows, path->rows);
@@ -4300,6 +4435,8 @@ status_name(RobustCostStatus st)
 			return "unsupported";
 		case ROBUST_COST_NOCONTEXT:
 			return "nocontext";
+		case ROBUST_COST_PROJECTED:
+			return "projected";
 	}
 	return "?";
 }
@@ -4521,6 +4658,130 @@ dump_path(PlannerInfo *root, Path *path, RobustPathCost *rc)
 	robust_dump_end(&d);
 }
 
+/* ------------------------------------------------- projected rounds */
+
+static inline bool
+same_costs(Path *path, double rows, double startup, double total, int nb)
+{
+	return same_bits(path->rows, rows) &&
+		same_bits(path->startup_cost, startup) &&
+		same_bits(path->total_cost, total) &&
+		(!IsA(path, HashPath) || ((HashPath *) path)->num_batches == nb);
+}
+
+/*
+ * The materialize_inner final_cost_mergejoin chooses for a merge join
+ * path in the round with no multiplier (as robust_projected_rounds off
+ * builds it, and its replay keeps it)
+ */
+static bool
+merge_choice_unprojected(Replay *R)
+{
+	/*
+	 * In the round's memory, not the scratch context: initial_cost_mergejoin
+	 * may add to the clauses' cache of scan selectivities
+	 */
+	MergePath  *t = palloc(sizeof(MergePath));
+	int			saved = robust_project_s;
+	bool		choice;
+
+	memcpy(t, R->path, sizeof(MergePath));
+	robust_project_s = -1;		/* (robust_cost_end_query restores it) */
+	cost_copy(R, &t->jpath.path, -1);
+	robust_project_s = saved;
+	choice = t->materialize_inner;
+	pfree(t);
+	return choice;
+}
+
+/*
+ * robust_debug_check_costs in a projected envelope round: the path's costs,
+ * as its cost functions gave them when it was built, are those the round
+ * gives it with robust_projected_rounds off, bit for bit, or an error.
+ *
+ * A path other than a join is replayed so (replay() in the round).  A join
+ * path is replayed in the round's scenario only, with its materialize_inner
+ * (the replay's point check needs its costs without the multipliers, which
+ * are gone).  A merge join's choice may differ from the one made without
+ * the multipliers, which the replay would keep: such paths are counted
+ * (st->round_flips), and must cost no more than the replay with that
+ * choice.
+ */
+static void
+check_projected(PlannerInfo *root, Path *path, RobustPathCost *rc)
+{
+	int			s = robust_project_s;
+	double		rows = path->rows;
+	double		startup = path->startup_cost;
+	double		total = path->total_cost;
+	int			nb = IsA(path, HashPath) ? ((HashPath *) path)->num_batches : 0;
+	double		r,
+				su,
+				t;
+	int			b;
+	RobustPathCost tmp;
+	Replay		R;
+	ListCell   *lc;
+
+	memset(&tmp, 0, sizeof(tmp));
+	tmp.id = -1;
+	tmp.partial = rc->partial;
+	if (!is_join_path(path))
+	{
+		replay(root, path, &tmp);
+		if (!same_costs(path, rows, startup, total, nb))
+			elog(ERROR, "RobDP: a %s of envelope round %d costed as built differs from its replay (%s): "
+				 "rows %.17g vs %.17g, startup %.17g vs %.17g, total %.17g vs %.17g",
+				 path_type_name(path), s, status_name(tmp.status),
+				 rows, path->rows, startup, path->startup_cost,
+				 total, path->total_cost);
+		return;
+	}
+
+	/* the replay keeps the scalars when nothing varies (replay()) */
+	if (!st->varies)
+		return;
+	memset(&R, 0, sizeof(R));
+	R.root = root;
+	R.path = path;
+	R.cxt = CurrentMemoryContext;
+	R.children = path_children(path);
+	R.size = path_size(path);
+	R.limit_tuples = -1.0;
+	R.join = true;
+	foreach(lc, R.children)
+		(void) compute(root, (Path *) lfirst(lc), rc->partial);
+	if (!join_setup(&R, &tmp))
+		return;					/* nocontext: the scalars too */
+	memo_setup(&R);
+	replay_once(&R, s, &r, &su, &t, &b);
+	if (!same_costs(path, r, su, t, b))
+		elog(ERROR, "RobDP: a %s of envelope round %d costed as built differs from its replay: "
+			 "rows %.17g vs %.17g, startup %.17g vs %.17g, total %.17g vs %.17g, batches %d vs %d",
+			 path_type_name(path), s, rows, r, startup, su, total, t, nb, b);
+
+	if (IsA(path, MergePath))
+	{
+		MergePath  *mp = (MergePath *) path;
+		bool		mine = mp->materialize_inner;
+
+		if (merge_choice_unprojected(&R) != mine)
+		{
+			st->round_flips++;
+			mp->materialize_inner = !mine;
+			replay_once(&R, s, &r, &su, &t, &b);
+			mp->materialize_inner = mine;
+			if (total > t || startup != su || rows != r)
+				elog(ERROR, "RobDP: a merge join of envelope round %d costs more with its choice of materialize_inner (%d) than with the replay's: "
+					 "startup %.17g vs %.17g, total %.17g vs %.17g",
+					 s, (int) mine, startup, su, total, t);
+		}
+	}
+	memo_restore(&R);
+	if (R.buf != NULL)
+		pfree(R.buf);
+}
+
 /* --------------------------------------------------------- entry point */
 
 static RobustPathCost *
@@ -4536,7 +4797,17 @@ compute(PlannerInfo *root, Path *path, bool partial)
 		st->next_path_id++;
 	rc->partial = partial;
 	path->robust = rc;
-	replay(root, path, rc);
+	if (robust_project_s >= 0 && root->robust_pass == ROBUST_PASS_ENVELOPE &&
+		!IsA(path, IndexPath) && !IsA(path, BitmapHeapPath))
+	{
+		/* a projected round: costed in its scenario as built */
+		Assert(root->robust_round == robust_project_s);
+		rc->status = ROBUST_COST_PROJECTED;
+		if (robust_debug_check_costs)
+			check_projected(root, path, rc);
+	}
+	else
+		replay(root, path, rc);
 	if (root->robust_pass == ROBUST_PASS_ENVELOPE)
 		st->round_counts[rc->status]++;
 	else if (cost_varies(rc))

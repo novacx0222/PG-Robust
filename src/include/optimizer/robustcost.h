@@ -58,9 +58,26 @@
  * and must reproduce the scalar fields bit for bit; if it does not, the
  * path keeps constant vectors and the debug dump reports it.
  *
- * In an envelope round (optimizer/robustsearch.h) everything is in the
- * round's scenario s already: the round's paths are replayed in s only and
- * the result goes into their scalar fields, with no vectors.
+ * In an envelope round (optimizer/robustsearch.h) the rows of the
+ * relations and the costs of the level-1 relations' paths are in the
+ * round's scenario s already, and the round's paths get their costs in s in
+ * their scalar fields, with no vectors.  With robust_projected_rounds on
+ * (the default), PostgreSQL's cost functions compute these costs as the
+ * paths are built.  What is not in s yet are the multipliers of the
+ * estimates a join path's cost functions make themselves, and two hooks
+ * apply them: robust_project_qual_selec (approx_tuple_count) and
+ * robust_cost_join_context (the semi-join factors the join's paths are
+ * given).  Index and bitmap heap paths, whose cost functions estimate an
+ * index selectivity, are replayed as before (a round builds them only by
+ * reparameterize_path, for the children of an Append); no other path of a
+ * round is.  The costs are those of a replay in s, bit for bit (with
+ * robust_debug_check_costs on, every path is replayed as well and any
+ * difference is an error), but for one decision: a merge join's
+ * materialize_inner is chosen in s, as PostgreSQL chooses it, where the
+ * replay keeps the choice made without the multipliers.  The replay's
+ * choice never costs less in s; the check counts the paths where the two
+ * differ.  With robust_projected_rounds off, each path of a round is costed
+ * without the multipliers, then replayed in s.
  *
  * Join paths (nested loop, merge and hash joins, with the rescan of a
  * nested loop's inner side, Memoize included) are not replayed scenario by
@@ -94,6 +111,8 @@ typedef enum RobustCostStatus
 	ROBUST_COST_MISMATCH,		/* the replay did not reproduce the scalars */
 	ROBUST_COST_UNSUPPORTED,	/* a path type replay does not know */
 	ROBUST_COST_NOCONTEXT,		/* a join path costed outside its join */
+	ROBUST_COST_PROJECTED,		/* an envelope round's, costed in its
+								 * scenario as it was built */
 } RobustCostStatus;
 
 /*
@@ -151,6 +170,12 @@ typedef struct RobustReplayHooks
 
 extern PGDLLIMPORT RobustReplayHooks *robust_replay;
 
+/*
+ * The scenario of the projected envelope round running (see above), or -1:
+ * the cost functions' hooks scale their own estimates as in that scenario.
+ */
+extern PGDLLIMPORT int robust_project_s;
+
 extern Selectivity robust_replay_index_selec(Selectivity sel);
 extern Selectivity robust_replay_qual_selec(List *quals, Selectivity sel);
 extern void robust_replay_semi_selec(Selectivity *jselec, Selectivity *nselec);
@@ -162,6 +187,9 @@ struct EstimationInfo;
 extern double robust_replay_num_groups(PlannerInfo *root, List *exprs,
 									   double input_rows,
 									   struct EstimationInfo *estinfo);
+extern Selectivity robust_project_qual_selec(PlannerInfo *root,
+											 JoinPath *path, List *quals,
+											 Selectivity sel);
 
 /* Planner entry points */
 extern void *robust_cost_begin_query(void);
@@ -173,7 +201,7 @@ extern void robust_cost_join_context(PlannerInfo *root, RelOptInfo *joinrel,
 									 RelOptInfo *innerrel, JoinType jointype,
 									 SpecialJoinInfo *sjinfo,
 									 List *restrictlist, bool inner_unique,
-									 const SemiAntiJoinFactors *semifactors);
+									 SemiAntiJoinFactors *semifactors);
 extern void robust_cost_add_path(Path *path, bool partial);
 extern void robust_cost_partial_rows(Path *path);
 extern void robust_cost_append_rows(Path *path);
@@ -199,6 +227,8 @@ extern bool robust_cost_precheck_off(void);
 extern void *robust_cost_search_save(void);
 extern void robust_cost_search_restore(void *save);
 extern const int *robust_cost_round_counts(void);
+extern int	robust_cost_round_flips(void);
+extern void robust_cost_round_project(int s);
 extern bool robust_cost_scores_active(void);
 extern bool robust_cost_collect(void);
 

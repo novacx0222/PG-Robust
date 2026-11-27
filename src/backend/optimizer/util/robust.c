@@ -30,6 +30,7 @@ bool		robust_envelope = true;
 bool		robust_select_dedup = true;
 bool		robust_select_precheck = true;
 bool		robust_vector_cost = true;
+bool		robust_projected_rounds = true;
 bool		robust_debug_check_costs = DEFAULT_ROBUST_CHECK_COSTS;
 bool		robust_gather_all = false;
 bool		robust_select = true;
